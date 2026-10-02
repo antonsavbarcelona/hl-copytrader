@@ -1,0 +1,13 @@
+# Railway: builds the Dockerfile; one worker (no port), restarted whenever it stops.
+# The run lives in Postgres: set DATABASE_URL = ${{Postgres.DATABASE_URL}} on the service.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+numReplicas = 1
+restartPolicyType = "ALWAYS"
+# Never two runs on the same state: the old one stops before the new one starts...
+overlapSeconds = 0
+# ... and gets time to save its state after SIGTERM.
+drainingSeconds = 30

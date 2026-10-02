@@ -29,7 +29,8 @@ blocked by a locked exe.
   (more `run` options, e.g. `--min-roi 30 --min-pnl 5000`).
 - Report: locally with `DATABASE_URL` set to the database's public URL (in `.env`, see
   `.env.example`): `hl-copytrader report`. Or SQL on the tables below.
-- Health: the hourly `status:` line in the logs; its `backlog` should stay at a few seconds.
+- Health: the `bot_status` table (every 10 min); `api_backlog_s` should stay at a few seconds
+  and `tick_max_ms` well under a second.
 
 **Any Docker host**:
 
@@ -61,6 +62,37 @@ minute) is per IP, and the image takes 800 of it.
   position (the difference waits for its next change); hourly funding at each coin's rate;
   a copy account at zero equity is liquidated and stops; position / equity over 60x is
   treated as a stale equity read and re-read first. Main perp dex only (no HIP-3 dexes).
+
+## Signals
+
+Besides copying each trader, the run trades its own signals out of what the followed traders
+do together: a grid of 35 variants side by side (`VARIANTS` in `src/signals.rs`), each on its
+own $1000 paper account (`signal:<name>`) filled on the live books like the copies.
+
+Per coin over a window, each trader's net flow (bought minus sold, so a split order or a market
+maker's churn counts once) is read four ways:
+
+- **heads** (`h…`): traders net buying vs net selling; a trader takes a side when its net flow
+  is 0.2%+ of its own equity, so one whale does not outvote the crowd;
+- **conviction** (`c…`): the sum of the traders' net flows, each as % of its own equity
+  (one trader counts up to 20%);
+- **volume** (`v…`): dollars of net buying vs net selling;
+- **positioning** (`p…`): the copied traders holding the coin long vs short now (1%+ of equity).
+
+The grid spans windows of 1 / 5 / 15 / 30 / 60 / 240 min, 2–20 traders, 60–90% agreement,
+$200k–$2M, and three exits — S (stop 0.75%, take profit 1.5%), M (1.5 / 3%), L (3 / 6%) — with
+one signal run under all three to tell the signal from the exit. `best-…` count only the traders
+whose copies run at a profit; `fade-…` take the opposite trade, as controls (if a fade wins
+too, the signal is noise). A name reads e.g. `h15m-5t-75-M`: heads, 15 min, 5+ traders, 75%+
+of them one way, exit M.
+
+Every entry is a complete trade, a row of `signal_trades`: coin, side, entry, stop, take
+profit, expiry, size from 1% of the account's equity at risk at the stop (all positions at
+most 10x equity, at most 10 open), and why (traders each way, agreement, conviction, dollars
+each way). A trade is closed at its stop, take profit or expiry, or when the traders turn the
+other way — the same row gets the exit, its reason, PnL after fees and the fees — and the coin
+then rests for the variant's window. Signals are read every 5 s; after a start, a window is read only once the
+flow covers it. `report` lists the signal accounts after the copies.
 
 ## What is measured
 
@@ -102,7 +134,17 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   - `fill`: ours (`why`: seed / copy / reconcile / restart / stale), with lag, the trader's
     price and slippage vs it (`slip_bps`, of it `move_bps`);
   - `enroll`, `plan` (the trader's set-up for a position), `liquidated`.
+- `signal_accounts`: one row per signal variant — `rule`, `equity`, `roi_pct`, `taken`,
+  `closed`, `wins`, `open_positions`, `state`.
+- `signal_trades`: one row per signal trade (key `id`), see Signals; e.g.
+  `select variant, count(*), avg((pnl > 0)::int), sum(pnl) from signal_trades
+  where closed_at is not null group by 1 order by 4 desc`.
+- `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
+  used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`, of it
+  `signals_*_ms`), and more in `data`. The ticks run on the loop the copies use: a few ms is
+  fine, hundreds would start to delay copies.
 
 The database being away does not stop the run: writes wait and go out once it is back.
-Without `DATABASE_URL` the same goes to files: `state.json` and `events.jsonl` in `--data`.
+Without `DATABASE_URL` the same goes to files in `--data`: `state.json`, `events.jsonl`,
+`signal_trades.jsonl` (a line when a trade opens, another when it closes), `status.jsonl`.
 `report` writes `report.csv` (all accounts, all the measures) to `--data`.

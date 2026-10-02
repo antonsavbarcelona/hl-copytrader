@@ -10,6 +10,7 @@ mod api;
 mod config;
 mod engine;
 mod report;
+mod signals;
 mod stats;
 mod store;
 mod ws;

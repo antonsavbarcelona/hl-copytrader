@@ -1,5 +1,7 @@
 //! Where a run lives: Postgres when `DATABASE_URL` is set (tables created on first start),
-//! else files in the data directory (`state.json`, `events.jsonl`).
+//! else files in the data directory (`state.json`, `events.jsonl`, `signal_trades.jsonl`).
+//! The copies (`copy_accounts`, `events`) and the signals (`signal_accounts`, `signal_trades`)
+//! are kept apart; `bot_status` (`status.jsonl`) has the bot's health every 10 minutes.
 //!
 //! The engine never waits on it: events and state snapshots go to a writer task, which
 //! batches them (one insert per second for events; for the state, only the accounts that
@@ -18,7 +20,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
-use crate::engine::Trader;
+use crate::engine::{SIGNAL_PREFIX, Trader};
 use crate::log;
 
 /// One copy account as saved: its full state plus a few columns to query by.
@@ -34,9 +36,59 @@ pub struct Row {
     pub state: String,
 }
 
+/// One signal variant's account as saved.
+#[derive(serde::Serialize)]
+pub struct SignalRow {
+    pub variant: String,
+    pub rule: String,
+    pub equity: f64,
+    pub roi_pct: f64,
+    pub taken: i64,
+    pub closed: i64,
+    pub wins: i64,
+    pub open_positions: i32,
+    /// The account (`Trader`), serialized.
+    pub state: String,
+}
+
+/// One signal trade: written when it opens, written again (whole) when it closes.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TradeRow {
+    pub id: String,
+    pub variant: String,
+    pub coin: String,
+    /// long / short
+    pub side: String,
+    /// Unix seconds.
+    pub opened_at: f64,
+    /// The mid when it fired, and our fill.
+    pub mid: f64,
+    pub entry: f64,
+    pub stop: f64,
+    pub take_profit: f64,
+    pub size: f64,
+    pub notional: f64,
+    pub risk_usd: f64,
+    pub risk_pct: f64,
+    pub expires_at: f64,
+    /// Why it fired: traders each way, agreement, conviction, dollars, window.
+    pub reason: Value,
+    pub closed_at: Option<f64>,
+    pub exit_px: Option<f64>,
+    /// stop / take profit / expiry / traders turned
+    pub exit_reason: Option<String>,
+    /// After fees, USD and % of equity at the open.
+    pub pnl: Option<f64>,
+    pub pnl_pct: Option<f64>,
+    pub fees: f64,
+}
+
 enum Cmd {
     Event(Value),
     Save(Vec<Row>),
+    SaveSignals(Vec<SignalRow>),
+    Trade(TradeRow),
+    Status(Value),
     Flush(oneshot::Sender<()>),
 }
 
@@ -54,6 +106,18 @@ impl Store {
         let _ = self.tx.send(Cmd::Save(rows));
     }
 
+    pub fn save_signals(&self, rows: Vec<SignalRow>) {
+        let _ = self.tx.send(Cmd::SaveSignals(rows));
+    }
+
+    pub fn trade(&self, row: TradeRow) {
+        let _ = self.tx.send(Cmd::Trade(row));
+    }
+
+    pub fn status(&self, status: Value) {
+        let _ = self.tx.send(Cmd::Status(status));
+    }
+
     /// Waits until everything sent so far is written.
     pub async fn flush(&self) {
         let (tx, rx) = oneshot::channel();
@@ -63,13 +127,18 @@ impl Store {
     }
 }
 
-/// The saved copy accounts of this run.
+/// The saved accounts of this run: the copies by address, the signal accounts as
+/// `signal:<variant>`.
 pub async fn load(cfg: &Config) -> Result<HashMap<String, Trader>> {
     match &cfg.database_url {
         Some(url) => {
             let client = pg_connect(url).await?;
             migrate(&client).await?;
-            let rows = client.query("SELECT address, state::text FROM copy_accounts WHERE run_id = $1", &[&cfg.run_id]).await?;
+            let rows = client.query(
+                "SELECT address, state::text FROM copy_accounts WHERE run_id = $1
+                 UNION ALL SELECT $2 || variant, state::text FROM signal_accounts WHERE run_id = $1",
+                &[&cfg.run_id, &SIGNAL_PREFIX],
+            ).await?;
             let mut out = HashMap::new();
             for r in rows {
                 let (address, state): (String, String) = (r.get(0), r.get(1));
@@ -81,10 +150,17 @@ pub async fn load(cfg: &Config) -> Result<HashMap<String, Trader>> {
             #[derive(serde::Deserialize, Default)]
             struct Saved {
                 traders: HashMap<String, Trader>,
+                #[serde(default)]
+                signals: HashMap<String, Trader>,
             }
             let path = cfg.data_dir.join("state.json");
             Ok(match std::fs::read_to_string(&path) {
-                Ok(s) => serde_json::from_str::<Saved>(&s).with_context(|| format!("{}", path.display()))?.traders,
+                Ok(s) => {
+                    let saved = serde_json::from_str::<Saved>(&s).with_context(|| format!("{}", path.display()))?;
+                    let mut out = saved.traders;
+                    out.extend(saved.signals.into_iter().map(|(v, t)| (format!("{SIGNAL_PREFIX}{v}"), t)));
+                    out
+                }
                 Err(_) => HashMap::new(),
             })
         }
@@ -122,31 +198,58 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             return;
         }
     };
-    // Every account as last saved (the file holds all of them).
+    let mut trades = match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("signal_trades.jsonl")) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            log!("store: cannot open signal_trades.jsonl: {e}");
+            return;
+        }
+    };
+    // Every account as last saved (the file holds all of them): copies, signal variants.
     let mut all: HashMap<String, String> = HashMap::new();
+    let mut sigs: HashMap<String, String> = HashMap::new();
+    let obj = |m: &HashMap<String, String>| m.iter().map(|(a, s)| format!("{}:{s}", Value::String(a.clone()))).collect::<Vec<_>>().join(",");
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Cmd::Event(ev) => {
                 let _ = writeln!(events, "{ev}");
             }
+            Cmd::Trade(t) => {
+                if let Ok(s) = serde_json::to_string(&t) {
+                    let _ = writeln!(trades, "{s}");
+                }
+            }
+            Cmd::Status(s) => {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("status.jsonl")) {
+                    let _ = writeln!(f, "{s}");
+                }
+            }
             Cmd::Save(rows) => {
                 for r in rows {
                     all.insert(r.address, r.state);
                 }
-                let body: Vec<String> = all.iter().map(|(a, s)| format!("{}:{s}", Value::String(a.clone()))).collect();
+            }
+            Cmd::SaveSignals(rows) => {
+                for r in rows {
+                    sigs.insert(r.variant, r.state);
+                }
+                // The signals are saved right after the copies: write the file once for both.
                 let tmp = state_path.with_extension("tmp");
-                if std::fs::write(&tmp, format!("{{\"traders\":{{{}}}}}", body.join(","))).is_ok() {
+                if std::fs::write(&tmp, format!("{{\"traders\":{{{}}},\"signals\":{{{}}}}}", obj(&all), obj(&sigs))).is_ok() {
                     let _ = std::fs::rename(&tmp, &state_path);
                 }
                 let _ = events.flush();
+                let _ = trades.flush();
             }
             Cmd::Flush(done) => {
                 let _ = events.flush();
+                let _ = trades.flush();
                 let _ = done.send(());
             }
         }
     }
     let _ = events.flush();
+    let _ = trades.flush();
 }
 
 // --------------------------------------------------------------------------------- postgres
@@ -176,6 +279,62 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_run_at ON events (run_id, at);
 CREATE INDEX IF NOT EXISTS events_run_address ON events (run_id, address, at);
+CREATE TABLE IF NOT EXISTS signal_accounts (
+    run_id          text        NOT NULL,
+    variant         text        NOT NULL,
+    rule            text        NOT NULL,
+    equity          float8      NOT NULL,
+    roi_pct         float8      NOT NULL,
+    taken           bigint      NOT NULL,
+    closed          bigint      NOT NULL,
+    wins            bigint      NOT NULL,
+    open_positions  integer     NOT NULL,
+    state           jsonb       NOT NULL,
+    updated_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, variant)
+);
+CREATE TABLE IF NOT EXISTS signal_trades (
+    run_id       text        NOT NULL,
+    id           text        NOT NULL,
+    variant      text        NOT NULL,
+    coin         text        NOT NULL,
+    side         text        NOT NULL,
+    opened_at    timestamptz NOT NULL,
+    mid          float8      NOT NULL,
+    entry        float8      NOT NULL,
+    stop         float8      NOT NULL,
+    take_profit  float8      NOT NULL,
+    size         float8      NOT NULL,
+    notional     float8      NOT NULL,
+    risk_usd     float8      NOT NULL,
+    risk_pct     float8      NOT NULL,
+    expires_at   timestamptz NOT NULL,
+    reason       jsonb       NOT NULL,
+    closed_at    timestamptz,
+    exit_px      float8,
+    exit_reason  text,
+    pnl          float8,
+    pnl_pct      float8,
+    fees         float8      NOT NULL,
+    PRIMARY KEY (run_id, id)
+);
+CREATE INDEX IF NOT EXISTS signal_trades_variant ON signal_trades (run_id, variant, opened_at);
+CREATE INDEX IF NOT EXISTS signal_trades_coin ON signal_trades (run_id, coin, opened_at);
+CREATE TABLE IF NOT EXISTS bot_status (
+    run_id          text        NOT NULL,
+    at              timestamptz NOT NULL,
+    copy_accounts   integer     NOT NULL,
+    followed        integer     NOT NULL,
+    open_positions  integer     NOT NULL,
+    api_weight      integer     NOT NULL,
+    api_backlog_s   float8      NOT NULL,
+    tick_avg_ms     float8      NOT NULL,
+    tick_max_ms     float8      NOT NULL,
+    signals_avg_ms  float8      NOT NULL,
+    signals_max_ms  float8      NOT NULL,
+    data            jsonb       NOT NULL,
+    PRIMARY KEY (run_id, at)
+);
 ";
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -223,10 +382,16 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     // Accounts waiting to be written (latest snapshot of each), and what was last written.
     let mut pending: HashMap<String, Row> = HashMap::new();
     let mut written: HashMap<String, u64> = HashMap::new();
+    // The same for the signal variants, and signal trades by id (a close replaces its open).
+    let mut pending_sigs: HashMap<String, SignalRow> = HashMap::new();
+    let mut written_sigs: HashMap<String, u64> = HashMap::new();
+    let mut trades: HashMap<String, TradeRow> = HashMap::new();
+    let mut statuses: Vec<Value> = Vec::new();
     let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut open = true;
-    while open || !events.is_empty() || !pending.is_empty() || !waiting.is_empty() {
+    while open || !events.is_empty() || !pending.is_empty() || !pending_sigs.is_empty() || !trades.is_empty() || !statuses.is_empty()
+        || !waiting.is_empty() {
         // Gather until the next tick (or a flush, a big batch, or the end), then write.
         let due = tokio::select! {
             cmd = rx.recv(), if open => match cmd {
@@ -242,6 +407,22 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     }
                     false
                 }
+                Some(Cmd::SaveSignals(rows)) => {
+                    for r in rows {
+                        if written_sigs.get(&r.variant) != Some(&hash(&r.state)) {
+                            pending_sigs.insert(r.variant.clone(), r);
+                        }
+                    }
+                    false
+                }
+                Some(Cmd::Trade(t)) => {
+                    trades.insert(t.id.clone(), t);
+                    false
+                }
+                Some(Cmd::Status(s)) => {
+                    statuses.push(s);
+                    false
+                }
                 Some(Cmd::Flush(done)) => {
                     waiting.push(done);
                     true
@@ -253,7 +434,8 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             },
             _ = tick.tick() => true,
         };
-        if !due || (events.is_empty() && pending.is_empty() && waiting.is_empty()) {
+        if !due || (events.is_empty() && pending.is_empty() && pending_sigs.is_empty() && trades.is_empty() && statuses.is_empty()
+            && waiting.is_empty()) {
             continue;
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
@@ -263,18 +445,24 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     Some(c)
                 }
                 Err(e) => {
-                    log!("store: postgres unavailable ({e:#}), {} events and {} accounts waiting", events.len(), pending.len());
+                    log!("store: postgres unavailable ({e:#}), {} events, {} accounts, {} signal trades waiting", events.len(),
+                        pending.len() + pending_sigs.len(), trades.len());
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
         }
         let Some(c) = &client else { continue };
-        match write(c, &run, &events, &pending).await {
+        match write(c, &run, &events, &pending, &pending_sigs, &trades, &statuses).await {
             Ok(()) => {
                 events.clear();
+                trades.clear();
+                statuses.clear();
                 for (a, r) in pending.drain() {
                     written.insert(a, hash(&r.state));
+                }
+                for (v, r) in pending_sigs.drain() {
+                    written_sigs.insert(v, hash(&r.state));
                 }
                 for done in waiting.drain(..) {
                     let _ = done.send(());
@@ -289,7 +477,57 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     }
 }
 
-async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>) -> Result<()> {
+async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>,
+               signals: &HashMap<String, SignalRow>, trades: &HashMap<String, TradeRow>, statuses: &[Value]) -> Result<()> {
+    if !statuses.is_empty() {
+        let rows = serde_json::to_string(statuses)?;
+        c.execute(
+            "INSERT INTO bot_status (run_id, at, copy_accounts, followed, open_positions, api_weight, api_backlog_s, tick_avg_ms,
+                 tick_max_ms, signals_avg_ms, signals_max_ms, data)
+             SELECT $1, to_timestamp(r.at), r.copy_accounts, r.followed, r.open_positions, r.api_weight, r.api_backlog_s, r.tick_avg_ms,
+                 r.tick_max_ms, r.signals_avg_ms, r.signals_max_ms, d
+             FROM jsonb_array_elements($2::text::jsonb) AS d,
+                  jsonb_to_record(d) AS r(at float8, copy_accounts int4, followed int4, open_positions int4, api_weight int4,
+                      api_backlog_s float8, tick_avg_ms float8, tick_max_ms float8, signals_avg_ms float8, signals_max_ms float8)
+             ON CONFLICT DO NOTHING",
+            &[&run, &rows],
+        )
+        .await
+        .context("saving status")?;
+    }
+    if !signals.is_empty() {
+        let rows = serde_json::to_string(&signals.values().collect::<Vec<_>>())?;
+        c.execute(
+            "INSERT INTO signal_accounts (run_id, variant, rule, equity, roi_pct, taken, closed, wins, open_positions, state, updated_at)
+             SELECT $1, r.variant, r.rule, r.equity, r.roi_pct, r.taken, r.closed, r.wins, r.open_positions, r.state::jsonb, now()
+             FROM jsonb_to_recordset($2::text::jsonb) AS r(variant text, rule text, equity float8, roi_pct float8, taken int8, closed int8,
+                  wins int8, open_positions int4, state text)
+             ON CONFLICT (run_id, variant) DO UPDATE SET rule = excluded.rule, equity = excluded.equity, roi_pct = excluded.roi_pct,
+                 taken = excluded.taken, closed = excluded.closed, wins = excluded.wins, open_positions = excluded.open_positions,
+                 state = excluded.state, updated_at = excluded.updated_at",
+            &[&run, &rows],
+        )
+        .await
+        .context("saving signal accounts")?;
+    }
+    if !trades.is_empty() {
+        let rows = serde_json::to_string(&trades.values().collect::<Vec<_>>())?;
+        c.execute(
+            "INSERT INTO signal_trades (run_id, id, variant, coin, side, opened_at, mid, entry, stop, take_profit, size, notional, risk_usd,
+                 risk_pct, expires_at, reason, closed_at, exit_px, exit_reason, pnl, pnl_pct, fees)
+             SELECT $1, r.id, r.variant, r.coin, r.side, to_timestamp(r.opened_at), r.mid, r.entry, r.stop, r.take_profit, r.size, r.notional,
+                 r.risk_usd, r.risk_pct, to_timestamp(r.expires_at), r.reason, to_timestamp(r.closed_at), r.exit_px, r.exit_reason, r.pnl,
+                 r.pnl_pct, r.fees
+             FROM jsonb_to_recordset($2::text::jsonb) AS r(id text, variant text, coin text, side text, opened_at float8, mid float8,
+                  entry float8, stop float8, take_profit float8, size float8, notional float8, risk_usd float8, risk_pct float8,
+                  expires_at float8, reason jsonb, closed_at float8, exit_px float8, exit_reason text, pnl float8, pnl_pct float8, fees float8)
+             ON CONFLICT (run_id, id) DO UPDATE SET closed_at = excluded.closed_at, exit_px = excluded.exit_px,
+                 exit_reason = excluded.exit_reason, pnl = excluded.pnl, pnl_pct = excluded.pnl_pct, fees = excluded.fees",
+            &[&run, &rows],
+        )
+        .await
+        .context("saving signal trades")?;
+    }
     if !events.is_empty() {
         let at: Vec<f64> = events.iter().map(|e| e["at"].as_f64().unwrap_or(0.0)).collect();
         let kind: Vec<String> = events.iter().map(|e| e["kind"].as_str().unwrap_or("").to_string()).collect();

@@ -25,8 +25,9 @@ use crate::account::{Account, round_size, walk};
 use crate::api::{AccountState, Api, CoinInfo, Leader, Trigger, exchange_now, now};
 use crate::config::Config;
 use crate::log;
+use crate::signals::{self, Flow, Inputs, OpenSignal, Reading, SignalState, VARIANTS, Variant};
 use crate::stats::{Plan, Stats, Trip};
-use crate::store::{Row, Store};
+use crate::store::{Row, SignalRow, Store, TradeRow};
 use crate::ws::{Book, Books, UserFill};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -55,7 +56,13 @@ pub struct Trader {
     /// Our open positions as trips from flat (coin -> trip).
     #[serde(default)]
     pub trips: HashMap<String, Trip>,
+    /// Signal accounts (`signal:<variant>`) only: their open signal trades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<SignalState>,
 }
+
+/// Signal accounts are kept under this prefix, next to the copy accounts.
+pub const SIGNAL_PREFIX: &str = "signal:";
 
 /// Its fills on one coin that one scheduled execution of ours follows.
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +97,10 @@ pub struct Engine {
     pub followed: Arc<RwLock<HashSet<String>>>,
     leaders: HashMap<String, Leader>,
     traders: HashMap<String, Trader>,
+    /// One account per signal variant (`signal:<name>`).
+    signals: HashMap<String, Trader>,
+    /// The followed traders' recent fills, for the signals.
+    flow: Flow,
     /// Accounts whose positions are being read.
     reading: HashSet<String>,
     /// Accounts with a set-up read scheduled.
@@ -103,6 +114,18 @@ pub struct Engine {
     store: Store,
     read_limit: Arc<Semaphore>,
     dirty: bool,
+    /// Time spent per tick since the last status line: ticks, total and longest (ms), and
+    /// of it the signals.
+    load: Load,
+}
+
+#[derive(Default)]
+struct Load {
+    ticks: u64,
+    tick_ms: f64,
+    tick_max_ms: f64,
+    signals_ms: f64,
+    signals_max_ms: f64,
 }
 
 /// An account over `stale_leverage` is read again only if its last read is older than this.
@@ -122,7 +145,21 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(cfg: Config, api: Api, books: Books, coins: Vec<CoinInfo>, tx: mpsc::UnboundedSender<Msg>, traders: HashMap<String, Trader>,
                store: Store) -> anyhow::Result<Self> {
-        log!("state: {} copy accounts", traders.len());
+        let (sigs, traders): (HashMap<String, Trader>, HashMap<String, Trader>) =
+            traders.into_iter().partition(|(a, _)| a.starts_with(SIGNAL_PREFIX));
+        let mut signals = HashMap::new();
+        for v in VARIANTS {
+            let key = format!("{SIGNAL_PREFIX}{}", v.name);
+            let t = sigs.get(&key).cloned().unwrap_or_else(|| Trader {
+                address: key.clone(),
+                name: Some(describe(v)),
+                enrolled_at: now(),
+                acct: Account::new(cfg.start_usd),
+                ..Default::default()
+            });
+            signals.insert(key, Trader { signal: Some(t.signal.clone().unwrap_or_default()), ..t });
+        }
+        log!("state: {} copy accounts, {} signal accounts", traders.len(), signals.len());
         let resync = traders.iter().filter(|(_, t)| !t.acct.liquidated && (!t.acct.positions.is_empty() || !t.theirs.is_empty()))
             .map(|(a, _)| a.clone()).collect();
         Ok(Self {
@@ -132,6 +169,8 @@ impl Engine {
             followed: Arc::new(RwLock::new(HashSet::new())),
             leaders: HashMap::new(),
             traders,
+            signals,
+            flow: Flow::new((exchange_now() * 1000.0) as u64),
             reading: HashSet::new(),
             planning: HashSet::new(),
             resync,
@@ -140,6 +179,7 @@ impl Engine {
             store,
             read_limit: Arc::new(Semaphore::new(4)),
             dirty: false,
+            load: Load::default(),
             cfg,
         })
     }
@@ -154,6 +194,20 @@ impl Engine {
     fn save(&mut self) {
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
+        let sig_rows = self.signals.iter().filter_map(|(a, t)| {
+            let equity = t.acct.equity(&marks);
+            Some(SignalRow {
+                variant: a.trim_start_matches(SIGNAL_PREFIX).to_string(),
+                rule: t.name.clone().unwrap_or_default(),
+                equity,
+                roi_pct: if t.acct.start > 0.0 { (equity / t.acct.start - 1.0) * 100.0 } else { 0.0 },
+                taken: t.signal.as_ref().map(|s| s.taken).unwrap_or(0) as i64,
+                closed: t.stats.trips as i64,
+                wins: t.stats.wins as i64,
+                open_positions: t.acct.positions.len() as i32,
+                state: serde_json::to_string(t).ok()?,
+            })
+        }).collect();
         let rows = self.traders.iter().filter_map(|(a, t)| {
             let equity = t.acct.equity(&marks);
             Some(Row {
@@ -169,6 +223,7 @@ impl Engine {
         }).collect();
         drop(b);
         self.store.save(rows);
+        self.store.save_signals(sig_rows);
         self.dirty = false;
     }
 
@@ -242,6 +297,9 @@ impl Engine {
         let pos_after = self.traders.get(&f.user).filter(|_| applied).map(|t| t.theirs.get(&f.coin).copied().unwrap_or(0.0) + f.delta);
         self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
             "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
+        let equity = self.traders.get(&f.user).map(|t| t.equity).filter(|&e| e > 0.0)
+            .or_else(|| self.leaders.get(&f.user).map(|l| l.account_value)).unwrap_or(0.0);
+        self.flow.push(&f.coin, f.time_ms, &f.user, f.delta * f.px, equity);
         let Some(t) = self.traders.get_mut(&f.user) else {
             // First sight: read its positions, then mirror them.
             self.read_account(&f.user.clone(), "enroll");
@@ -443,7 +501,7 @@ impl Engine {
 
     fn on_funding(&mut self, ctx: HashMap<String, (f64, f64)>) {
         let mut total = 0.0;
-        for t in self.traders.values_mut() {
+        for t in self.traders.values_mut().chain(self.signals.values_mut()) {
             if t.acct.liquidated {
                 continue;
             }
@@ -461,22 +519,30 @@ impl Engine {
             }
         }
         self.dirty = true;
-        log!("funding: ${total:.2} across copy accounts");
+        log!("funding: ${total:.2} across copy and signal accounts");
         let live: Vec<&Trader> = self.traders.values().filter(|t| !t.acct.liquidated).collect();
-        let (weight, backlog) = self.api.usage();
         log!(
-            "status: {} copy accounts ({} liquidated), {} followed, {} positions open; {} copy fills in all; \
-             API weight {weight} in the last hour, backlog {backlog:.0} s",
+            "status: {} copy accounts ({} liquidated), {} followed, {} positions open; {} copy fills in all",
             self.traders.len(),
             self.traders.len() - live.len(),
             self.followed.read().unwrap().len(),
             live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
         );
+        let b = self.books.read().unwrap();
+        let marks = |c: &str| b.get(c).and_then(Book::mid);
+        let line: Vec<String> = VARIANTS.iter().filter_map(|v| {
+            let t = self.signals.get(&format!("{SIGNAL_PREFIX}{}", v.name))?;
+            let s = t.signal.as_ref()?;
+            Some(format!("{} ${:.0} ({} taken, {} open)", v.name, t.acct.equity(&marks), s.taken, s.open.len()))
+        }).collect();
+        log!("signals: {}", line.join(", "));
+
     }
 
     /// Liquidations and reconciliation of active accounts.
     fn on_tick(&mut self) {
+        let started = std::time::Instant::now();
         let books = self.books.clone();
         let b = books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
@@ -497,9 +563,24 @@ impl Engine {
                 stale.push(a.clone());
             }
         }
+        for t in self.signals.values_mut() {
+            let equity = t.acct.equity(&marks);
+            mark(t, &marks, equity);
+        }
         drop(b);
         for a in liquidate {
             self.liquidate(&a);
+        }
+        let signals_at = std::time::Instant::now();
+        self.run_signals();
+        let (tick, sig) = (started.elapsed().as_secs_f64() * 1000.0, signals_at.elapsed().as_secs_f64() * 1000.0);
+        self.load.ticks += 1;
+        self.load.tick_ms += tick;
+        self.load.tick_max_ms = self.load.tick_max_ms.max(tick);
+        self.load.signals_ms += sig;
+        self.load.signals_max_ms = self.load.signals_max_ms.max(sig);
+        if self.load.ticks >= 120 {
+            self.status();
         }
         for a in stale.into_iter().take(20) {
             self.read_account(&a, "reconcile");
@@ -508,6 +589,211 @@ impl Engine {
         for a in self.resync.split_off(n) {
             self.read_account(&a, "restart");
         }
+    }
+
+    /// Every 10 min (120 ticks): the bot's health to `bot_status` — what it follows and holds,
+    /// the API budget, and how long its ticks take (they run on the one loop the copies use).
+    fn status(&mut self) {
+        let l = std::mem::take(&mut self.load);
+        let n = l.ticks.max(1) as f64;
+        let (weight, backlog) = self.api.usage();
+        let live: Vec<&Trader> = self.traders.values().filter(|t| !t.acct.liquidated).collect();
+        let st = json!({
+            "at": r(now(), 3),
+            "copy_accounts": self.traders.len(),
+            "liquidated": self.traders.len() - live.len(),
+            "followed": self.followed.read().unwrap().len(),
+            "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
+            "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
+            "api_weight": weight,
+            "api_backlog_s": r(backlog, 1),
+            "ticks": l.ticks,
+            "tick_avg_ms": r(l.tick_ms / n, 2),
+            "tick_max_ms": r(l.tick_max_ms, 2),
+            "signals_avg_ms": r(l.signals_ms / n, 2),
+            "signals_max_ms": r(l.signals_max_ms, 2),
+            "flow_fills": self.flow.len(),
+            "signal_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.open.len()).sum::<usize>(),
+            "signal_trades_taken": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.taken).sum::<u64>(),
+        });
+        log!("status: {st}");
+        self.store.status(st);
+    }
+
+    /// Every variant reads the coins with recent flow (and the held ones): open trades are
+    /// closed at their stop, take profit, expiry or when the traders turn the other way; new
+    /// ones are opened where a variant fires.
+    fn run_signals(&mut self) {
+        let now_ms = (exchange_now() * 1000.0) as u64;
+        self.flow.prune(now_ms);
+        let at = now();
+        let books = self.books.clone();
+        let b = books.read().unwrap();
+        let marks = |c: &str| b.get(c).and_then(Book::mid);
+        // The traders whose copies we run at a profit, and every copied trader's positions as a
+        // share of its equity.
+        let best: HashSet<String> = self.traders.iter()
+            .filter(|(_, t)| !t.acct.liquidated && t.copy_fills >= 3 && t.acct.equity(&marks) > t.acct.start)
+            .map(|(a, _)| a.clone()).collect();
+        let mut positions: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+        for (a, t) in &self.traders {
+            if t.acct.liquidated || t.equity <= 0.0 {
+                continue;
+            }
+            for (c, s) in &t.theirs {
+                if let Some(m) = marks(c) {
+                    positions.entry(c.clone()).or_default().push((a.clone(), s * m / t.equity));
+                }
+            }
+        }
+        let mut coins: Vec<String> = self.flow.coins().chain(positions.keys()).cloned().collect::<HashSet<_>>().into_iter().collect();
+        coins.sort();
+        let inputs = Inputs::new(&self.flow, &positions, &best, now_ms);
+        let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
+        let mut opens: Vec<(&'static Variant, String, Reading)> = Vec::new();
+        for v in VARIANTS {
+            let key = format!("{SIGNAL_PREFIX}{}", v.name);
+            let Some(state) = self.signals.get(&key).and_then(|t| t.signal.as_ref()) else { continue };
+            for (coin, os) in &state.open {
+                let Some(mid) = marks(coin) else { continue };
+                let rd = inputs.read(v, coin);
+                let why = if (mid - os.stop) * os.side <= 0.0 {
+                    "stop"
+                } else if (mid - os.tp) * os.side >= 0.0 {
+                    "take profit"
+                } else if at >= os.expires {
+                    "expiry"
+                } else if rd.side == -os.side {
+                    "traders turned"
+                } else {
+                    continue;
+                };
+                closes.push((key.clone(), coin.clone(), why, rd));
+            }
+            let mut open = state.open.len();
+            for coin in &coins {
+                if open >= signals::MAX_OPEN {
+                    break;
+                }
+                if state.open.contains_key(coin) || state.closed_at.get(coin).is_some_and(|&t| at - t < v.cooldown_s) || marks(coin).is_none() {
+                    continue;
+                }
+                let rd = inputs.read(v, coin);
+                if rd.side != 0.0 {
+                    opens.push((v, coin.clone(), rd));
+                    open += 1;
+                }
+            }
+        }
+        drop(inputs);
+        drop(b);
+        for (key, coin, why, rd) in closes {
+            self.close_signal(&key, &coin, why, &rd);
+        }
+        for (v, coin, rd) in opens {
+            self.open_signal(v, &coin, &rd);
+        }
+    }
+
+    /// Opens `v`'s trade in `coin`: a taker order sized to risk `RISK_PCT` of the account at the
+    /// variant's stop, stop and take profit set from the fill.
+    fn open_signal(&mut self, v: &Variant, coin: &str, rd: &Reading) {
+        let key = format!("{SIGNAL_PREFIX}{}", v.name);
+        let Some(info) = self.coins.get(coin).cloned() else { return };
+        let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
+        let Some(mid) = book.mid() else { return };
+        let (equity, gross) = {
+            let b = self.books.read().unwrap();
+            let marks = |c: &str| b.get(c).and_then(Book::mid);
+            let Some(t) = self.signals.get(&key) else { return };
+            let gross: f64 = t.acct.positions.iter().map(|(c, p)| p.size.abs() * marks(c).unwrap_or(p.entry)).sum();
+            (t.acct.equity(&marks), gross)
+        };
+        if equity <= 0.0 {
+            return;
+        }
+        let usd = signals::notional(equity, gross, v.exit.stop_pct);
+        let size = round_size(usd / mid, info.sz_decimals);
+        if size * mid < self.cfg.min_order_usd {
+            return;
+        }
+        let side_levels = if rd.side > 0.0 { &book.asks } else { &book.bids };
+        let (got, px) = walk(side_levels, size);
+        if got <= 0.0 {
+            return;
+        }
+        let best_px = side_levels[0].0;
+        let fee = got * px * self.cfg.taker_fee;
+        let at = now();
+        let Some(t) = self.signals.get_mut(&key) else { return };
+        book_fill(t, coin, got * rd.side, px, fee, equity, at, true);
+        // Price vs the mid when the signal fired: the spread and the book walked.
+        let (mv, impact) = (got * (best_px - mid) * rd.side, got * (px - best_px) * rd.side);
+        t.stats.copy(0.0, 0.0, got * px, mv + impact, mv, impact);
+        let stop = px * (1.0 - rd.side * v.exit.stop_pct / 100.0);
+        let os = OpenSignal {
+            id: format!("{}-{coin}-{}", v.name, (at * 1000.0) as u64),
+            side: rd.side,
+            entry: px,
+            stop,
+            tp: px * (1.0 + rd.side * v.exit.tp_pct / 100.0),
+            opened: at,
+            expires: at + v.hold_s,
+            mid,
+            size: got,
+            risk_usd: got * (px - stop).abs(),
+            risk_pct: got * (px - stop).abs() / equity * 100.0,
+            fee,
+            reason: json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3), "score_pct": r(rd.score, 2),
+                "buy_usd": r(rd.buy_usd, 0), "sell_usd": r(rd.sell_usd, 0), "window_s": v.window_s, "book_ms": book.time_ms}),
+        };
+        let state = t.signal.get_or_insert_with(Default::default);
+        state.taken += 1;
+        state.open.insert(coin.to_string(), os.clone());
+        self.dirty = true;
+        self.store.trade(ticket(v.name, coin, &os, None));
+    }
+
+    /// Closes `key`'s trade in `coin` at the book.
+    fn close_signal(&mut self, key: &str, coin: &str, why: &'static str, rd: &Reading) {
+        let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
+        let fee_rate = self.cfg.taker_fee;
+        let at = now();
+        let Some(t) = self.signals.get_mut(key) else { return };
+        let ours = t.acct.size(coin);
+        let Some(os) = t.signal.as_ref().and_then(|s| s.open.get(coin)).cloned() else { return };
+        if ours != 0.0 {
+            let (got, px) = walk(if ours > 0.0 { &book.bids } else { &book.asks }, ours.abs());
+            if got <= 0.0 {
+                return;
+            }
+            let fee = got * px * fee_rate;
+            let pnl = t.trips.get(coin).map(|x| x.pnl).unwrap_or(0.0) + (px - os.entry) * got * os.side - fee;
+            let opened_equity = t.trips.get(coin).map(|x| x.equity).unwrap_or(t.acct.start);
+            book_fill(t, coin, -ours.signum() * got, px, fee, 0.0, at, false);
+            if t.acct.size(coin) != 0.0 {
+                // Not all of it filled (thin book): the rest goes at the next tick.
+                if let Some(o) = t.signal.as_mut().and_then(|s| s.open.get_mut(coin)) {
+                    o.fee += fee;
+                }
+                return;
+            }
+            let variant = key.trim_start_matches(SIGNAL_PREFIX).to_string();
+            let mut row = ticket(&variant, coin, &os, Some((at, px, why)));
+            row.fees = os.fee + fee;
+            row.pnl = Some(r(pnl, 4));
+            row.pnl_pct = Some(r(pnl / opened_equity * 100.0, 3));
+            if let serde_json::Value::Object(m) = &mut row.reason {
+                m.insert("traders_at_close".into(), json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3)}));
+            }
+            self.store.trade(row);
+        }
+        let Some(t) = self.signals.get_mut(key) else { return };
+        if let Some(s) = t.signal.as_mut() {
+            s.open.remove(coin);
+            s.closed_at.insert(coin.to_string(), at);
+        }
+        self.dirty = true;
     }
 
     fn liquidate(&mut self, user: &str) {
@@ -603,5 +889,46 @@ mod tests {
         assert!((t.stats.loss_usd - 10.2).abs() < 1e-9);
         assert!(t.trips.is_empty());
         assert_eq!(t.stats.entries, 3);
+    }
+}
+
+/// One line on what a variant does, for its account's name.
+fn describe(v: &Variant) -> String {
+    let w = v.window_s / 60.0;
+    let what = match v.kind {
+        signals::Kind::Heads => format!("{}+ traders, {:.0}%+ of them one way over {w:.0} min", v.min_traders, v.min_agree * 100.0),
+        signals::Kind::Conviction => format!("{}+ traders, net {}% of equity one way over {w:.0} min", v.min_traders, v.min_score),
+        signals::Kind::Volume => format!("${:.0}k+ net, {:.0}%+ of it one way, {}+ traders, over {w:.0} min", v.min_usd / 1000.0,
+            v.min_agree * 100.0, v.min_traders),
+        signals::Kind::Positioning => format!("{}+ traders holding, {:.0}%+ one way", v.min_traders, v.min_agree * 100.0),
+    };
+    format!("{}{}{}; stop {}%, tp {}%, {:.0} min max", if v.fade { "against: " } else { "" }, if v.best_only { "profitable copies only: " } else { "" },
+        what, v.exit.stop_pct, v.exit.tp_pct, v.hold_s / 60.0)
+}
+
+/// A signal trade's row: its ticket, and how it closed once it has.
+fn ticket(variant: &str, coin: &str, os: &OpenSignal, closed: Option<(f64, f64, &str)>) -> TradeRow {
+    TradeRow {
+        id: os.id.clone(),
+        variant: variant.to_string(),
+        coin: coin.to_string(),
+        side: if os.side > 0.0 { "long" } else { "short" }.to_string(),
+        opened_at: r(os.opened, 3),
+        mid: os.mid,
+        entry: os.entry,
+        stop: os.stop,
+        take_profit: os.tp,
+        size: os.size,
+        notional: r(os.size * os.entry, 4),
+        risk_usd: r(os.risk_usd, 4),
+        risk_pct: r(os.risk_pct, 4),
+        expires_at: r(os.expires, 3),
+        reason: os.reason.clone(),
+        closed_at: closed.map(|c| r(c.0, 3)),
+        exit_px: closed.map(|c| c.1),
+        exit_reason: closed.map(|c| c.2.to_string()),
+        pnl: None,
+        pnl_pct: None,
+        fees: r(os.fee, 6),
     }
 }

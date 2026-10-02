@@ -241,7 +241,7 @@ impl Engine {
         let applied = self.traders.get(&f.user).is_some_and(|t| !t.acct.liquidated && f.time_ms > t.read_ms);
         let pos_after = self.traders.get(&f.user).filter(|_| applied).map(|t| t.theirs.get(&f.coin).copied().unwrap_or(0.0) + f.delta);
         self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
-            "time_ms": f.time_ms, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
+            "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
         let Some(t) = self.traders.get_mut(&f.user) else {
             // First sight: read its positions, then mirror them.
             self.read_account(&f.user.clone(), "enroll");

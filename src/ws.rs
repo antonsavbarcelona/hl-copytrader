@@ -27,6 +27,8 @@ pub struct UserFill {
     pub delta: f64,
     pub px: f64,
     pub time_ms: u64,
+    /// The exchange's trade id (one trade, both its sides).
+    pub tid: u64,
     /// When it reached us, on the exchange's clock.
     pub recv: f64,
 }
@@ -129,7 +131,7 @@ pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>
             let (px, sz) = (num(&t["px"]), num(&t["sz"]));
             for (user, sign) in [(buyer.to_lowercase(), 1.0), (seller.to_lowercase(), -1.0)] {
                 if set.contains(&user) {
-                    let _ = tx.send(UserFill { user, coin: coin.clone(), delta: sign * sz, px, time_ms, recv });
+                    let _ = tx.send(UserFill { user, coin: coin.clone(), delta: sign * sz, px, time_ms, tid, recv });
                 }
             }
         }

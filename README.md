@@ -97,7 +97,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   positions, all the measures above, open trips), upserted every 30 s when changed.
 - `events`: `at`, `kind`, `address`, `coin`, `data` (jsonb):
   - `their_fill`: every fill of a followed account as it reached us (size signed, price,
-    exchange time, feed delay, its position after) — what the traders did;
+    exchange time, the exchange's trade id `tid`, feed delay, its position after) — what the
+    traders did;
   - `fill`: ours (`why`: seed / copy / reconcile / restart / stale), with lag, the trader's
     price and slippage vs it (`slip_bps`, of it `move_bps`);
   - `enroll`, `plan` (the trader's set-up for a position), `liquidated`.

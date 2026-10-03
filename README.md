@@ -65,26 +65,46 @@ minute) is per IP, and the image takes 800 of it.
 
 ## Signals
 
-Besides copying each trader, the run trades its own signals out of what the followed traders
-do together: a grid of 35 variants side by side (`VARIANTS` in `src/signals.rs`), each on its
-own $1000 paper account (`signal:<name>`) filled on the live books like the copies.
+Besides copying each trader, the run trades its own signals: a grid of 61 variants side by side
+(`VARIANTS` in `src/signals.rs`), each on its own $1000 paper account (`signal:<name>`) filled on
+the live books like the copies.
 
-Per coin over a window, each trader's net flow (bought minus sold, so a split order or a market
-maker's churn counts once) is read four ways:
+Out of what the followed traders do, per coin over a window from each trader's net flow (bought
+minus sold, so a split order or a market maker's churn counts once):
 
 - **heads** (`h…`): traders net buying vs net selling; a trader takes a side when its net flow
   is 0.2%+ of its own equity, so one whale does not outvote the crowd;
 - **conviction** (`c…`): the sum of the traders' net flows, each as % of its own equity
   (one trader counts up to 20%);
 - **volume** (`v…`): dollars of net buying vs net selling;
-- **positioning** (`p…`): the copied traders holding the coin long vs short now (1%+ of equity).
+- **positioning** (`p…`): the copied traders holding the coin long vs short now (1%+ of equity);
+  `fade-p…-fund` bet against a crowded side only when funding (0.00125%/h+, ~11% a year) is paid
+  by that side, `-oi` also when open interest rose 3%+ in 4 h;
+- **clusters** (`sl…`): the copied traders' stop orders and liquidation prices (read with their
+  set-ups) within 1–2% of the price: $250k–$1M of them on one side (70%+ of those in the band)
+  is where a cascade would start; the trade goes the way they would push the price.
+
+Out of everyone's trades (the public stream names every taker):
+
+- **whales** (`w…`): wallets whose net taker flow in a coin over 5–60 min is $250k–$1M+.
+
+Out of prices alone (mids every minute; at a start the last 5 h of one-minute candles of the 60
+most traded coins are read, so these do not wait hours):
+
+- **trend** (`t…`): a coin among the 60 most traded moved 0.6%+ in 15 min / 1.2%+ in 60 min:
+  followed; `fade-t240m…`: 3.3%+ in 4 h, faded (reversal);
+- **cross momentum** (`x…`): among the 40 most traded, the 3 strongest against BTC over 60 / 240
+  min long, the 3 weakest short, held as long and entered again while still among them.
 
 The grid spans windows of 1 / 5 / 15 / 30 / 60 / 240 min, 2–20 traders, 60–90% agreement,
 $200k–$2M, and three exits — S (stop 0.75%, take profit 1.5%), M (1.5 / 3%), L (3 / 6%) — with
 one signal run under all three to tell the signal from the exit. `best-…` count only the traders
-whose copies run at a profit; `fade-…` take the opposite trade, as controls (if a fade wins
-too, the signal is noise). A name reads e.g. `h15m-5t-75-M`: heads, 15 min, 5+ traders, 75%+
-of them one way, exit M.
+whose copies run at a profit, `low-…` only those whose every leverage setting seen is 10x or
+less with an account of $30k+; `fade-…` take the opposite trade, as controls (if a fade wins
+too, the signal is noise). Exit variations of the best signals: `-tr` a trailing stop (1.5% /
+3% behind the best price since the entry, no take profit), `-be` the stop moved to the entry
+once the trade is 1R up, `-60` held at most 60 min. A name reads e.g. `h15m-5t-75-M`: heads, 15
+min, 5+ traders, 75%+ of them one way, exit M.
 
 Every entry is a complete trade, a row of `signal_trades`: coin, side, entry, stop, take
 profit, expiry, size from 1% of the account's equity at risk at the stop (all positions at
@@ -103,9 +123,10 @@ out. Each one also gets two limit-order twins of the same size (`signal_maker_tr
   opposite best when the spread is wider than a tick, else our side's best), following the price
   when it moves away, for up to 30 s; then `limit` cancels the rest (a trade that got nothing is
   "not filled"), `limit+market` takes it at the book;
-- it fills when a trade prints through its price, when trades at its price use up the size that
-  rested ahead of it (the size at that level when it was placed, less what the book later shows),
-  or when the opposite side of the book reaches it; maker fee 0.015%;
+- trades through its price fill it by their size; trades at its price, once they used up the size
+  that rested ahead of it (the size at that level when it was placed, less what the book later
+  shows); and so does what the opposite side of the book shows at or through its price (counted
+  once while it stays there); maker fee 0.015%;
 - once in: stop and take profit at the same distances from its own entry, the take profit a resting
   limit order (maker), the stop, expiry and the traders turning at the book (taker).
 
@@ -168,7 +189,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
   used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`, of it
   `signals_*_ms`), and more in `data` (of it the watched coins' trades and book changes:
-  `market_msgs`, `market_*_ms`, `watched_coins`, `maker_trades_open`). The ticks run on the loop
+  `market_msgs`, `market_*_ms`, `watched_coins`, `maker_trades_open`; `whale_wallets` tracked,
+  `ctx_coins` with funding / open interest). The ticks run on the loop
   the copies use: a few ms is fine, hundreds would start to delay copies.
 
 The database being away does not stop the run: writes wait and go out once it is back.

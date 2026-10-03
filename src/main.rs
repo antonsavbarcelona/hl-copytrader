@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let api = api::Api::new(cfg.weight_per_min)?;
-    let (coins, _) = api.meta().await?;
+    let (coins, ctx0) = api.meta().await?;
     log!("{} perp coins", coins.len());
     let names: Vec<String> = coins.iter().map(|c| c.name.clone()).collect();
     let books: ws::Books = Default::default();
@@ -52,7 +52,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let traders = store::load(&cfg).await?;
     let store = store::open(&cfg).await?;
     let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
-    let (followed, watched) = (engine.followed.clone(), engine.watched.clone());
+    let (followed, watched, whales) = (engine.followed.clone(), engine.watched.clone(), engine.whales.clone());
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
     {
@@ -89,7 +89,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     // Fills, trades and book changes go through their own channel into the engine's.
     let (ftx, mut frx) = mpsc::unbounded_channel();
     tokio::spawn(ws::run_books(names.clone(), books.clone(), watched.clone(), ftx.clone()));
-    tokio::spawn(ws::run_trades(names, followed, watched, ftx));
+    tokio::spawn(ws::run_trades(names, followed, watched, whales, ftx));
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -102,6 +102,39 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                 if tx.send(msg).is_err() {
                     break;
                 }
+            }
+        });
+    }
+    // The most traded coins' last hours of prices, so the price signals start at once.
+    {
+        let (api, tx) = (api.clone(), tx.clone());
+        let mut liquid: Vec<(String, f64)> = ctx0.iter().map(|(c, x)| (c.clone(), x.day_volume)).collect();
+        liquid.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let start = ((api::now() - signals::PRICE_KEEP_S) * 1000.0) as u64;
+        tokio::spawn(async move {
+            for (coin, _) in liquid.into_iter().take(signals::TREND_COINS) {
+                match api.candles(&coin, start).await {
+                    Ok(closes) => {
+                        let _ = tx.send(engine::Msg::Seed { coin, closes });
+                    }
+                    Err(e) => log!("candles {coin}: {e}"),
+                }
+            }
+            log!("prices: last {} h of the {} most traded coins read", signals::PRICE_KEEP_S / 3600.0, signals::TREND_COINS);
+        });
+    }
+    // Funding, open interest and volume per coin now and every 5 min (crowding, trend coins).
+    {
+        let (api, tx) = (api.clone(), tx.clone());
+        tokio::spawn(async move {
+            loop {
+                match api.meta().await {
+                    Ok((_, ctx)) => {
+                        let _ = tx.send(engine::Msg::Ctx(ctx));
+                    }
+                    Err(e) => log!("coin context read failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(300)).await;
             }
         });
     }

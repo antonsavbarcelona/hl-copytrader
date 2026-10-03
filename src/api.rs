@@ -52,6 +52,17 @@ pub struct CoinInfo {
     pub sz_decimals: u32,
 }
 
+/// A coin's state on the exchange.
+#[derive(Clone, Debug, Default)]
+pub struct CoinCtx {
+    /// Funding rate (hourly) and mark price.
+    pub funding: f64,
+    pub mark: f64,
+    /// Open interest and 24 h volume, USD.
+    pub oi_usd: f64,
+    pub day_volume: f64,
+}
+
 /// How a position of the account is set up on the exchange.
 #[derive(Clone, Debug, Default)]
 pub struct PosSetup {
@@ -143,8 +154,8 @@ impl Api {
         bail!("info {body}: still failing")
     }
 
-    /// Active perp coins (main dex) and, per coin, the current funding rate and mark price.
-    pub async fn meta(&self) -> Result<(Vec<CoinInfo>, HashMap<String, (f64, f64)>)> {
+    /// Active perp coins (main dex) and, per coin, its funding, mark, open interest, volume.
+    pub async fn meta(&self) -> Result<(Vec<CoinInfo>, HashMap<String, CoinCtx>)> {
         let v = self.info(json!({"type": "metaAndAssetCtxs"}), 20).await?;
         let mut coins = Vec::new();
         let mut ctx = HashMap::new();
@@ -153,13 +164,21 @@ impl Api {
         for (i, u) in universe.iter().enumerate() {
             let name = u["name"].as_str().unwrap_or("").to_string();
             if let Some(c) = ctxs.get(i) {
-                ctx.insert(name.clone(), (num(&c["funding"]), num(&c["markPx"])));
+                let mark = num(&c["markPx"]);
+                ctx.insert(name.clone(), CoinCtx { funding: num(&c["funding"]), mark, oi_usd: num(&c["openInterest"]) * mark,
+                                                   day_volume: num(&c["dayNtlVlm"]) });
             }
             if !u["isDelisted"].as_bool().unwrap_or(false) {
                 coins.push(CoinInfo { name, sz_decimals: u["szDecimals"].as_u64().unwrap_or(0) as u32 });
             }
         }
         Ok((coins, ctx))
+    }
+
+    /// One-minute candles' closes of `coin` from `start_ms` on: (open time ms, close).
+    pub async fn candles(&self, coin: &str, start_ms: u64) -> Result<Vec<(u64, f64)>> {
+        let v = self.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ms}}), 20).await?;
+        Ok(v.as_array().cloned().unwrap_or_default().iter().filter_map(|k| Some((k["t"].as_u64()?, num(&k["c"])))).collect())
     }
 
     pub async fn account(&self, user: &str) -> Result<AccountState> {

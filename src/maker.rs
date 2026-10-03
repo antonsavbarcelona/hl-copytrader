@@ -7,9 +7,10 @@
 //!
 //! The entry order sits at the most aggressive post-only price: one tick inside the opposite
 //! best when the spread is wider than a tick, else at our side's best, and follows the price
-//! when it moves away. It fills when a trade prints through its price, when trades at its price
-//! use up the size resting ahead of it (the size at that level when it was placed, less what
-//! the book later shows), or when the opposite side of the book reaches it. Once in, the take
+//! when it moves away. Trades through its price fill it by their size; trades at its price, once
+//! they used up the size resting ahead of it (the size at that level when it was placed, less
+//! what the book later shows); and so does what the opposite side of the book shows at or
+//! through its price (counted once while it stays). Once in, the take
 //! profit is a resting limit order too (maker fee); stop, expiry and the traders turning close
 //! at the book (taker), like the market trade.
 
@@ -80,6 +81,9 @@ pub struct Resting {
     /// Exchange time of the book it was placed on: trades up to then are in that book.
     #[serde(default)]
     pub since_ms: u64,
+    /// Opposite size at or through our price already counted.
+    #[serde(default)]
+    pub crossed: f64,
 }
 
 impl Resting {
@@ -87,7 +91,7 @@ impl Resting {
     pub fn new(side: f64, px: f64, size: f64, book: &Book) -> Self {
         let ours = if side > 0.0 { &book.bids } else { &book.asks };
         let ahead = ours.iter().find(|l| same_px(l.0, px)).map(|l| l.1).unwrap_or(0.0);
-        Self { side, px, left: size, ahead, since_ms: book.time_ms }
+        Self { side, px, left: size, ahead, since_ms: book.time_ms, crossed: 0.0 }
     }
 
     /// A trade printed at `time_ms` (`taker_buy`: its aggressor bought): the size of ours it
@@ -99,8 +103,10 @@ impl Resting {
             return 0.0;
         }
         if (px - self.px) * self.side < 0.0 && !same_px(px, self.px) {
-            // Through our price: everything at it, ours too, went first.
-            return std::mem::take(&mut self.left);
+            // Through our price: that much would have been ours first.
+            let f = self.left.min(sz);
+            self.left -= f;
+            return f;
         }
         if !same_px(px, self.px) {
             return 0.0;
@@ -115,15 +121,21 @@ impl Resting {
         f
     }
 
-    /// The book changed: the opposite side reaching our price fills us; what rests ahead of us
-    /// is at most what the book shows at our price (cancels ahead of us move us up).
+    /// The book changed: what the opposite side shows at or through our price would have
+    /// matched us (counted once while it stays there: our order is not really in the book, so it
+    /// does not take it away); what rests ahead of us is at most what the book shows at our
+    /// price (cancels ahead of us move us up).
     pub fn on_book(&mut self, book: &Book) -> f64 {
         if self.left <= 0.0 {
             return 0.0;
         }
         let (ours, theirs) = if self.side > 0.0 { (&book.bids, &book.asks) } else { (&book.asks, &book.bids) };
-        if theirs.first().is_some_and(|l| (l.0 - self.px) * self.side <= 0.0) {
-            return std::mem::take(&mut self.left);
+        let crossing: f64 = theirs.iter().take_while(|l| (l.0 - self.px) * self.side <= 0.0 || same_px(l.0, self.px)).map(|l| l.1).sum();
+        let f = self.left.min((crossing - self.crossed).max(0.0));
+        self.crossed = crossing;
+        if f > 0.0 {
+            self.left -= f;
+            return f;
         }
         // Levels shown best first: our price is inside the shown depth if it is not past the last.
         if let Some(last) = ours.last() {
@@ -155,6 +167,16 @@ pub struct MakerTrade {
     pub market_entry: f64,
     pub stop_pct: f64,
     pub tp_pct: f64,
+    /// Trailing / break-even rules of the variant's exit, the best mid since the entry, and
+    /// the stop once they moved it.
+    #[serde(default)]
+    pub trail_pct: f64,
+    #[serde(default)]
+    pub be_r: f64,
+    #[serde(default)]
+    pub peak: f64,
+    #[serde(default)]
+    pub stop_px: Option<f64>,
     pub expires: f64,
     /// The variant account's equity at the open (for % of equity).
     pub equity: f64,
@@ -189,7 +211,7 @@ impl MakerTrade {
     }
 
     pub fn stop(&self) -> f64 {
-        self.entry() * (1.0 - self.side * self.stop_pct / 100.0)
+        self.stop_px.unwrap_or_else(|| self.entry() * (1.0 - self.side * self.stop_pct / 100.0))
     }
 
     pub fn tp(&self) -> f64 {
@@ -357,6 +379,14 @@ impl MakerTrade {
                 }
             }
         }
+        if let (Some(mid), true) = (book.mid(), self.closed_at.is_none() && self.held() > 0.0 && (self.trail_pct > 0.0 || self.be_r > 0.0)) {
+            let (stop, entry) = (self.stop(), self.entry());
+            let s = crate::signals::follow_stop(self.side, entry, stop, self.stop_pct, self.trail_pct, self.be_r, &mut self.peak, mid);
+            if s != stop {
+                self.stop_px = Some(s);
+                changed = true;
+            }
+        }
         if self.closed_at.is_none() && self.held() > 0.0 && book.mid().is_some_and(|m| (m - self.stop()) * self.side <= 0.0) {
             self.close_at_book(book, at, "stop");
             changed = true;
@@ -405,18 +435,23 @@ mod tests {
         assert_eq!(o.on_print(false, 100.0, 2.0, 1), 0.0); // 1 left ahead
         assert_eq!(o.on_print(false, 100.0, 1.5, 1), 0.5);
         assert_eq!(o.left, 1.5);
-        // Cancels ahead: nothing ahead now; a sell through our price fills the rest.
+        // Cancels ahead: less ahead now; sells through our price fill as much as they trade.
         o.ahead = 1.0;
         o.on_book(&book(&[(100.0, 0.5)], &[(100.1, 5.0)]));
         assert_eq!(o.ahead, 0.5);
-        assert_eq!(o.on_print(false, 99.9, 0.1, 1), 1.5);
+        assert_eq!(o.on_print(false, 99.9, 0.1, 1), 0.1);
+        assert!((o.on_print(false, 99.8, 2.0, 1) - 1.4).abs() < 1e-12);
         assert_eq!(o.left, 0.0);
     }
 
     #[test]
     fn book_reaching_the_order_fills_it() {
         let mut o = Resting::new(1.0, 100.0, 2.0, &book(&[(100.0, 3.0)], &[(100.1, 5.0)]));
-        assert_eq!(o.on_book(&book(&[(99.9, 3.0)], &[(100.0, 1.0)])), 2.0);
+        assert_eq!(o.on_book(&book(&[(99.9, 3.0)], &[(100.0, 1.0)])), 1.0);
+        // The same offer still there is not counted again; more of it is.
+        assert_eq!(o.on_book(&book(&[(99.9, 3.0)], &[(100.0, 1.0)])), 0.0);
+        assert_eq!(o.on_book(&book(&[(99.9, 3.0)], &[(99.95, 0.5), (100.0, 1.0)])), 0.5);
+        assert_eq!(o.left, 0.5);
         // A take profit far from the book keeps its place until the book shows its price.
         let mut tp = Resting::new(-1.0, 103.0, 1.0, &book(&[(100.0, 3.0)], &[(100.1, 5.0)]));
         tp.ahead = 4.0;
@@ -444,8 +479,11 @@ mod tests {
         assert!(t.order.is_none() && t.tp_order.is_some());
         // Take profit at entry +2%, filled by buyers through it.
         let tp = t.tp();
-        t.on_print(true, tp + 0.5, 1.0, 1, Some(&b), 100.0);
+        t.on_print(true, tp + 0.5, 1.5, 1, Some(&b), 100.0);
+        assert!(t.closed_at.is_none() && (t.held() - 0.5).abs() < 1e-12);
+        t.on_print(true, tp + 0.4, 1.0, 1, Some(&b), 101.0);
         assert_eq!(t.exit_reason.as_deref(), Some("take profit"));
+        assert_eq!(t.exit_maker, 2.0);
         assert!((t.realized - 2.0 * (tp - t.entry())).abs() < 1e-9);
     }
 
@@ -462,11 +500,30 @@ mod tests {
     }
 
     #[test]
+    fn trailing_stop_on_the_twin() {
+        let b = book(&[(100.0, 3.0)], &[(100.01, 5.0)]);
+        let mut t = MakerTrade { trail_pct: 1.0, tp_pct: 50.0, ..twin(Mode::Limit) };
+        t.place(&b, 0.0);
+        t.on_print(false, 99.99, 5.0, 1, Some(&b), 1.0);
+        assert_eq!(t.filled, 2.0);
+        // Up to 105: the stop trails 1% behind (103.95); a dip to 104 keeps it; 103.9 stops.
+        t.on_book(&book(&[(104.99, 10.0)], &[(105.01, 5.0)]), 2.0);
+        assert!((t.stop() - 105.0 * 0.99).abs() < 1e-9);
+        t.on_book(&book(&[(103.99, 10.0)], &[(104.01, 5.0)]), 3.0);
+        assert!(t.closed_at.is_none() && (t.stop() - 105.0 * 0.99).abs() < 1e-9);
+        t.on_book(&book(&[(103.89, 10.0)], &[(103.91, 5.0)]), 4.0);
+        assert_eq!(t.exit_reason.as_deref(), Some("stop"));
+        assert!((t.realized - 2.0 * (103.89 - 100.0)).abs() < 1e-9);
+    }
+
+    #[test]
     fn stop_at_the_book() {
         let b = book(&[(100.0, 3.0)], &[(100.01, 5.0)]);
         let mut t = twin(Mode::Limit);
         t.place(&b, 0.0);
-        t.on_print(false, 99.99, 1.0, 1, Some(&b), 1.0); // through: all of it
+        t.on_print(false, 99.99, 1.0, 1, Some(&b), 1.0); // through: as much as it traded
+        assert_eq!(t.filled, 1.0);
+        t.on_print(false, 99.98, 5.0, 1, Some(&b), 1.5);
         assert_eq!(t.filled, 2.0);
         t.on_book(&book(&[(98.9, 10.0)], &[(98.92, 5.0)]), 2.0);
         assert_eq!(t.exit_reason.as_deref(), Some("stop"));

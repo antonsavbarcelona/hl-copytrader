@@ -22,14 +22,14 @@ use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::account::{Account, round_size, walk};
-use crate::api::{AccountState, Api, CoinInfo, Leader, Trigger, exchange_now, now};
+use crate::api::{AccountState, Api, CoinCtx, CoinInfo, Leader, Trigger, exchange_now, now};
 use crate::config::Config;
 use crate::log;
 use crate::maker::{self, MakerTrade};
-use crate::signals::{self, Flow, Inputs, OpenSignal, Reading, SignalState, VARIANTS, Variant};
+use crate::signals::{self, Ctx, Data, Flow, Inputs, Level, OpenSignal, Prices, Reading, SignalState, VARIANTS, Variant, WhaleFlow};
 use crate::stats::{Plan, Stats, Trip};
 use crate::store::{MakerRow, Row, SignalRow, Store, TradeRow};
-use crate::ws::{Book, Books, UserFill, Watched};
+use crate::ws::{Book, Books, UserFill, Watched, Whales};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Trader {
@@ -60,7 +60,23 @@ pub struct Trader {
     /// Signal accounts (`signal:<variant>`) only: their open signal trades.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<SignalState>,
+    /// Its positions' stops and liquidation prices as last read (coin -> set-up).
+    #[serde(default)]
+    pub setups: HashMap<String, Setup>,
 }
+
+/// A trader's position set-up as read: its side, liquidation price, stop orders (trigger
+/// price, size or None for the whole position).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Setup {
+    pub side: f64,
+    pub liq_px: Option<f64>,
+    pub stops: Vec<(f64, Option<f64>)>,
+    pub at: f64,
+}
+
+/// A set-up older than this is not used for the clusters.
+const SETUP_MAX_AGE_S: f64 = 6.0 * 3600.0;
 
 /// Signal accounts are kept under this prefix, next to the copy accounts.
 pub const SIGNAL_PREFIX: &str = "signal:";
@@ -84,7 +100,11 @@ pub enum Msg {
     /// Its positions' set-up and its stop / take-profit orders.
     Plan { user: String, state: anyhow::Result<(AccountState, Vec<Trigger>)> },
     Leaders(Vec<Leader>),
-    Funding(HashMap<String, (f64, f64)>),
+    Funding(HashMap<String, CoinCtx>),
+    /// Funding, open interest and volume per coin, every few minutes.
+    Ctx(HashMap<String, CoinCtx>),
+    /// A coin's recent one-minute closes, read at a start (price signals need not wait hours).
+    Seed { coin: String, closes: Vec<(u64, f64)> },
     /// A trade in a watched coin (`taker_buy`: its aggressor bought).
     Print { coin: String, px: f64, sz: f64, taker_buy: bool, time_ms: u64 },
     /// A watched coin's book changed.
@@ -103,6 +123,11 @@ pub struct Engine {
     /// Coins with open signal trades or limit-order twins: their trades and book changes come
     /// in as they happen (stops, take profits, limit fills).
     pub watched: Watched,
+    /// Everyone's taker flow (the trades websocket adds to it).
+    pub whales: Whales,
+    /// Mids every minute, and the exchange's per-coin state, for the price and crowding signals.
+    prices: Prices,
+    ctx: Ctx,
     leaders: HashMap<String, Leader>,
     traders: HashMap<String, Trader>,
     /// One account per signal variant (`signal:<name>`).
@@ -180,6 +205,9 @@ impl Engine {
             coins: coins.into_iter().map(|c| (c.name.clone(), c)).collect(),
             followed: Arc::new(RwLock::new(HashSet::new())),
             watched: Arc::new(RwLock::new(HashSet::new())),
+            whales: Arc::new(std::sync::Mutex::new(WhaleFlow::new((exchange_now() * 1000.0) as u64))),
+            prices: Prices::new((exchange_now() * 1000.0) as u64),
+            ctx: Ctx::default(),
             leaders: HashMap::new(),
             traders,
             signals,
@@ -250,6 +278,11 @@ impl Engine {
                 Msg::Plan { user, state } => self.on_plan(user, state),
                 Msg::Leaders(l) => self.on_leaders(l),
                 Msg::Funding(ctx) => self.on_funding(ctx),
+                Msg::Seed { coin, closes } => self.prices.seed(&coin, &closes),
+                Msg::Ctx(ctx) => {
+                    let rows = ctx.iter().map(|(c, x)| (c, x.funding, x.day_volume, x.oi_usd));
+                    self.ctx.update((exchange_now() * 1000.0) as u64, rows);
+                }
                 Msg::Print { coin, px, sz, taker_buy, time_ms } => self.timed(|e| e.on_print(&coin, px, sz, taker_buy, time_ms)),
                 Msg::Book(coin) => self.timed(|e| e.on_book(&coin)),
                 Msg::Tick => self.on_tick(),
@@ -419,6 +452,12 @@ impl Engine {
         };
         let Some(t) = self.traders.get_mut(&user) else { return };
         t.plan_read = now();
+        // Its stops and liquidation prices, every position (for the clusters).
+        t.setups = state.positions.iter().map(|(coin, &size)| {
+            let stops = triggers.iter().filter(|o| &o.coin == coin && o.stop && o.sell == (size > 0.0)).map(|o| (o.trigger_px, o.size)).collect();
+            let liq_px = state.setups.get(coin).and_then(|s| s.liq_px);
+            (coin.clone(), Setup { side: size.signum(), liq_px, stops, at: t.plan_read })
+        }).collect();
         let equity = if t.equity > 0.0 { t.equity } else { state.account_value };
         let mut evs = Vec::new();
         for (coin, trip) in t.trips.iter_mut() {
@@ -514,7 +553,7 @@ impl Engine {
         }
     }
 
-    fn on_funding(&mut self, ctx: HashMap<String, (f64, f64)>) {
+    fn on_funding(&mut self, ctx: HashMap<String, CoinCtx>) {
         let mut total = 0.0;
         for t in self.traders.values_mut().chain(self.signals.values_mut()) {
             if t.acct.liquidated {
@@ -522,9 +561,9 @@ impl Engine {
             }
             let mut paid = 0.0;
             for (c, p) in &t.acct.positions {
-                if let Some((rate, mark)) = ctx.get(c) {
+                if let Some(x) = ctx.get(c) {
                     // Longs pay a positive rate.
-                    paid -= p.size * mark * rate;
+                    paid -= p.size * x.mark * x.funding;
                 }
             }
             if paid != 0.0 {
@@ -582,6 +621,12 @@ impl Engine {
             let equity = t.acct.equity(&marks);
             mark(t, &marks, equity);
         }
+        let now_ms = (exchange_now() * 1000.0) as u64;
+        for (c, book) in b.iter() {
+            if let Some(m) = book.mid() {
+                self.prices.sample(c, now_ms, m);
+            }
+        }
         drop(b);
         for a in liquidate {
             self.liquidate(&a);
@@ -631,6 +676,8 @@ impl Engine {
             "market_avg_ms": r(l.market_ms / (l.market_msgs.max(1) as f64), 3),
             "market_max_ms": r(l.market_max_ms, 2),
             "watched_coins": self.watched.read().unwrap().len(),
+            "whale_wallets": self.whales.lock().unwrap().wallets(),
+            "ctx_coins": self.ctx.volume.len(),
             "maker_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.makers.len()).sum::<usize>(),
             "flow_fills": self.flow.len(),
             "signal_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.open.len()).sum::<usize>(),
@@ -684,9 +731,18 @@ impl Engine {
         let Some(book) = b.get(coin) else { return };
         let Some(mid) = book.mid() else { return };
         let at = now();
-        let closes: Vec<(String, &'static str)> = self.signals.iter()
-            .filter_map(|(key, t)| Some((key.clone(), stop_or_tp(t.signal.as_ref()?.open.get(coin)?, mid)?)))
-            .collect();
+        let mut closes: Vec<(String, &'static str)> = Vec::new();
+        for (key, t) in self.signals.iter_mut() {
+            let Some(os) = t.signal.as_mut().and_then(|s| s.open.get_mut(coin)) else { continue };
+            let stop = os.stop;
+            os.follow(mid);
+            if os.stop != stop {
+                self.dirty = true;
+            }
+            if let Some(why) = stop_or_tp(os, mid) {
+                closes.push((key.clone(), why));
+            }
+        }
         let mut rows = Vec::new();
         for (key, t) in self.signals.iter_mut() {
             let Some(s) = t.signal.as_mut() else { continue };
@@ -730,11 +786,22 @@ impl Engine {
         let books = self.books.clone();
         let b = books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
-        // The traders whose copies we run at a profit, and every copied trader's positions as a
-        // share of its equity.
+        // Trailing / break-even stops follow the price.
+        for t in self.signals.values_mut() {
+            for (c, os) in t.signal.iter_mut().flat_map(|s| s.open.iter_mut()) {
+                if let Some(m) = marks(c) {
+                    os.follow(m);
+                }
+            }
+        }
+        // The traders whose copies we run at a profit, those with low leverage settings and a
+        // large account, every copied trader's positions as a share of its equity, and their
+        // stops and liquidation prices.
         let best: HashSet<String> = self.traders.iter()
             .filter(|(_, t)| !t.acct.liquidated && t.copy_fills >= 3 && t.acct.equity(&marks) > t.acct.start)
             .map(|(a, _)| a.clone()).collect();
+        let low_lev: HashSet<String> = self.traders.iter().filter(|(_, t)| is_low_lev(t)).map(|(a, _)| a.clone()).collect();
+        let levels = trigger_levels(&self.traders, at);
         let mut positions: HashMap<String, Vec<(String, f64)>> = HashMap::new();
         for (a, t) in &self.traders {
             if t.acct.liquidated || t.equity <= 0.0 {
@@ -746,9 +813,16 @@ impl Engine {
                 }
             }
         }
-        let mut coins: Vec<String> = self.flow.coins().chain(positions.keys()).cloned().collect::<HashSet<_>>().into_iter().collect();
+        let whales = self.whales.clone();
+        let w = whales.lock().unwrap();
+        let liquid = self.ctx.liquid(signals::TREND_COINS);
+        let mut coins: Vec<String> = self.flow.coins().chain(positions.keys()).chain(levels.keys()).chain(liquid.iter()).chain(w.coins())
+            .cloned().collect::<HashSet<_>>().into_iter().collect();
         coins.sort();
-        let inputs = Inputs::new(&self.flow, &positions, &best, now_ms);
+        let inputs = Inputs::new(Data {
+            flow: &self.flow, positions: &positions, best: &best, low_lev: &low_lev, whales: &w, prices: &self.prices, ctx: &self.ctx,
+            levels: &levels, now_ms,
+        });
         let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
         let mut opens: Vec<(&'static Variant, String, Reading)> = Vec::new();
         let mut twin_closes: Vec<(String, String, &'static str)> = Vec::new();
@@ -795,6 +869,7 @@ impl Engine {
             }
         }
         drop(inputs);
+        drop(w);
         // The twins: expiry and the traders turning at the book; the rest as on a book change.
         let mut rows = Vec::new();
         for (key, t) in self.signals.iter_mut() {
@@ -876,6 +951,10 @@ impl Engine {
             fee,
             reason: json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3), "score_pct": r(rd.score, 2),
                 "buy_usd": r(rd.buy_usd, 0), "sell_usd": r(rd.sell_usd, 0), "window_s": v.window_s, "book_ms": book.time_ms}),
+            stop_pct: v.exit.stop_pct,
+            trail_pct: v.exit.trail_pct,
+            be_r: v.exit.be_r,
+            peak: 0.0,
         };
         let state = t.signal.get_or_insert_with(Default::default);
         state.taken += 1;
@@ -895,6 +974,8 @@ impl Engine {
                 market_entry: px,
                 stop_pct: v.exit.stop_pct,
                 tp_pct: v.exit.tp_pct,
+                trail_pct: v.exit.trail_pct,
+                be_r: v.exit.be_r,
                 expires: os.expires,
                 equity,
                 sz_decimals: info.sz_decimals,
@@ -1049,6 +1130,45 @@ mod tests {
         assert!(t.trips.is_empty());
         assert_eq!(t.stats.entries, 3);
     }
+
+    #[test]
+    fn stop_and_liquidation_levels() {
+        let setup = |side: f64, liq: Option<f64>, stops: Vec<(f64, Option<f64>)>, at: f64| Setup { side, liq_px: liq, stops, at };
+        let mut long = Trader { acct: Account::new(1000.0), ..Default::default() };
+        long.theirs.insert("ETH".into(), 10.0);
+        long.theirs.insert("SOL".into(), -5.0);
+        // ETH long 10: a stop for 4 at 1900, a position stop at 1850 (capped at the position), liq 1500.
+        long.setups.insert("ETH".into(), setup(1.0, Some(1500.0), vec![(1900.0, Some(4.0)), (1850.0, None)], 1000.0));
+        // SOL: read when it was long, now short: stale, not used.
+        long.setups.insert("SOL".into(), setup(1.0, Some(90.0), vec![], 1000.0));
+        let mut old = Trader { acct: Account::new(1000.0), ..Default::default() };
+        old.theirs.insert("ETH".into(), -1.0);
+        old.setups.insert("ETH".into(), setup(-1.0, Some(2500.0), vec![], 1000.0 - SETUP_MAX_AGE_S - 1.0));
+        let traders: HashMap<String, Trader> = [("a".to_string(), long), ("b".to_string(), old)].into_iter().collect();
+        let lv = trigger_levels(&traders, 1000.0);
+        assert!(!lv.contains_key("SOL"));
+        let eth = &lv["ETH"];
+        assert_eq!(eth.len(), 3);
+        let usd: Vec<(f64, f64, f64)> = eth.iter().map(|l| (l.px, l.usd, l.dir)).collect();
+        assert_eq!(usd, vec![(1900.0, 7600.0, -1.0), (1850.0, 18_500.0, -1.0), (1500.0, 15_000.0, -1.0)]);
+    }
+
+    #[test]
+    fn low_leverage_large_accounts() {
+        let mut t = Trader { acct: Account::new(1000.0), equity: 50_000.0, ..Default::default() };
+        assert!(!is_low_lev(&t)); // nothing read yet
+        t.stats.planned = 3;
+        t.stats.lev_max = 5.0;
+        assert!(is_low_lev(&t));
+        // An open trip read at 20x counts too.
+        let mut trip = Trip::new(0.0, 1000.0);
+        trip.plan(Plan { leverage: 20.0, ..Default::default() });
+        t.trips.insert("BTC".into(), trip);
+        assert!(!is_low_lev(&t));
+        t.trips.clear();
+        t.equity = 20_000.0;
+        assert!(!is_low_lev(&t));
+    }
 }
 
 /// One line on what a variant does, for its account's name.
@@ -1059,10 +1179,74 @@ fn describe(v: &Variant) -> String {
         signals::Kind::Conviction => format!("{}+ traders, net {}% of equity one way over {w:.0} min", v.min_traders, v.min_score),
         signals::Kind::Volume => format!("${:.0}k+ net, {:.0}%+ of it one way, {}+ traders, over {w:.0} min", v.min_usd / 1000.0,
             v.min_agree * 100.0, v.min_traders),
-        signals::Kind::Positioning => format!("{}+ traders holding, {:.0}%+ one way", v.min_traders, v.min_agree * 100.0),
+        signals::Kind::Positioning => {
+            let mut s = format!("{}+ traders holding, {:.0}%+ one way", v.min_traders, v.min_agree * 100.0);
+            if v.min_funding > 0.0 {
+                s += &format!(", funding {:.5}%/h+ their way", v.min_funding * 100.0);
+            }
+            if v.min_oi_pct > 0.0 {
+                s += &format!(", open interest +{}%+ over 4 h", v.min_oi_pct);
+            }
+            s
+        }
+        signals::Kind::Cluster => format!("${:.0}k+ of the traders' stops / liquidations within {}% on one side, {:.0}%+ of those in the band",
+            v.min_usd / 1000.0, v.band_pct, v.min_agree * 100.0),
+        signals::Kind::Whales => format!("{}+ wallets with ${:.0}k+ net taker flow, {:.0}%+ of the whales' dollars one way, over {w:.0} min",
+            v.min_traders, v.min_usd / 1000.0, v.min_agree * 100.0),
+        signals::Kind::Trend => format!("moved {}%+ over {w:.0} min (top {} coins by volume)", v.move_pct, signals::TREND_COINS),
+        signals::Kind::CrossMomentum => format!("{} strongest long / weakest short vs BTC over {w:.0} min (top {} coins by volume)",
+            v.top_k, signals::XMOM_COINS),
     };
-    format!("{}{}{}; stop {}%, tp {}%, {:.0} min max", if v.fade { "against: " } else { "" }, if v.best_only { "profitable copies only: " } else { "" },
-        what, v.exit.stop_pct, v.exit.tp_pct, v.hold_s / 60.0)
+    let who = match v.who {
+        signals::Who::All => "",
+        signals::Who::Best => "profitable copies only: ",
+        signals::Who::LowLev => "low-leverage large accounts only: ",
+    };
+    let mut exit = format!("stop {}%", v.exit.stop_pct);
+    if v.exit.trail_pct > 0.0 {
+        exit += &format!(", trailing {}%", v.exit.trail_pct);
+    } else {
+        exit += &format!(", tp {}%", v.exit.tp_pct);
+    }
+    if v.exit.be_r > 0.0 {
+        exit += &format!(", to break even at {}R", v.exit.be_r);
+    }
+    format!("{}{who}{what}; {exit}, {:.0} min max", if v.fade { "against: " } else { "" }, v.hold_s / 60.0)
+}
+
+/// Low leverage and a large account: every leverage setting read (closed trips and open ones)
+/// at most `LOW_LEV_MAX`, at least one read, equity at least `LOW_LEV_MIN_EQUITY`.
+fn is_low_lev(t: &Trader) -> bool {
+    let open = t.trips.values().filter_map(|x| x.plan.as_ref());
+    let max = open.clone().map(|p| p.leverage).fold(t.stats.lev_max, f64::max);
+    let read = t.stats.planned > 0 || open.count() > 0;
+    !t.acct.liquidated && read && max > 0.0 && max <= signals::LOW_LEV_MAX && t.equity >= signals::LOW_LEV_MIN_EQUITY
+}
+
+/// The copied traders' stops and liquidation prices per coin, from set-ups read within
+/// `SETUP_MAX_AGE_S` of positions they still hold that way.
+fn trigger_levels(traders: &HashMap<String, Trader>, at: f64) -> HashMap<String, Vec<Level>> {
+    let mut out: HashMap<String, Vec<Level>> = HashMap::new();
+    for (a, t) in traders {
+        if t.acct.liquidated {
+            continue;
+        }
+        for (coin, s) in &t.setups {
+            let pos = t.theirs.get(coin).copied().unwrap_or(0.0);
+            if at - s.at > SETUP_MAX_AGE_S || pos == 0.0 || pos.signum() != s.side {
+                continue;
+            }
+            let (abs, dir) = (pos.abs(), -s.side);
+            let lv = out.entry(coin.clone()).or_default();
+            for &(px, size) in &s.stops {
+                lv.push(Level { px, usd: size.unwrap_or(abs).min(abs) * px, dir, who: a.clone() });
+            }
+            if let Some(px) = s.liq_px {
+                lv.push(Level { px, usd: abs * px, dir, who: a.clone() });
+            }
+        }
+    }
+    out
 }
 
 /// A market signal trade's stop or take profit, if the mid has reached it.

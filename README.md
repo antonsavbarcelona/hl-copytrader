@@ -92,7 +92,29 @@ most 10x equity, at most 10 open), and why (traders each way, agreement, convict
 each way). A trade is closed at its stop, take profit or expiry, or when the traders turn the
 other way — the same row gets the exit, its reason, PnL after fees and the fees — and the coin
 then rests for the variant's window. Signals are read every 5 s; after a start, a window is read only once the
-flow covers it. `report` lists the signal accounts after the copies.
+flow covers it. Stops and take profits are checked on every change of the coin's book, not only every 5 s.
+`report` lists the signal accounts after the copies.
+
+**Market vs limit orders.** Every signal trade above is a market trade: taker in (0.045%), taker
+out. Each one also gets two limit-order twins of the same size (`signal_maker_trades`, by
+`parent_id`), so the two ways of trading the same signals compare trade by trade:
+
+- the entry is a post-only order at the most aggressive maker price (one tick inside the
+  opposite best when the spread is wider than a tick, else our side's best), following the price
+  when it moves away, for up to 30 s; then `limit` cancels the rest (a trade that got nothing is
+  "not filled"), `limit+market` takes it at the book;
+- it fills when a trade prints through its price, when trades at its price use up the size that
+  rested ahead of it (the size at that level when it was placed, less what the book later shows),
+  or when the opposite side of the book reaches it; maker fee 0.015%;
+- once in: stop and take profit at the same distances from its own entry, the take profit a resting
+  limit order (maker), the stop, expiry and the traders turning at the book (taker).
+
+```
+select m.mode, count(*), avg((m.filled > 0)::int) filled_share, avg(m.maker_pct) maker_pct,
+       sum(m.pnl) limit_pnl, sum(t.pnl) market_pnl, sum(m.fees) limit_fees, sum(t.fees) market_fees
+from signal_maker_trades m join signal_trades t on t.run_id = m.run_id and t.id = m.parent_id
+where m.closed_at is not null and t.closed_at is not null group by 1
+```
 
 ## What is measured
 
@@ -139,12 +161,18 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `signal_trades`: one row per signal trade (key `id`), see Signals; e.g.
   `select variant, count(*), avg((pnl > 0)::int), sum(pnl) from signal_trades
   where closed_at is not null group by 1 order by 4 desc`.
+- `signal_maker_trades`: the limit-order twins (key `id` = `parent_id:mode`): how much of the
+  market trade's size it got and how (`filled`, `maker_pct`, `wait_s`, `requotes`), its entry vs
+  the market trade's (`market_entry`), exit (`exit_reason` also "not filled", `exit_maker_pct`),
+  PnL after fees and the fees each way.
 - `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
   used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`, of it
-  `signals_*_ms`), and more in `data`. The ticks run on the loop the copies use: a few ms is
-  fine, hundreds would start to delay copies.
+  `signals_*_ms`), and more in `data` (of it the watched coins' trades and book changes:
+  `market_msgs`, `market_*_ms`, `watched_coins`, `maker_trades_open`). The ticks run on the loop
+  the copies use: a few ms is fine, hundreds would start to delay copies.
 
 The database being away does not stop the run: writes wait and go out once it is back.
 Without `DATABASE_URL` the same goes to files in `--data`: `state.json`, `events.jsonl`,
-`signal_trades.jsonl` (a line when a trade opens, another when it closes), `status.jsonl`.
+`signal_trades.jsonl` (a line when a trade opens, another when it closes),
+`signal_maker_trades.jsonl` (a line at every change), `status.jsonl`.
 `report` writes `report.csv` (all accounts, all the measures) to `--data`.

@@ -1,7 +1,8 @@
 //! Where a run lives: Postgres when `DATABASE_URL` is set (tables created on first start),
-//! else files in the data directory (`state.json`, `events.jsonl`, `signal_trades.jsonl`).
-//! The copies (`copy_accounts`, `events`) and the signals (`signal_accounts`, `signal_trades`)
-//! are kept apart; `bot_status` (`status.jsonl`) has the bot's health every 10 minutes.
+//! else files in the data directory (`state.json`, `events.jsonl`, `signal_trades.jsonl`,
+//! `signal_maker_trades.jsonl`). The copies (`copy_accounts`, `events`) and the signals
+//! (`signal_accounts`, `signal_trades`, their limit-order twins `signal_maker_trades`) are kept
+//! apart; `bot_status` (`status.jsonl`) has the bot's health every 10 minutes.
 //!
 //! The engine never waits on it: events and state snapshots go to a writer task, which
 //! batches them (one insert per second for events; for the state, only the accounts that
@@ -83,11 +84,55 @@ pub struct TradeRow {
     pub fees: f64,
 }
 
+/// One limit-order twin of a signal trade (see `maker`): written when placed, again (whole)
+/// as it fills and when it closes.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MakerRow {
+    /// `<parent_id>:<mode>`.
+    pub id: String,
+    /// The market trade's id in `signal_trades`.
+    pub parent_id: String,
+    pub variant: String,
+    /// limit / limit+market
+    pub mode: String,
+    pub coin: String,
+    pub side: String,
+    pub placed_at: f64,
+    /// The mid when the signal fired, and the market trade's entry.
+    pub mid: f64,
+    pub market_entry: f64,
+    /// The market trade's size, and how much of it we got (of it as maker, %).
+    pub size: f64,
+    pub filled: f64,
+    pub maker_pct: f64,
+    pub entry: Option<f64>,
+    /// When the entry ended (filled, or its deadline), seconds after the signal.
+    pub wait_s: Option<f64>,
+    /// Times the order followed the price.
+    pub requotes: i64,
+    pub stop: Option<f64>,
+    pub take_profit: Option<f64>,
+    pub expires_at: f64,
+    pub reason: Value,
+    pub closed_at: Option<f64>,
+    pub exit_px: Option<f64>,
+    /// stop / take profit / expiry / traders turned / not filled
+    pub exit_reason: Option<String>,
+    pub exit_maker_pct: Option<f64>,
+    /// After fees, USD and % of the variant's equity at the open.
+    pub pnl: Option<f64>,
+    pub pnl_pct: Option<f64>,
+    pub entry_fees: f64,
+    pub exit_fees: f64,
+    pub fees: f64,
+}
+
 enum Cmd {
     Event(Value),
     Save(Vec<Row>),
     SaveSignals(Vec<SignalRow>),
     Trade(TradeRow),
+    Maker(MakerRow),
     Status(Value),
     Flush(oneshot::Sender<()>),
 }
@@ -112,6 +157,10 @@ impl Store {
 
     pub fn trade(&self, row: TradeRow) {
         let _ = self.tx.send(Cmd::Trade(row));
+    }
+
+    pub fn maker(&self, row: MakerRow) {
+        let _ = self.tx.send(Cmd::Maker(row));
     }
 
     pub fn status(&self, status: Value) {
@@ -205,6 +254,13 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             return;
         }
     };
+    let mut makers = match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("signal_maker_trades.jsonl")) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            log!("store: cannot open signal_maker_trades.jsonl: {e}");
+            return;
+        }
+    };
     // Every account as last saved (the file holds all of them): copies, signal variants.
     let mut all: HashMap<String, String> = HashMap::new();
     let mut sigs: HashMap<String, String> = HashMap::new();
@@ -217,6 +273,11 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::Trade(t) => {
                 if let Ok(s) = serde_json::to_string(&t) {
                     let _ = writeln!(trades, "{s}");
+                }
+            }
+            Cmd::Maker(m) => {
+                if let Ok(s) = serde_json::to_string(&m) {
+                    let _ = writeln!(makers, "{s}");
                 }
             }
             Cmd::Status(s) => {
@@ -240,16 +301,19 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                 }
                 let _ = events.flush();
                 let _ = trades.flush();
+                let _ = makers.flush();
             }
             Cmd::Flush(done) => {
                 let _ = events.flush();
                 let _ = trades.flush();
+                let _ = makers.flush();
                 let _ = done.send(());
             }
         }
     }
     let _ = events.flush();
     let _ = trades.flush();
+    let _ = makers.flush();
 }
 
 // --------------------------------------------------------------------------------- postgres
@@ -320,6 +384,40 @@ CREATE TABLE IF NOT EXISTS signal_trades (
 );
 CREATE INDEX IF NOT EXISTS signal_trades_variant ON signal_trades (run_id, variant, opened_at);
 CREATE INDEX IF NOT EXISTS signal_trades_coin ON signal_trades (run_id, coin, opened_at);
+CREATE TABLE IF NOT EXISTS signal_maker_trades (
+    run_id          text        NOT NULL,
+    id              text        NOT NULL,
+    parent_id       text        NOT NULL,
+    variant         text        NOT NULL,
+    mode            text        NOT NULL,
+    coin            text        NOT NULL,
+    side            text        NOT NULL,
+    placed_at       timestamptz NOT NULL,
+    mid             float8      NOT NULL,
+    market_entry    float8      NOT NULL,
+    size            float8      NOT NULL,
+    filled          float8      NOT NULL,
+    maker_pct       float8      NOT NULL,
+    entry           float8,
+    wait_s          float8,
+    requotes        bigint      NOT NULL,
+    stop            float8,
+    take_profit     float8,
+    expires_at      timestamptz NOT NULL,
+    reason          jsonb       NOT NULL,
+    closed_at       timestamptz,
+    exit_px         float8,
+    exit_reason     text,
+    exit_maker_pct  float8,
+    pnl             float8,
+    pnl_pct         float8,
+    entry_fees      float8      NOT NULL,
+    exit_fees       float8      NOT NULL,
+    fees            float8      NOT NULL,
+    PRIMARY KEY (run_id, id)
+);
+CREATE INDEX IF NOT EXISTS signal_maker_trades_parent ON signal_maker_trades (run_id, parent_id);
+CREATE INDEX IF NOT EXISTS signal_maker_trades_variant ON signal_maker_trades (run_id, variant, placed_at);
 CREATE TABLE IF NOT EXISTS bot_status (
     run_id          text        NOT NULL,
     at              timestamptz NOT NULL,
@@ -386,12 +484,13 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     let mut pending_sigs: HashMap<String, SignalRow> = HashMap::new();
     let mut written_sigs: HashMap<String, u64> = HashMap::new();
     let mut trades: HashMap<String, TradeRow> = HashMap::new();
+    let mut makers: HashMap<String, MakerRow> = HashMap::new();
     let mut statuses: Vec<Value> = Vec::new();
     let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut open = true;
-    while open || !events.is_empty() || !pending.is_empty() || !pending_sigs.is_empty() || !trades.is_empty() || !statuses.is_empty()
-        || !waiting.is_empty() {
+    while open || !events.is_empty() || !pending.is_empty() || !pending_sigs.is_empty() || !trades.is_empty() || !makers.is_empty()
+        || !statuses.is_empty() || !waiting.is_empty() {
         // Gather until the next tick (or a flush, a big batch, or the end), then write.
         let due = tokio::select! {
             cmd = rx.recv(), if open => match cmd {
@@ -419,6 +518,10 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     trades.insert(t.id.clone(), t);
                     false
                 }
+                Some(Cmd::Maker(m)) => {
+                    makers.insert(m.id.clone(), m);
+                    false
+                }
                 Some(Cmd::Status(s)) => {
                     statuses.push(s);
                     false
@@ -434,8 +537,8 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             },
             _ = tick.tick() => true,
         };
-        if !due || (events.is_empty() && pending.is_empty() && pending_sigs.is_empty() && trades.is_empty() && statuses.is_empty()
-            && waiting.is_empty()) {
+        if !due || (events.is_empty() && pending.is_empty() && pending_sigs.is_empty() && trades.is_empty() && makers.is_empty()
+            && statuses.is_empty() && waiting.is_empty()) {
             continue;
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
@@ -446,17 +549,18 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                 }
                 Err(e) => {
                     log!("store: postgres unavailable ({e:#}), {} events, {} accounts, {} signal trades waiting", events.len(),
-                        pending.len() + pending_sigs.len(), trades.len());
+                        pending.len() + pending_sigs.len(), trades.len() + makers.len());
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
             };
         }
         let Some(c) = &client else { continue };
-        match write(c, &run, &events, &pending, &pending_sigs, &trades, &statuses).await {
+        match write(c, &run, &events, &pending, &pending_sigs, &trades, &makers, &statuses).await {
             Ok(()) => {
                 events.clear();
                 trades.clear();
+                makers.clear();
                 statuses.clear();
                 for (a, r) in pending.drain() {
                     written.insert(a, hash(&r.state));
@@ -477,8 +581,10 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>,
-               signals: &HashMap<String, SignalRow>, trades: &HashMap<String, TradeRow>, statuses: &[Value]) -> Result<()> {
+               signals: &HashMap<String, SignalRow>, trades: &HashMap<String, TradeRow>, makers: &HashMap<String, MakerRow>,
+               statuses: &[Value]) -> Result<()> {
     if !statuses.is_empty() {
         let rows = serde_json::to_string(statuses)?;
         c.execute(
@@ -527,6 +633,30 @@ async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts
         )
         .await
         .context("saving signal trades")?;
+    }
+    if !makers.is_empty() {
+        let rows = serde_json::to_string(&makers.values().collect::<Vec<_>>())?;
+        c.execute(
+            "INSERT INTO signal_maker_trades (run_id, id, parent_id, variant, mode, coin, side, placed_at, mid, market_entry, size, filled,
+                 maker_pct, entry, wait_s, requotes, stop, take_profit, expires_at, reason, closed_at, exit_px, exit_reason, exit_maker_pct,
+                 pnl, pnl_pct, entry_fees, exit_fees, fees)
+             SELECT $1, r.id, r.parent_id, r.variant, r.mode, r.coin, r.side, to_timestamp(r.placed_at), r.mid, r.market_entry, r.size,
+                 r.filled, r.maker_pct, r.entry, r.wait_s, r.requotes, r.stop, r.take_profit, to_timestamp(r.expires_at), r.reason,
+                 to_timestamp(r.closed_at), r.exit_px, r.exit_reason, r.exit_maker_pct, r.pnl, r.pnl_pct, r.entry_fees, r.exit_fees, r.fees
+             FROM jsonb_to_recordset($2::text::jsonb) AS r(id text, parent_id text, variant text, mode text, coin text, side text,
+                  placed_at float8, mid float8, market_entry float8, size float8, filled float8, maker_pct float8, entry float8,
+                  wait_s float8, requotes int8, stop float8, take_profit float8, expires_at float8, reason jsonb, closed_at float8,
+                  exit_px float8, exit_reason text, exit_maker_pct float8, pnl float8, pnl_pct float8, entry_fees float8,
+                  exit_fees float8, fees float8)
+             ON CONFLICT (run_id, id) DO UPDATE SET filled = excluded.filled, maker_pct = excluded.maker_pct, entry = excluded.entry,
+                 wait_s = excluded.wait_s, requotes = excluded.requotes, stop = excluded.stop, take_profit = excluded.take_profit,
+                 closed_at = excluded.closed_at, exit_px = excluded.exit_px, exit_reason = excluded.exit_reason,
+                 exit_maker_pct = excluded.exit_maker_pct, pnl = excluded.pnl, pnl_pct = excluded.pnl_pct,
+                 entry_fees = excluded.entry_fees, exit_fees = excluded.exit_fees, fees = excluded.fees",
+            &[&run, &rows],
+        )
+        .await
+        .context("saving signal maker trades")?;
     }
     if !events.is_empty() {
         let at: Vec<f64> = events.iter().map(|e| e["at"].as_f64().unwrap_or(0.0)).collect();

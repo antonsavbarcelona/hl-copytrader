@@ -25,10 +25,11 @@ use crate::account::{Account, round_size, walk};
 use crate::api::{AccountState, Api, CoinInfo, Leader, Trigger, exchange_now, now};
 use crate::config::Config;
 use crate::log;
+use crate::maker::{self, MakerTrade};
 use crate::signals::{self, Flow, Inputs, OpenSignal, Reading, SignalState, VARIANTS, Variant};
 use crate::stats::{Plan, Stats, Trip};
-use crate::store::{Row, SignalRow, Store, TradeRow};
-use crate::ws::{Book, Books, UserFill};
+use crate::store::{MakerRow, Row, SignalRow, Store, TradeRow};
+use crate::ws::{Book, Books, UserFill, Watched};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Trader {
@@ -84,6 +85,10 @@ pub enum Msg {
     Plan { user: String, state: anyhow::Result<(AccountState, Vec<Trigger>)> },
     Leaders(Vec<Leader>),
     Funding(HashMap<String, (f64, f64)>),
+    /// A trade in a watched coin (`taker_buy`: its aggressor bought).
+    Print { coin: String, px: f64, sz: f64, taker_buy: bool, time_ms: u64 },
+    /// A watched coin's book changed.
+    Book(String),
     Tick,
     /// Save and stop.
     Shutdown,
@@ -95,6 +100,9 @@ pub struct Engine {
     books: Books,
     coins: HashMap<String, CoinInfo>,
     pub followed: Arc<RwLock<HashSet<String>>>,
+    /// Coins with open signal trades or limit-order twins: their trades and book changes come
+    /// in as they happen (stops, take profits, limit fills).
+    pub watched: Watched,
     leaders: HashMap<String, Leader>,
     traders: HashMap<String, Trader>,
     /// One account per signal variant (`signal:<name>`).
@@ -126,6 +134,10 @@ struct Load {
     tick_max_ms: f64,
     signals_ms: f64,
     signals_max_ms: f64,
+    /// Trades and book changes of the watched coins, and the time spent on them (ms).
+    market_msgs: u64,
+    market_ms: f64,
+    market_max_ms: f64,
 }
 
 /// An account over `stale_leverage` is read again only if its last read is older than this.
@@ -167,6 +179,7 @@ impl Engine {
             books,
             coins: coins.into_iter().map(|c| (c.name.clone(), c)).collect(),
             followed: Arc::new(RwLock::new(HashSet::new())),
+            watched: Arc::new(RwLock::new(HashSet::new())),
             leaders: HashMap::new(),
             traders,
             signals,
@@ -237,6 +250,8 @@ impl Engine {
                 Msg::Plan { user, state } => self.on_plan(user, state),
                 Msg::Leaders(l) => self.on_leaders(l),
                 Msg::Funding(ctx) => self.on_funding(ctx),
+                Msg::Print { coin, px, sz, taker_buy, time_ms } => self.timed(|e| e.on_print(&coin, px, sz, taker_buy, time_ms)),
+                Msg::Book(coin) => self.timed(|e| e.on_book(&coin)),
                 Msg::Tick => self.on_tick(),
                 Msg::Shutdown => {
                     self.save();
@@ -612,6 +627,11 @@ impl Engine {
             "tick_max_ms": r(l.tick_max_ms, 2),
             "signals_avg_ms": r(l.signals_ms / n, 2),
             "signals_max_ms": r(l.signals_max_ms, 2),
+            "market_msgs": l.market_msgs,
+            "market_avg_ms": r(l.market_ms / (l.market_msgs.max(1) as f64), 3),
+            "market_max_ms": r(l.market_max_ms, 2),
+            "watched_coins": self.watched.read().unwrap().len(),
+            "maker_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.makers.len()).sum::<usize>(),
             "flow_fills": self.flow.len(),
             "signal_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.open.len()).sum::<usize>(),
             "signal_trades_taken": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.taken).sum::<u64>(),
@@ -620,9 +640,89 @@ impl Engine {
         self.store.status(st);
     }
 
+    /// Runs a handler of the watched coins' trades / book changes, timing it.
+    fn timed(&mut self, f: impl FnOnce(&mut Self)) {
+        let started = std::time::Instant::now();
+        f(self);
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.load.market_msgs += 1;
+        self.load.market_ms += ms;
+        self.load.market_max_ms = self.load.market_max_ms.max(ms);
+    }
+
+    /// A trade in a watched coin: the limit orders of the twins it fills.
+    fn on_print(&mut self, coin: &str, px: f64, sz: f64, taker_buy: bool, time_ms: u64) {
+        let books = self.books.clone();
+        let b = books.read().unwrap();
+        let book = b.get(coin);
+        let at = now();
+        let mut rows = Vec::new();
+        for (key, t) in self.signals.iter_mut() {
+            let Some(s) = t.signal.as_mut() else { continue };
+            for m in s.makers.iter_mut().filter(|m| m.coin == coin) {
+                if m.on_print(taker_buy, px, sz, time_ms, book, at) {
+                    rows.push(maker_row(key.trim_start_matches(SIGNAL_PREFIX), m));
+                }
+            }
+            s.makers.retain(|m| m.closed_at.is_none());
+        }
+        drop(b);
+        if !rows.is_empty() {
+            self.dirty = true;
+        }
+        for row in rows {
+            self.store.maker(row);
+        }
+    }
+
+    /// A watched coin's book changed: market trades' stops and take profits at the mid, as
+    /// soon as the book shows them; the twins' fills from the book, orders following the
+    /// price, entry deadlines and stops.
+    fn on_book(&mut self, coin: &str) {
+        let books = self.books.clone();
+        let b = books.read().unwrap();
+        let Some(book) = b.get(coin) else { return };
+        let Some(mid) = book.mid() else { return };
+        let at = now();
+        let closes: Vec<(String, &'static str)> = self.signals.iter()
+            .filter_map(|(key, t)| Some((key.clone(), stop_or_tp(t.signal.as_ref()?.open.get(coin)?, mid)?)))
+            .collect();
+        let mut rows = Vec::new();
+        for (key, t) in self.signals.iter_mut() {
+            let Some(s) = t.signal.as_mut() else { continue };
+            for m in s.makers.iter_mut().filter(|m| m.coin == coin) {
+                if m.on_book(book, at) {
+                    rows.push(maker_row(key.trim_start_matches(SIGNAL_PREFIX), m));
+                }
+            }
+            s.makers.retain(|m| m.closed_at.is_none());
+        }
+        drop(b);
+        if !rows.is_empty() {
+            self.dirty = true;
+        }
+        for row in rows {
+            self.store.maker(row);
+        }
+        for (key, why) in closes {
+            self.close_signal(&key, coin, why, None);
+        }
+    }
+
+    /// The coins to watch: open signal trades and twins.
+    fn update_watched(&self) {
+        let mut set = HashSet::new();
+        for s in self.signals.values().filter_map(|t| t.signal.as_ref()) {
+            set.extend(s.open.keys().cloned());
+            set.extend(s.makers.iter().map(|m| m.coin.clone()));
+        }
+        *self.watched.write().unwrap() = set;
+    }
+
     /// Every variant reads the coins with recent flow (and the held ones): open trades are
     /// closed at their stop, take profit, expiry or when the traders turn the other way; new
-    /// ones are opened where a variant fires.
+    /// ones are opened where a variant fires. The twins are closed at expiry or when the
+    /// traders turn, and checked against the book (in case its changes did not come in).
     fn run_signals(&mut self) {
         let now_ms = (exchange_now() * 1000.0) as u64;
         self.flow.prune(now_ms);
@@ -651,16 +751,25 @@ impl Engine {
         let inputs = Inputs::new(&self.flow, &positions, &best, now_ms);
         let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
         let mut opens: Vec<(&'static Variant, String, Reading)> = Vec::new();
+        let mut twin_closes: Vec<(String, String, &'static str)> = Vec::new();
         for v in VARIANTS {
             let key = format!("{SIGNAL_PREFIX}{}", v.name);
             let Some(state) = self.signals.get(&key).and_then(|t| t.signal.as_ref()) else { continue };
+            for m in &state.makers {
+                let why = if at >= m.expires {
+                    "expiry"
+                } else if inputs.read(v, &m.coin).side == -m.side {
+                    "traders turned"
+                } else {
+                    continue;
+                };
+                twin_closes.push((key.clone(), m.id.clone(), why));
+            }
             for (coin, os) in &state.open {
                 let Some(mid) = marks(coin) else { continue };
                 let rd = inputs.read(v, coin);
-                let why = if (mid - os.stop) * os.side <= 0.0 {
-                    "stop"
-                } else if (mid - os.tp) * os.side >= 0.0 {
-                    "take profit"
+                let why = if let Some(why) = stop_or_tp(os, mid) {
+                    why
                 } else if at >= os.expires {
                     "expiry"
                 } else if rd.side == -os.side {
@@ -686,13 +795,34 @@ impl Engine {
             }
         }
         drop(inputs);
+        // The twins: expiry and the traders turning at the book; the rest as on a book change.
+        let mut rows = Vec::new();
+        for (key, t) in self.signals.iter_mut() {
+            let Some(s) = t.signal.as_mut() else { continue };
+            let variant = key.trim_start_matches(SIGNAL_PREFIX);
+            for m in s.makers.iter_mut() {
+                let Some(book) = b.get(&m.coin) else { continue };
+                let why = twin_closes.iter().find(|(k, id, _)| k == key && id == &m.id).map(|x| x.2);
+                if why.is_some_and(|why| m.close_at_book(book, at, why)) || m.on_book(book, at) {
+                    rows.push(maker_row(variant, m));
+                }
+            }
+            s.makers.retain(|m| m.closed_at.is_none());
+        }
         drop(b);
+        if !rows.is_empty() {
+            self.dirty = true;
+        }
+        for row in rows {
+            self.store.maker(row);
+        }
         for (key, coin, why, rd) in closes {
-            self.close_signal(&key, &coin, why, &rd);
+            self.close_signal(&key, &coin, why, Some(&rd));
         }
         for (v, coin, rd) in opens {
             self.open_signal(v, &coin, &rd);
         }
+        self.update_watched();
     }
 
     /// Opens `v`'s trade in `coin`: a taker order sized to risk `RISK_PCT` of the account at the
@@ -750,12 +880,41 @@ impl Engine {
         let state = t.signal.get_or_insert_with(Default::default);
         state.taken += 1;
         state.open.insert(coin.to_string(), os.clone());
+        // Its limit-order twins: the same size, entering with a post-only order instead.
+        let mut rows = Vec::new();
+        for mode in maker::MODES {
+            let mut m = MakerTrade {
+                id: format!("{}:{}", os.id, mode.name()),
+                parent: os.id.clone(),
+                mode: Some(mode),
+                coin: coin.to_string(),
+                side: rd.side,
+                size: got,
+                placed: at,
+                mid,
+                market_entry: px,
+                stop_pct: v.exit.stop_pct,
+                tp_pct: v.exit.tp_pct,
+                expires: os.expires,
+                equity,
+                sz_decimals: info.sz_decimals,
+                reason: os.reason.clone(),
+                ..Default::default()
+            };
+            if m.place(&book, at) {
+                rows.push(maker_row(v.name, &m));
+                state.makers.push(m);
+            }
+        }
         self.dirty = true;
         self.store.trade(ticket(v.name, coin, &os, None));
+        for row in rows {
+            self.store.maker(row);
+        }
     }
 
-    /// Closes `key`'s trade in `coin` at the book.
-    fn close_signal(&mut self, key: &str, coin: &str, why: &'static str, rd: &Reading) {
+    /// Closes `key`'s trade in `coin` at the book; `rd`: the traders then, when read.
+    fn close_signal(&mut self, key: &str, coin: &str, why: &'static str, rd: Option<&Reading>) {
         let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
         let fee_rate = self.cfg.taker_fee;
         let at = now();
@@ -783,7 +942,7 @@ impl Engine {
             row.fees = os.fee + fee;
             row.pnl = Some(r(pnl, 4));
             row.pnl_pct = Some(r(pnl / opened_equity * 100.0, 3));
-            if let serde_json::Value::Object(m) = &mut row.reason {
+            if let (serde_json::Value::Object(m), Some(rd)) = (&mut row.reason, rd) {
                 m.insert("traders_at_close".into(), json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3)}));
             }
             self.store.trade(row);
@@ -904,6 +1063,53 @@ fn describe(v: &Variant) -> String {
     };
     format!("{}{}{}; stop {}%, tp {}%, {:.0} min max", if v.fade { "against: " } else { "" }, if v.best_only { "profitable copies only: " } else { "" },
         what, v.exit.stop_pct, v.exit.tp_pct, v.hold_s / 60.0)
+}
+
+/// A market signal trade's stop or take profit, if the mid has reached it.
+fn stop_or_tp(os: &OpenSignal, mid: f64) -> Option<&'static str> {
+    if (mid - os.stop) * os.side <= 0.0 {
+        Some("stop")
+    } else if (mid - os.tp) * os.side >= 0.0 {
+        Some("take profit")
+    } else {
+        None
+    }
+}
+
+/// A limit-order twin's row.
+fn maker_row(variant: &str, m: &MakerTrade) -> MakerRow {
+    let entered = m.entered_at.is_some() && m.filled > 0.0;
+    let closed = m.closed_at.is_some();
+    MakerRow {
+        id: m.id.clone(),
+        parent_id: m.parent.clone(),
+        variant: variant.to_string(),
+        mode: m.mode.map(|x| x.name()).unwrap_or("").to_string(),
+        coin: m.coin.clone(),
+        side: if m.side > 0.0 { "long" } else { "short" }.to_string(),
+        placed_at: r(m.placed, 3),
+        mid: m.mid,
+        market_entry: m.market_entry,
+        size: m.size,
+        filled: m.filled,
+        maker_pct: if m.filled > 0.0 { r(m.maker_filled / m.filled * 100.0, 2) } else { 0.0 },
+        entry: (m.filled > 0.0).then(|| m.entry()),
+        wait_s: m.entered_at.map(|e| r(e - m.placed, 3)),
+        requotes: m.requotes as i64,
+        stop: entered.then(|| m.stop()),
+        take_profit: entered.then(|| m.tp()),
+        expires_at: r(m.expires, 3),
+        reason: m.reason.clone(),
+        closed_at: m.closed_at.map(|c| r(c, 3)),
+        exit_px: (m.exited > 0.0).then(|| m.exit_value / m.exited),
+        exit_reason: m.exit_reason.clone(),
+        exit_maker_pct: (m.exited > 0.0).then(|| r(m.exit_maker / m.exited * 100.0, 2)),
+        pnl: closed.then(|| r(m.pnl(), 4)),
+        pnl_pct: closed.then(|| r(m.pnl() / m.equity.max(1e-9) * 100.0, 3)),
+        entry_fees: r(m.entry_fee, 6),
+        exit_fees: r(m.exit_fee, 6),
+        fees: r(m.entry_fee + m.exit_fee, 6),
+    }
 }
 
 /// A signal trade's row: its ticket, and how it closed once it has.

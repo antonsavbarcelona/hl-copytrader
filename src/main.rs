@@ -9,6 +9,7 @@ mod account;
 mod api;
 mod config;
 mod engine;
+mod maker;
 mod report;
 mod signals;
 mod stats;
@@ -51,7 +52,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let traders = store::load(&cfg).await?;
     let store = store::open(&cfg).await?;
     let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
-    let followed = engine.followed.clone();
+    let (followed, watched) = (engine.followed.clone(), engine.watched.clone());
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
     {
@@ -85,15 +86,20 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             }
         });
     }
-    tokio::spawn(ws::run_books(names.clone(), books.clone()));
-    // Fills go through their own channel into the engine's.
+    // Fills, trades and book changes go through their own channel into the engine's.
     let (ftx, mut frx) = mpsc::unbounded_channel();
-    tokio::spawn(ws::run_trades(names, followed, ftx));
+    tokio::spawn(ws::run_books(names.clone(), books.clone(), watched.clone(), ftx.clone()));
+    tokio::spawn(ws::run_trades(names, followed, watched, ftx));
     {
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some(f) = frx.recv().await {
-                if tx.send(engine::Msg::Fill(f)).is_err() {
+                let msg = match f {
+                    ws::Feed::Fill(f) => engine::Msg::Fill(f),
+                    ws::Feed::Print { coin, px, sz, taker_buy, time_ms } => engine::Msg::Print { coin, px, sz, taker_buy, time_ms },
+                    ws::Feed::Book(coin) => engine::Msg::Book(coin),
+                };
+                if tx.send(msg).is_err() {
                     break;
                 }
             }

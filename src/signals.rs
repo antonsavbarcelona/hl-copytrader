@@ -207,6 +207,9 @@ pub struct SignalState {
     pub closed_at: HashMap<String, f64>,
     /// Signals taken (opened).
     pub taken: u64,
+    /// Limit-order twins of its trades still working or open (see `maker`).
+    #[serde(default)]
+    pub makers: Vec<crate::maker::MakerTrade>,
 }
 
 /// What the traders are doing in one coin, as a variant reads it.

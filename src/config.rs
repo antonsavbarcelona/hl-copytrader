@@ -2,6 +2,9 @@
 
 use std::path::PathBuf;
 
+/// Hyperliquid taker fee (base tier).
+pub const TAKER_FEE: f64 = 0.00045;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -41,7 +44,7 @@ impl Default for Config {
             min_month_pnl: 10_000.0,
             min_month_roi: 0.5,
             exec_delay_ms: 1000,
-            taker_fee: 0.00045,
+            taker_fee: TAKER_FEE,
             min_order_usd: 10.0,
             stale_leverage: 60.0,
             reconcile_s: 2.0 * 3600.0,

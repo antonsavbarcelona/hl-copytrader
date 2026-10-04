@@ -932,7 +932,10 @@ impl Engine {
         if equity <= 0.0 {
             return;
         }
-        let usd = signals::notional(equity, gross, v.exit.stop_pct);
+        // The stop from the coin's volatility (the fixed one until it is known).
+        let range = self.prices.hourly_range_pct(coin, (exchange_now() * 1000.0) as u64);
+        let (stop_pct, tp_pct, trail_pct) = v.exit.at(range);
+        let usd = signals::notional(equity, gross, stop_pct);
         let size = round_size(usd / mid, info.sz_decimals);
         if size * mid < self.cfg.min_order_usd {
             return;
@@ -950,13 +953,13 @@ impl Engine {
         // Price vs the mid when the signal fired: the spread and the book walked.
         let (mv, impact) = (got * (best_px - mid) * rd.side, got * (px - best_px) * rd.side);
         t.stats.copy(0.0, 0.0, got * px, mv + impact, mv, impact);
-        let stop = px * (1.0 - rd.side * v.exit.stop_pct / 100.0);
+        let stop = px * (1.0 - rd.side * stop_pct / 100.0);
         let os = OpenSignal {
             id: format!("{}-{coin}-{}", v.name, (at * 1000.0) as u64),
             side: rd.side,
             entry: px,
             stop,
-            tp: px * (1.0 + rd.side * v.exit.tp_pct / 100.0),
+            tp: px * (1.0 + rd.side * tp_pct / 100.0),
             opened: at,
             expires: at + v.hold_s,
             mid,
@@ -965,9 +968,10 @@ impl Engine {
             risk_pct: got * (px - stop).abs() / equity * 100.0,
             fee,
             reason: json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3), "score_pct": r(rd.score, 2),
-                "buy_usd": r(rd.buy_usd, 0), "sell_usd": r(rd.sell_usd, 0), "window_s": v.window_s, "book_ms": book.time_ms}),
-            stop_pct: v.exit.stop_pct,
-            trail_pct: v.exit.trail_pct,
+                "buy_usd": r(rd.buy_usd, 0), "sell_usd": r(rd.sell_usd, 0), "window_s": v.window_s, "book_ms": book.time_ms,
+                "stop_pct": r(stop_pct, 3), "range_1h_pct": range.map(|x| r(x, 3))}),
+            stop_pct,
+            trail_pct,
             be_r: v.exit.be_r,
             peak: 0.0,
         };
@@ -987,9 +991,9 @@ impl Engine {
                 placed: at,
                 mid,
                 market_entry: px,
-                stop_pct: v.exit.stop_pct,
-                tp_pct: v.exit.tp_pct,
-                trail_pct: v.exit.trail_pct,
+                stop_pct,
+                tp_pct,
+                trail_pct,
                 be_r: v.exit.be_r,
                 expires: os.expires,
                 equity,
@@ -1218,11 +1222,13 @@ fn describe(v: &Variant) -> String {
         signals::Who::Best => "profitable copies only: ",
         signals::Who::LowLev => "low-leverage large accounts only: ",
     };
-    let mut exit = format!("stop {}%", v.exit.stop_pct);
-    if v.exit.trail_pct > 0.0 {
-        exit += &format!(", trailing {}%", v.exit.trail_pct);
+    let e = &v.exit;
+    let mut exit = format!("stop {}x the coin's 1 h range ({}-{}%; {}% until known)", e.vol_k, signals::VOL_STOP_MIN, signals::VOL_STOP_MAX,
+        e.stop_pct);
+    if e.trail_pct > 0.0 {
+        exit += &format!(", trailing {:.1}x the stop", e.trail_pct / e.stop_pct);
     } else {
-        exit += &format!(", tp {}%", v.exit.tp_pct);
+        exit += &format!(", tp {:.1}x the stop", e.tp_pct / e.stop_pct);
     }
     if v.exit.be_r > 0.0 {
         exit += &format!(", to break even at {}R", v.exit.be_r);

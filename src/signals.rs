@@ -66,20 +66,44 @@ pub enum Who {
 
 /// Stop / take profit, % from the entry; a trailing stop (% from the best price since the
 /// entry, 0 = none) and the stop moved to the entry once the trade is `be_r` times its risk up
-/// (0 = never).
+/// (0 = never). The stop is `vol_k` times the coin's hourly range (`Prices::hourly_range_pct`;
+/// about 2 x the range over the profile's holding time, which grows with its square root),
+/// within `VOL_STOP_MIN`..`VOL_STOP_MAX`, the take profit and the trail kept in the same
+/// proportion to it; `stop_pct` until the range is known.
 #[derive(Clone, Copy, Debug)]
 pub struct Exit {
     pub stop_pct: f64,
     pub tp_pct: f64,
     pub trail_pct: f64,
     pub be_r: f64,
+    pub vol_k: f64,
 }
 
-pub const SHORT: Exit = Exit { stop_pct: 0.75, tp_pct: 1.5, trail_pct: 0.0, be_r: 0.0 };
-pub const MID: Exit = Exit { stop_pct: 1.5, tp_pct: 3.0, trail_pct: 0.0, be_r: 0.0 };
-pub const LONG: Exit = Exit { stop_pct: 3.0, tp_pct: 6.0, trail_pct: 0.0, be_r: 0.0 };
+pub const SHORT: Exit = Exit { stop_pct: 0.75, tp_pct: 1.5, trail_pct: 0.0, be_r: 0.0, vol_k: 1.5 };
+pub const MID: Exit = Exit { stop_pct: 1.5, tp_pct: 3.0, trail_pct: 0.0, be_r: 0.0, vol_k: 3.0 };
+pub const LONG: Exit = Exit { stop_pct: 3.0, tp_pct: 6.0, trail_pct: 0.0, be_r: 0.0, vol_k: 5.0 };
 /// A take profit this far is none: the trade ends at its (trailing) stop, expiry or a turn.
 const NO_TP: f64 = 50.0;
+/// Volatility stops: never tighter / wider than this (%), from the hourly range over this many
+/// hours (at least `VOL_MIN_HOURS` of them known).
+pub const VOL_STOP_MIN: f64 = 0.5;
+pub const VOL_STOP_MAX: f64 = 15.0;
+pub const VOL_HOURS: u64 = 4;
+const VOL_MIN_HOURS: usize = 3;
+
+impl Exit {
+    /// Stop, take profit and trail (%) for a coin moving `range_pct` an hour (None: not known
+    /// yet, the fixed ones).
+    pub fn at(&self, range_pct: Option<f64>) -> (f64, f64, f64) {
+        let stop = match range_pct {
+            Some(r) if self.vol_k > 0.0 && r > 0.0 => (self.vol_k * r).clamp(VOL_STOP_MIN, VOL_STOP_MAX),
+            _ => self.stop_pct,
+        };
+        let f = stop / self.stop_pct;
+        let tp = if self.tp_pct >= NO_TP { NO_TP } else { self.tp_pct * f };
+        (stop, tp, self.trail_pct * f)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Variant {
@@ -638,6 +662,22 @@ impl Prices {
 
     pub fn last(&self, coin: &str) -> Option<f64> {
         self.per_coin.get(coin)?.back().map(|x| x.1)
+    }
+
+    /// The coin's average hourly range (high - low of the minute mids, % of the last) over the
+    /// last `VOL_HOURS` hours; None until `VOL_MIN_HOURS` of them have 30+ minutes sampled.
+    pub fn hourly_range_pct(&self, coin: &str, now_ms: u64) -> Option<f64> {
+        let q = self.per_coin.get(coin)?;
+        let mut ranges = Vec::new();
+        for h in 0..VOL_HOURS {
+            let (to, from) = (now_ms.saturating_sub(h * 3_600_000), now_ms.saturating_sub((h + 1) * 3_600_000));
+            let mids: Vec<f64> = q.iter().filter(|x| x.0 >= from && x.0 < to && x.1 > 0.0).map(|x| x.1).collect();
+            if mids.len() >= 30 {
+                let (lo, hi) = mids.iter().fold((f64::MAX, f64::MIN), |(l, h), m| (l.min(*m), h.max(*m)));
+                ranges.push((hi - lo) / mids[mids.len() - 1] * 100.0);
+            }
+        }
+        (ranges.len() >= VOL_MIN_HOURS).then(|| ranges.iter().sum::<f64>() / ranges.len() as f64)
     }
 
     /// The lowest and highest mid of the minutes from `from_ms` to `to_ms`.
@@ -1264,6 +1304,35 @@ mod tests {
         assert_eq!(follow_stop(1.0, 100.0, 98.5, 1.5, 0.0, 0.0, &mut peak, 150.0), 98.5);
         assert_eq!(peak, 0.0);
         assert_eq!(var("v15m-2t-70-500k-M-tr").exit.tp_pct, NO_TP);
+    }
+
+    #[test]
+    fn volatility_stops() {
+        // A coin swinging 100 -> 104 -> 100 every hour: about a 4% hourly range (of the hour's
+        // last mid, 100 to 104).
+        let mut p = Prices::new(0);
+        for m in 0..=300u64 {
+            let x = (m % 60) as f64;
+            p.sample("MEME", m * 60_000, 100.0 + 4.0 * (1.0 - (x - 30.0).abs() / 30.0));
+            p.sample("BTC", m * 60_000, 60_000.0 + (m % 2) as f64 * 60.0);
+        }
+        let now = 300 * 60_000;
+        let meme = p.hourly_range_pct("MEME", now).unwrap();
+        assert!(meme > 3.8 && meme <= 4.0, "{meme}");
+        // M: 3 x the range stop, twice that take profit; L: 5 x, capped at 15%.
+        let (s, t, _) = MID.at(Some(meme));
+        assert!((s - 3.0 * meme).abs() < 1e-9 && (t - 2.0 * s).abs() < 1e-9);
+        assert_eq!(LONG.at(Some(meme)).0, VOL_STOP_MAX);
+        assert!((LONG.at(Some(2.0)).0 - 10.0).abs() < 1e-9);
+        assert_eq!(LONG.at(Some(10.0)).0, VOL_STOP_MAX);
+        // BTC moving 0.1% an hour: the floor.
+        assert_eq!(MID.at(p.hourly_range_pct("BTC", now)).0, VOL_STOP_MIN);
+        // Not known yet (under 3 hours sampled): the fixed stop.
+        assert_eq!(p.hourly_range_pct("MEME", 100 * 60_000), None);
+        assert_eq!(MID.at(None), (1.5, 3.0, 0.0));
+        // The trail scales with the stop; no take profit stays none.
+        let tr = var("v15m-2t-70-500k-M-tr").exit.at(Some(meme));
+        assert!((tr.0 - 3.0 * meme).abs() < 1e-9 && (tr.2 - tr.0).abs() < 1e-9 && tr.1 == NO_TP);
     }
 
     #[test]

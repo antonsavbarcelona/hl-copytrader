@@ -91,7 +91,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     // Fills, trades and book changes go through their own channel into the engine's.
     let (ftx, mut frx) = mpsc::unbounded_channel();
     tokio::spawn(ws::run_books(names.clone(), books.clone(), watched.clone(), ftx.clone()));
-    tokio::spawn(ws::run_trades(names, followed, watched, whales, ftx));
+    tokio::spawn(ws::run_trades(names.clone(), followed, watched, whales, ftx));
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -107,14 +107,17 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             }
         });
     }
-    // The most traded coins' last hours of prices, so the price signals start at once.
+    // Every coin's last hours of prices, most traded first, so the price signals and the
+    // volatility stops start at once.
     {
         let (api, tx) = (api.clone(), tx.clone());
-        let mut liquid: Vec<(String, f64)> = ctx0.iter().map(|(c, x)| (c.clone(), x.day_volume)).collect();
+        let mut liquid: Vec<(String, f64)> =
+            ctx0.iter().filter(|(c, _)| names.contains(c)).map(|(c, x)| (c.clone(), x.day_volume)).collect();
         liquid.sort_by(|a, b| b.1.total_cmp(&a.1));
         let start = ((api::now() - signals::PRICE_KEEP_S) * 1000.0) as u64;
         tokio::spawn(async move {
-            for (coin, _) in liquid.into_iter().take(signals::TREND_COINS) {
+            let n = liquid.len();
+            for (coin, _) in liquid {
                 match api.candles(&coin, start).await {
                     Ok(closes) => {
                         let _ = tx.send(engine::Msg::Seed { coin, closes });
@@ -122,7 +125,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                     Err(e) => log!("candles {coin}: {e}"),
                 }
             }
-            log!("prices: last {} h of the {} most traded coins read", signals::PRICE_KEEP_S / 3600.0, signals::TREND_COINS);
+            log!("prices: last {} h of {n} coins read", signals::PRICE_KEEP_S / 3600.0);
         });
     }
     // Funding, open interest and volume per coin now and every 5 min (crowding, trend coins).

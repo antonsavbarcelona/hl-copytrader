@@ -97,12 +97,17 @@ most traded coins are read, so these do not wait hours):
   min long, the 3 weakest short, held as long and entered again while still among them.
 
 The grid spans windows of 1 / 5 / 15 / 30 / 60 / 240 min, 2–20 traders, 60–90% agreement,
-$200k–$2M, and three exits — S (stop 0.75%, take profit 1.5%), M (1.5 / 3%), L (3 / 6%) — with
-one signal run under all three to tell the signal from the exit. `best-…` count only the traders
+$200k–$2M, and three exits — S, M, L — with one signal run under all three to tell the signal
+from the exit. Stops follow each coin's volatility: S 1.5x, M 3x, L 5x its average hourly range
+(high − low of the minute mids over the last 4 h), 0.5% to 15%, the take profit twice the stop
+(about 2x the range over the profile's holding time, so an alt swinging 3% an hour gets a 9% M
+stop and BTC moving 0.2% a 0.6% one); until a coin has 3 h of prices, the fixed 0.75 / 1.5 / 3%
+stops (take profit 1.5 / 3 / 6%). The size still risks 1% of the account at the stop: a wider
+stop is a smaller position. Every coin's last 5 h of one-minute prices are read at a start. `best-…` count only the traders
 whose copies run at a profit, `low-…` only those whose every leverage setting seen is 10x or
 less with an account of $30k+; `fade-…` take the opposite trade, as controls (if a fade wins
-too, the signal is noise). Exit variations of the best signals: `-tr` a trailing stop (1.5% /
-3% behind the best price since the entry, no take profit), `-be` the stop moved to the entry
+too, the signal is noise). Exit variations of the best signals: `-tr` a trailing stop (as far
+behind the best price since the entry as the stop, or twice that, no take profit), `-be` the stop moved to the entry
 once the trade is 1R up, `-60` held at most 60 min. A name reads e.g. `h15m-5t-75-M`: heads, 15
 min, 5+ traders, 75%+ of them one way, exit M.
 

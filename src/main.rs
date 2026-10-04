@@ -12,6 +12,7 @@ mod engine;
 mod maker;
 mod report;
 mod signals;
+mod smart;
 mod stats;
 mod store;
 mod ws;
@@ -50,8 +51,9 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let books: ws::Books = Default::default();
     let (tx, rx) = mpsc::unbounded_channel();
     let traders = store::load(&cfg).await?;
+    let smart = store::load_smart(&cfg).await?;
     let store = store::open(&cfg).await?;
-    let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
+    let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store, smart)?;
     let (followed, watched, whales) = (engine.followed.clone(), engine.watched.clone(), engine.whales.clone());
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

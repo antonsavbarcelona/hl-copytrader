@@ -26,6 +26,7 @@ use crate::api::{AccountState, Api, CoinCtx, CoinInfo, Leader, Trigger, exchange
 use crate::config::Config;
 use crate::log;
 use crate::maker::{self, MakerTrade};
+use crate::smart::{self, Smart};
 use crate::signals::{self, Ctx, Data, Flow, Inputs, Level, OpenSignal, Prices, Reading, SignalState, VARIANTS, Variant, WhaleFlow};
 use crate::stats::{Plan, Stats, Trip};
 use crate::store::{MakerRow, Row, SignalRow, Store, TradeRow};
@@ -134,6 +135,8 @@ pub struct Engine {
     signals: HashMap<String, Trader>,
     /// The followed traders' recent fills, for the signals.
     flow: Flow,
+    /// Their actions on their positions, and their ratings (smart money).
+    smart: Smart,
     /// Accounts whose positions are being read.
     reading: HashSet<String>,
     /// Accounts with a set-up read scheduled.
@@ -181,7 +184,7 @@ fn r(x: f64, d: i32) -> f64 {
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(cfg: Config, api: Api, books: Books, coins: Vec<CoinInfo>, tx: mpsc::UnboundedSender<Msg>, traders: HashMap<String, Trader>,
-               store: Store) -> anyhow::Result<Self> {
+               store: Store, smart_saved: Option<String>) -> anyhow::Result<Self> {
         let (sigs, traders): (HashMap<String, Trader>, HashMap<String, Trader>) =
             traders.into_iter().partition(|(a, _)| a.starts_with(SIGNAL_PREFIX));
         let mut signals = HashMap::new();
@@ -212,6 +215,7 @@ impl Engine {
             traders,
             signals,
             flow: Flow::new((exchange_now() * 1000.0) as u64),
+            smart: Smart::load(smart_saved.as_deref(), (exchange_now() * 1000.0) as u64),
             reading: HashSet::new(),
             planning: HashSet::new(),
             resync,
@@ -288,6 +292,7 @@ impl Engine {
                 Msg::Tick => self.on_tick(),
                 Msg::Shutdown => {
                     self.save();
+                    self.store.smart(self.smart.saved());
                     self.store.flush().await;
                     log!("stopped, state saved");
                     return;
@@ -348,6 +353,10 @@ impl Engine {
         let equity = self.traders.get(&f.user).map(|t| t.equity).filter(|&e| e > 0.0)
             .or_else(|| self.leaders.get(&f.user).map(|l| l.account_value)).unwrap_or(0.0);
         self.flow.push(&f.coin, f.time_ms, &f.user, f.delta * f.px, equity);
+        if applied {
+            let before = self.traders.get(&f.user).and_then(|t| t.theirs.get(&f.coin).copied()).unwrap_or(0.0);
+            self.smart.on_fill(&f.user, &f.coin, before, f.delta, f.px, f.time_ms, equity, &self.prices);
+        }
         let Some(t) = self.traders.get_mut(&f.user) else {
             // First sight: read its positions, then mirror them.
             self.read_account(&f.user.clone(), "enroll");
@@ -409,6 +418,7 @@ impl Engine {
         // Coins where it or we hold something: mirror to its current positions.
         let mut coins_now: HashSet<String> = theirs.keys().cloned().collect();
         coins_now.extend(t.acct.positions.keys().cloned());
+        self.smart.sync(&user, &theirs, |c| state.setups.get(c).map(|s| s.entry));
         t.theirs = theirs;
         self.dirty = true;
         if new {
@@ -628,6 +638,7 @@ impl Engine {
             }
         }
         drop(b);
+        self.smart.tick(now_ms, &self.prices);
         for a in liquidate {
             self.liquidate(&a);
         }
@@ -682,9 +693,12 @@ impl Engine {
             "flow_fills": self.flow.len(),
             "signal_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.open.len()).sum::<usize>(),
             "signal_trades_taken": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.taken).sum::<u64>(),
+            "smart_actions": self.smart.len(),
+            "smart_traders_rated": self.smart.rated(),
         });
         log!("status: {st}");
         self.store.status(st);
+        self.store.smart(self.smart.saved());
     }
 
     /// Runs a handler of the watched coins' trades / book changes, timing it.
@@ -801,6 +815,7 @@ impl Engine {
             .filter(|(_, t)| !t.acct.liquidated && t.copy_fills >= 3 && t.acct.equity(&marks) > t.acct.start)
             .map(|(a, _)| a.clone()).collect();
         let low_lev: HashSet<String> = self.traders.iter().filter(|(_, t)| is_low_lev(t)).map(|(a, _)| a.clone()).collect();
+        let risk_adj: HashSet<String> = self.traders.iter().filter(|(_, t)| is_risk_adj(t)).map(|(a, _)| a.clone()).collect();
         let levels = trigger_levels(&self.traders, at);
         let mut positions: HashMap<String, Vec<(String, f64)>> = HashMap::new();
         for (a, t) in &self.traders {
@@ -821,7 +836,7 @@ impl Engine {
         coins.sort();
         let inputs = Inputs::new(Data {
             flow: &self.flow, positions: &positions, best: &best, low_lev: &low_lev, whales: &w, prices: &self.prices, ctx: &self.ctx,
-            levels: &levels, now_ms,
+            levels: &levels, smart: &self.smart, risk_adj: &risk_adj, now_ms,
         });
         let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
         let mut opens: Vec<(&'static Variant, String, Reading)> = Vec::new();
@@ -1196,6 +1211,7 @@ fn describe(v: &Variant) -> String {
         signals::Kind::Trend => format!("moved {}%+ over {w:.0} min (top {} coins by volume)", v.move_pct, signals::TREND_COINS),
         signals::Kind::CrossMomentum => format!("{} strongest long / weakest short vs BTC over {w:.0} min (top {} coins by volume)",
             v.top_k, signals::XMOM_COINS),
+        signals::Kind::Smart => smart::describe(v),
     };
     let who = match v.who {
         signals::Who::All => "",
@@ -1221,6 +1237,13 @@ fn is_low_lev(t: &Trader) -> bool {
     let max = open.clone().map(|p| p.leverage).fold(t.stats.lev_max, f64::max);
     let read = t.stats.planned > 0 || open.count() > 0;
     !t.acct.liquidated && read && max > 0.0 && max <= signals::LOW_LEV_MAX && t.equity >= signals::LOW_LEV_MIN_EQUITY
+}
+
+/// Its copy made more than its worst drawdown (USD) over 5+ closed trips.
+fn is_risk_adj(t: &Trader) -> bool {
+    let s = &t.stats;
+    let pnl = s.win_usd - s.loss_usd;
+    !t.acct.liquidated && s.trips >= 5 && pnl > 0.0 && pnl >= s.max_dd_pct / 100.0 * t.acct.start
 }
 
 /// The copied traders' stops and liquidation prices per coin, from set-ups read within

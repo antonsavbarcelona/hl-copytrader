@@ -106,6 +106,48 @@ too, the signal is noise). Exit variations of the best signals: `-tr` a trailing
 once the trade is 1R up, `-60` held at most 60 min. A name reads e.g. `h15m-5t-75-M`: heads, 15
 min, 5+ traders, 75%+ of them one way, exit M.
 
+**Smart money by action** (`sm-…`, `src/smart.rs`). Each followed trader's fills become actions
+on its position — open from flat, add, reduce, close, flip (fills of one order, 2 s apart, are
+one action; a close and an open the other way within 10 min, a flip) — with their context: the
+position's PnL and age, the price since its last action, its size against its usual entries,
+what it closed elsewhere just before, its book. Every entry (one per trader, coin and side per 15
+min: scaling in is one decision) is scored by the price 5 / 15 / 60 / 240 min later, at 60 min
+per coin, direction and regime (trend: 2%+ over 4 h, else range), with a recent form halving
+daily, how far it went its way / against in the hour, and how many other traders entered the
+same way in the 30 min before / after. These ratings start empty and grow with the run (kept in
+`smart_state`). A variant counts the traders whose latest action of its kind still stands:
+
+| # | kind | variant | fires on |
+|---|------|---------|----------|
+| 1 | entry | `sm-open-15m-2t-1p-M`, `sm-open-15m-1t-10p-100k-L` | opens from flat (1%+ of equity; one of 10%+ and $100k+) |
+| 2 | add | `sm-add50-15m-2t-M` | adds of half the position or more |
+| 3 | exit | `sm-exit-15m-2t-M` | half or more off positions (2%+) held 1 h+ |
+| 4 | flip | `sm-flip-15m-1t-M` / `-L` | long to short or back, both sides 2%+ |
+| 5 | accelerating | `sm-accel-10m-1t-M` | flow growing over each third of 10 min, 3%+ in all |
+| 6 | fresh | `sm-fresh-30m-2t-M` | positions of 5%+ opened in the last 30 min |
+| 7 | winner adds / loser cuts | `sm-winadd-30m-2t-M`, `sm-losecut-30m-2t-M` | adds to positions 1%+ up / cuts of positions 1%+ down |
+| 8 | averaging | `sm-avgdown-60m-2t-L`, `sm-avgup-60m-2t-L` | adds after the price went 2%+ against / for it |
+| 9 | coordinated | `sm-coord-5m-3t-M` | 3+ independent traders opening (traders entering together 3+ times count once) |
+| 10 | leaders | `sm-leader-5m-1t-M` | entries by traders others follow in (2x as many after as before) |
+| 11 | specialists | `sm-spec-15m-1t-M` | entries by traders good in this coin (20 bp+) and direction |
+| 12 | risk-adjusted | `sm-riskadj-15m-2t-M` | entries by traders whose copies made more than their worst drawdown |
+| 13 | recent form | `sm-recent-15m-2t-M` | entries by traders 10 bp+ in recent form |
+| 14 | regime | `sm-regime-15m-2t-M` | entries by traders 10 bp+ in the coin's current regime |
+| 15 | size surprise | `sm-sizez-15m-1t-25k-M` | entries 2.5 sd over the trader's usual size, $25k+ |
+| 16 | concentration | `sm-conc-30m-1t-25p-L` | entries of 25%+ taking the coin to 1x equity and half the book (+25 points) |
+| 17 | rotation | `sm-rot-15m-1t-M` | new positions of 5%+ right after closing as much elsewhere |
+| 18 | disagreement | `sm-disagree-30m-2t-M` | the top-rated tenth one way, 60%+ of the others the other |
+| 19 | vs the crowd | `sm-vscrowd-30m-3t-250k-M` | positively rated traders one way, $250k+ of all takers' flow the other |
+| 20 | vs funding / OI | `sm-fund-entry-30m-3t-L`, `sm-fund-exit-30m-3t-L` | entries paid funding to hold with OI up 1%+ in 1 h / exits from a side paying crowded funding |
+| 21 | early | `sm-early-15m-1t-M` | entries by traders whose entries lead the price at 15 min (t ≥ 2) |
+| 22 | execution | `sm-exec-15m-1t-M` | entries by traders whose entries go 60%+ their way |
+| 23 | horizon | `sm-hz15-15m-1t-M` (held 30 min), `sm-hz240-30m-1t-L` | entries by traders whose edge is at 15 min / 4 h |
+| 24 | playbook | `sm-playbook-30m-1t-M` | a probe (1% or less) left 10 min+, then within 2 h an add to 4%+ |
+| 25 | capitulation | `sm-capit-30m-1t-L` | averaged down twice, then 75%+ off at 3%+ down: faded |
+
+Controls: `fade-sm-open-…`, `fade-sm-flip-…`, `fade-sm-coord-…`. The rated kinds (10–14, 18, 19,
+21–23) stay quiet until the ratings have enough entries (5–10 per trader).
+
 Every entry is a complete trade, a row of `signal_trades`: coin, side, entry, stop, take
 profit, expiry, size from 1% of the account's equity at risk at the stop (all positions at
 most 10x equity, at most 10 open), and why (traders each way, agreement, conviction, dollars
@@ -186,6 +228,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   market trade's size it got and how (`filled`, `maker_pct`, `wait_s`, `requotes`), its entry vs
   the market trade's (`market_entry`), exit (`exit_reason` also "not filled", `exit_maker_pct`),
   PnL after fees and the fees each way.
+- `smart_state`: the smart-money positions and ratings (one row per run), every 10 min.
 - `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
   used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`, of it
   `signals_*_ms`), and more in `data` (of it the watched coins' trades and book changes:

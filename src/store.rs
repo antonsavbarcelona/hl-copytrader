@@ -2,7 +2,8 @@
 //! else files in the data directory (`state.json`, `events.jsonl`, `signal_trades.jsonl`,
 //! `signal_maker_trades.jsonl`). The copies (`copy_accounts`, `events`) and the signals
 //! (`signal_accounts`, `signal_trades`, their limit-order twins `signal_maker_trades`) are kept
-//! apart; `bot_status` (`status.jsonl`) has the bot's health every 10 minutes.
+//! apart; `bot_status` (`status.jsonl`) has the bot's health every 10 minutes, `smart_state`
+//! (`smart.json`) the smart-money ratings and positions (see `smart`).
 //!
 //! The engine never waits on it: events and state snapshots go to a writer task, which
 //! batches them (one insert per second for events; for the state, only the accounts that
@@ -134,6 +135,7 @@ enum Cmd {
     Trade(TradeRow),
     Maker(MakerRow),
     Status(Value),
+    Smart(String),
     Flush(oneshot::Sender<()>),
 }
 
@@ -165,6 +167,11 @@ impl Store {
 
     pub fn status(&self, status: Value) {
         let _ = self.tx.send(Cmd::Status(status));
+    }
+
+    /// The smart-money state (`Smart::saved`), replacing the last.
+    pub fn smart(&self, state: String) {
+        let _ = self.tx.send(Cmd::Smart(state));
     }
 
     /// Waits until everything sent so far is written.
@@ -213,6 +220,19 @@ pub async fn load(cfg: &Config) -> Result<HashMap<String, Trader>> {
                 Err(_) => HashMap::new(),
             })
         }
+    }
+}
+
+/// The smart-money state saved by this run, if any.
+pub async fn load_smart(cfg: &Config) -> Result<Option<String>> {
+    match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            migrate(&client).await?;
+            let row = client.query_opt("SELECT state::text FROM smart_state WHERE run_id = $1", &[&cfg.run_id]).await?;
+            Ok(row.map(|r| r.get(0)))
+        }
+        None => Ok(std::fs::read_to_string(cfg.data_dir.join("smart.json")).ok()),
     }
 }
 
@@ -283,6 +303,12 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             Cmd::Status(s) => {
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("status.jsonl")) {
                     let _ = writeln!(f, "{s}");
+                }
+            }
+            Cmd::Smart(s) => {
+                let (path, tmp) = (dir.join("smart.json"), dir.join("smart.tmp"));
+                if std::fs::write(&tmp, s).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
                 }
             }
             Cmd::Save(rows) => {
@@ -433,6 +459,11 @@ CREATE TABLE IF NOT EXISTS bot_status (
     data            jsonb       NOT NULL,
     PRIMARY KEY (run_id, at)
 );
+CREATE TABLE IF NOT EXISTS smart_state (
+    run_id      text        PRIMARY KEY,
+    state       jsonb       NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
 ";
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -486,11 +517,12 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     let mut trades: HashMap<String, TradeRow> = HashMap::new();
     let mut makers: HashMap<String, MakerRow> = HashMap::new();
     let mut statuses: Vec<Value> = Vec::new();
+    let mut smart: Option<String> = None;
     let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut open = true;
     while open || !events.is_empty() || !pending.is_empty() || !pending_sigs.is_empty() || !trades.is_empty() || !makers.is_empty()
-        || !statuses.is_empty() || !waiting.is_empty() {
+        || !statuses.is_empty() || smart.is_some() || !waiting.is_empty() {
         // Gather until the next tick (or a flush, a big batch, or the end), then write.
         let due = tokio::select! {
             cmd = rx.recv(), if open => match cmd {
@@ -526,6 +558,10 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     statuses.push(s);
                     false
                 }
+                Some(Cmd::Smart(s)) => {
+                    smart = Some(s);
+                    false
+                }
                 Some(Cmd::Flush(done)) => {
                     waiting.push(done);
                     true
@@ -538,7 +574,7 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             _ = tick.tick() => true,
         };
         if !due || (events.is_empty() && pending.is_empty() && pending_sigs.is_empty() && trades.is_empty() && makers.is_empty()
-            && statuses.is_empty() && waiting.is_empty()) {
+            && statuses.is_empty() && smart.is_none() && waiting.is_empty()) {
             continue;
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
@@ -556,8 +592,9 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             };
         }
         let Some(c) = &client else { continue };
-        match write(c, &run, &events, &pending, &pending_sigs, &trades, &makers, &statuses).await {
+        match write(c, &run, &events, &pending, &pending_sigs, &trades, &makers, &statuses, smart.as_deref()).await {
             Ok(()) => {
+                smart = None;
                 events.clear();
                 trades.clear();
                 makers.clear();
@@ -584,7 +621,16 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
 #[allow(clippy::too_many_arguments)]
 async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>,
                signals: &HashMap<String, SignalRow>, trades: &HashMap<String, TradeRow>, makers: &HashMap<String, MakerRow>,
-               statuses: &[Value]) -> Result<()> {
+               statuses: &[Value], smart: Option<&str>) -> Result<()> {
+    if let Some(state) = smart {
+        c.execute(
+            "INSERT INTO smart_state (run_id, state, updated_at) VALUES ($1, $2::text::jsonb, now())
+             ON CONFLICT (run_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+            &[&run, &state],
+        )
+        .await
+        .context("saving smart money state")?;
+    }
     if !statuses.is_empty() {
         let rows = serde_json::to_string(statuses)?;
         c.execute(

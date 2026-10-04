@@ -22,6 +22,11 @@
 //!   - cross momentum: among the most traded coins, the strongest / weakest against BTC over
 //!     a window.
 //!
+//! Out of each followed trader's actions on its position (`smart`): opens, adds, exits, flips,
+//! in their context (its PnL, the position's age, its usual size, funding, the crowd) and by the
+//! traders' own ratings (how the price went after their entries, per coin, direction, regime,
+//! horizon); 25 kinds, `sm-…`.
+//!
 //! The flow kinds can read only some traders: those whose copies run at a profit (`best-`), or
 //! those with low leverage settings and a large account (`low-`). Exits: stop and take profit
 //! at fixed distances, optionally a trailing stop (`-tr`, no take profit) or the stop moved to
@@ -33,6 +38,8 @@ use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::smart::{Rule, Smart, View};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
     Heads,
@@ -43,6 +50,8 @@ pub enum Kind {
     Whales,
     Trend,
     CrossMomentum,
+    /// A followed trader's actions of one kind (`rule`, see `smart`).
+    Smart,
 }
 
 /// Whose flow or positions a variant reads.
@@ -106,6 +115,9 @@ pub struct Variant {
     pub min_funding: f64,
     /// Positioning: open interest up at least this % over `OI_WINDOW_S`; 0 = not read.
     pub min_oi_pct: f64,
+    /// Smart money: which kind of action, and its size (% of the trader's equity) at least.
+    pub rule: Rule,
+    pub min_pct: f64,
 }
 
 const BASE: Variant = Variant {
@@ -126,6 +138,8 @@ const BASE: Variant = Variant {
     band_pct: 0.0,
     min_funding: 0.0,
     min_oi_pct: 0.0,
+    rule: Rule::None,
+    min_pct: 0.0,
 };
 
 /// Heads over `window_m`: `traders`+ on one side and `agree` of those taking one.
@@ -174,6 +188,14 @@ const fn trend(name: &'static str, window_m: f64, move_pct: f64, exit: Exit, hol
 /// held for `hold_m`, entered again at once while still among them.
 const fn xmom(name: &'static str, window_m: f64, k: usize, exit: Exit, hold_m: f64) -> Variant {
     Variant { name, kind: Kind::CrossMomentum, window_s: window_m * 60.0, top_k: k, exit, hold_s: hold_m * 60.0, cooldown_s: 0.0, ..BASE }
+}
+
+/// Smart money over `window_m`: `traders`+ whose latest action of the `rule`'s kind (`pct`%+ of
+/// equity; `usd`, see `Rule`) still stands, `agree` of those taking a side.
+#[allow(clippy::too_many_arguments)]
+const fn smart(name: &'static str, rule: Rule, window_m: f64, traders: usize, agree: f64, pct: f64, usd: f64, exit: Exit, hold_m: f64) -> Variant {
+    Variant { name, kind: Kind::Smart, rule, window_s: window_m * 60.0, min_traders: traders, min_agree: agree, min_pct: pct, min_usd: usd,
+              exit, hold_s: hold_m * 60.0, cooldown_s: cooldown(window_m), ..BASE }
 }
 
 const fn best(v: Variant, name: &'static str) -> Variant {
@@ -290,6 +312,46 @@ pub const VARIANTS: &[Variant] = &[
     held(volume("", 15.0, 2, 0.70, 500_000.0, MID, 120.0), 60.0, "v15m-2t-70-500k-M-60"),
     trail(volume("", 60.0, 3, 0.75, 2_000_000.0, LONG, 360.0), 3.0, "v60m-3t-75-2m-L-tr"),
     breakeven(conviction("", 60.0, 5, 10.0, LONG, 360.0), 1.0, "c60m-5t-10c-L-be"),
+    // Smart money by action (`smart`). Names: sm, kind, window, traders, size (p: % of equity).
+    // 1-9: what the action is, in what context.
+    smart("sm-open-15m-2t-1p-M", Rule::Open, 15.0, 2, 0.75, 1.0, 0.0, MID, 120.0),
+    smart("sm-open-15m-1t-10p-100k-L", Rule::Open, 15.0, 1, 0.75, 10.0, 100_000.0, LONG, 360.0),
+    smart("sm-add50-15m-2t-M", Rule::Add, 15.0, 2, 0.75, 1.0, 0.0, MID, 120.0),
+    smart("sm-exit-15m-2t-M", Rule::Exit, 15.0, 2, 0.75, 2.0, 0.0, MID, 120.0),
+    smart("sm-flip-15m-1t-M", Rule::Flip, 15.0, 1, 0.75, 2.0, 0.0, MID, 120.0),
+    smart("sm-flip-15m-1t-L", Rule::Flip, 15.0, 1, 0.75, 2.0, 0.0, LONG, 360.0),
+    smart("sm-accel-10m-1t-M", Rule::Accel, 10.0, 1, 0.75, 3.0, 0.0, MID, 120.0),
+    smart("sm-fresh-30m-2t-M", Rule::Fresh, 30.0, 2, 0.75, 5.0, 0.0, MID, 120.0),
+    smart("sm-winadd-30m-2t-M", Rule::WinnerAdd, 30.0, 2, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-losecut-30m-2t-M", Rule::LoserCut, 30.0, 2, 0.75, 1.0, 0.0, MID, 120.0),
+    smart("sm-avgdown-60m-2t-L", Rule::AvgDown, 60.0, 2, 0.75, 0.5, 0.0, LONG, 360.0),
+    smart("sm-avgup-60m-2t-L", Rule::AvgUp, 60.0, 2, 0.75, 0.5, 0.0, LONG, 360.0),
+    smart("sm-coord-5m-3t-M", Rule::Coordinated, 5.0, 3, 0.8, 0.5, 0.0, MID, 120.0),
+    // 10-14, 21-23: entries by traders rated for it (the ratings grow as the run goes).
+    smart("sm-leader-5m-1t-M", Rule::Leader, 5.0, 1, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-spec-15m-1t-M", Rule::Specialist, 15.0, 1, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-riskadj-15m-2t-M", Rule::RiskAdj, 15.0, 2, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-recent-15m-2t-M", Rule::Recent, 15.0, 2, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-regime-15m-2t-M", Rule::Regime, 15.0, 2, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-early-15m-1t-M", Rule::Early, 15.0, 1, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-exec-15m-1t-M", Rule::Execution, 15.0, 1, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-hz15-15m-1t-M", Rule::HorizonShort, 15.0, 1, 0.75, 0.5, 0.0, MID, 30.0),
+    smart("sm-hz240-30m-1t-L", Rule::HorizonLong, 30.0, 1, 0.75, 0.5, 0.0, LONG, 240.0),
+    // 15-17, 24, 25: the action against the trader's own habits and book.
+    smart("sm-sizez-15m-1t-25k-M", Rule::SizeSurprise, 15.0, 1, 0.75, 0.0, 25_000.0, MID, 120.0),
+    smart("sm-conc-30m-1t-25p-L", Rule::Concentration, 30.0, 1, 0.75, 25.0, 0.0, LONG, 360.0),
+    smart("sm-rot-15m-1t-M", Rule::Rotation, 15.0, 1, 0.75, 5.0, 0.0, MID, 120.0),
+    smart("sm-playbook-30m-1t-M", Rule::Playbook, 30.0, 1, 0.75, 4.0, 0.0, MID, 120.0),
+    smart("sm-capit-30m-1t-L", Rule::Capitulation, 30.0, 1, 0.75, 5.0, 0.0, LONG, 360.0),
+    // 18-20: smart money against the others, the crowd, funding.
+    smart("sm-disagree-30m-2t-M", Rule::Disagree, 30.0, 2, 0.75, 0.5, 0.0, MID, 120.0),
+    smart("sm-vscrowd-30m-3t-250k-M", Rule::VsCrowd, 30.0, 3, 0.7, 0.5, 250_000.0, MID, 120.0),
+    smart("sm-fund-entry-30m-3t-L", Rule::FundingEntry, 30.0, 3, 0.7, 0.5, 0.0, LONG, 360.0),
+    smart("sm-fund-exit-30m-3t-L", Rule::FundingExit, 30.0, 3, 0.7, 2.0, 0.0, LONG, 360.0),
+    // Controls.
+    fade(smart("", Rule::Open, 15.0, 2, 0.75, 1.0, 0.0, MID, 120.0), "fade-sm-open-15m-2t-1p-M"),
+    fade(smart("", Rule::Flip, 15.0, 1, 0.75, 2.0, 0.0, MID, 120.0), "fade-sm-flip-15m-1t-M"),
+    fade(smart("", Rule::Coordinated, 5.0, 3, 0.8, 0.5, 0.0, MID, 120.0), "fade-sm-coord-5m-3t-M"),
 ];
 
 /// Flow is kept this long (the longest window).
@@ -578,6 +640,13 @@ impl Prices {
         self.per_coin.get(coin)?.back().map(|x| x.1)
     }
 
+    /// The lowest and highest mid of the minutes from `from_ms` to `to_ms`.
+    pub fn range(&self, coin: &str, from_ms: u64, to_ms: u64) -> Option<(f64, f64)> {
+        let from = from_ms / 60_000 * 60_000;
+        let mids = self.per_coin.get(coin)?.iter().filter(|x| x.0 >= from && x.0 <= to_ms && x.1 > 0.0).map(|x| x.1);
+        mids.fold(None, |r, m| Some(r.map_or((m, m), |(lo, hi): (f64, f64)| (lo.min(m), hi.max(m)))))
+    }
+
     /// The move over the last `window_s` (fraction): the latest mid against the last one known
     /// `window_s` back (the latest of the last minute that ended by then; None until sampling
     /// covers it).
@@ -667,6 +736,10 @@ pub struct Data<'a> {
     pub prices: &'a Prices,
     pub ctx: &'a Ctx,
     pub levels: &'a HashMap<String, Vec<Level>>,
+    /// The followed traders' actions and ratings, and those whose copies made more than their
+    /// worst drawdown.
+    pub smart: &'a Smart,
+    pub risk_adj: &'a HashSet<String>,
     pub now_ms: u64,
 }
 
@@ -679,6 +752,8 @@ pub struct Inputs<'a> {
     d: Data<'a>,
     trend_coins: HashSet<String>,
     xmom_coins: Vec<String>,
+    /// The top-rated traders (`Smart::top_tier`).
+    top: HashSet<String>,
     nets: Cache<(String, u64, Who), Vec<(f64, f64)>>,
     whale_nets: Cache<(String, u64), Vec<f64>>,
     /// Per window: coin -> (rank from the weakest, coins ranked, move against BTC).
@@ -689,7 +764,8 @@ impl<'a> Inputs<'a> {
     pub fn new(d: Data<'a>) -> Self {
         let trend_coins = d.ctx.liquid(TREND_COINS).into_iter().collect();
         let xmom_coins = d.ctx.liquid(XMOM_COINS);
-        Self { d, trend_coins, xmom_coins, nets: RefCell::default(), whale_nets: RefCell::default(), ranks: RefCell::default() }
+        let top = d.smart.top_tier();
+        Self { d, trend_coins, xmom_coins, top, nets: RefCell::default(), whale_nets: RefCell::default(), ranks: RefCell::default() }
     }
 
     fn who(&self, w: Who) -> Option<&HashSet<String>> {
@@ -823,6 +899,12 @@ impl<'a> Inputs<'a> {
                     (false, 0.0)
                 }
             }
+            Kind::Smart => {
+                let crowd = if v.rule == Rule::VsCrowd { self.whale_nets(coin, v.window_s).map(|n| n.iter().sum()) } else { None };
+                let view = View { now_ms: self.d.now_ms, prices: self.d.prices, ctx: self.d.ctx, risk_adj: self.d.risk_adj, top: &self.top,
+                                  crowd_usd: crowd };
+                self.d.smart.read(v, coin, &view, &mut rd)
+            }
         };
         rd.side = if fires { if v.fade { -side } else { side } } else { 0.0 };
         rd
@@ -899,13 +981,15 @@ mod tests {
         prices: Prices,
         ctx: Ctx,
         levels: HashMap<String, Vec<Level>>,
+        smart: Smart,
+        risk_adj: HashSet<String>,
     }
 
     impl World {
         fn read(&self, name: &str, coin: &str, now_ms: u64) -> Reading {
             Inputs::new(Data {
                 flow: &self.flow, positions: &self.positions, best: &self.best, low_lev: &self.low_lev, whales: &self.whales,
-                prices: &self.prices, ctx: &self.ctx, levels: &self.levels, now_ms,
+                prices: &self.prices, ctx: &self.ctx, levels: &self.levels, smart: &self.smart, risk_adj: &self.risk_adj, now_ms,
             }).read(var(name), coin)
         }
     }

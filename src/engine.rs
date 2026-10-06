@@ -150,6 +150,10 @@ pub struct Engine {
     store: Store,
     read_limit: Arc<Semaphore>,
     dirty: bool,
+    /// The top `signals::TOP_SHARE` of the copies by PnL, worked out every `TOP_EVERY_S`, and
+    /// when (0: not yet).
+    top10: HashSet<String>,
+    top10_at: f64,
     /// Time spent per tick since the last status line: ticks, total and longest (ms), and
     /// of it the signals.
     load: Load,
@@ -224,6 +228,8 @@ impl Engine {
             store,
             read_limit: Arc::new(Semaphore::new(4)),
             dirty: false,
+            top10: HashSet::new(),
+            top10_at: 0.0,
             load: Load::default(),
             cfg,
         })
@@ -674,6 +680,7 @@ impl Engine {
             "copy_accounts": self.traders.len(),
             "liquidated": self.traders.len() - live.len(),
             "followed": self.followed.read().unwrap().len(),
+            "top10": self.top10.len(),
             "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
             "api_weight": weight,
@@ -815,6 +822,13 @@ impl Engine {
             .filter(|(_, t)| !t.acct.liquidated && t.copy_fills >= 3 && t.acct.equity(&marks) > t.acct.start)
             .map(|(a, _)| a.clone()).collect();
         let low_lev: HashSet<String> = self.traders.iter().filter(|(_, t)| is_low_lev(t)).map(|(a, _)| a.clone()).collect();
+        if at - self.top10_at >= signals::TOP_EVERY_S {
+            let top = top_copies(&self.traders, &marks);
+            let (added, dropped) = (top.difference(&self.top10).count(), self.top10.difference(&top).count());
+            log!("top list: {} traders, {added} in, {dropped} out", top.len());
+            self.top10 = top;
+            self.top10_at = at;
+        }
         let risk_adj: HashSet<String> = self.traders.iter().filter(|(_, t)| is_risk_adj(t)).map(|(a, _)| a.clone()).collect();
         let levels = trigger_levels(&self.traders, at);
         let mut positions: HashMap<String, Vec<(String, f64)>> = HashMap::new();
@@ -835,7 +849,7 @@ impl Engine {
             .cloned().collect::<HashSet<_>>().into_iter().collect();
         coins.sort();
         let inputs = Inputs::new(Data {
-            flow: &self.flow, positions: &positions, best: &best, low_lev: &low_lev, whales: &w, prices: &self.prices, ctx: &self.ctx,
+            flow: &self.flow, positions: &positions, best: &best, low_lev: &low_lev, top10: &self.top10, whales: &w, prices: &self.prices, ctx: &self.ctx,
             levels: &levels, smart: &self.smart, risk_adj: &risk_adj, now_ms,
         });
         let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
@@ -847,6 +861,8 @@ impl Engine {
             for m in &state.makers {
                 let why = if at >= m.expires {
                     "expiry"
+                } else if v.follow {
+                    if out_with_them(&inputs, v, &m.coin, m.side) { "traders out" } else { continue }
                 } else if inputs.read(v, &m.coin).side == -m.side {
                     "traders turned"
                 } else {
@@ -861,6 +877,8 @@ impl Engine {
                     why
                 } else if at >= os.expires {
                     "expiry"
+                } else if v.follow {
+                    if out_with_them(&inputs, v, coin, os.side) { "traders out" } else { continue }
                 } else if rd.side == -os.side {
                     "traders turned"
                 } else {
@@ -877,7 +895,9 @@ impl Engine {
                     continue;
                 }
                 let rd = inputs.read(v, coin);
-                if rd.side != 0.0 {
+                // Out with them: only while they hold it the way they took (not a flow they
+                // already undid).
+                if rd.side != 0.0 && !(v.follow && out_with_them(&inputs, v, coin, rd.side)) {
                     opens.push((v, coin.clone(), rd));
                     open += 1;
                 }
@@ -1173,6 +1193,27 @@ mod tests {
     }
 
     #[test]
+    fn top_copies_by_pnl() {
+        // 20 copies: the top tenth is 2, of those at a profit with 3+ copy fills.
+        let mut traders = HashMap::new();
+        for i in 0..20 {
+            let mut t = Trader { acct: Account::new(1000.0), copy_fills: 10, ..Default::default() };
+            t.acct.cash = 1000.0 + i as f64 * 10.0 - 50.0;
+            traders.insert(format!("t{i:02}"), t);
+        }
+        let marks = |_: &str| None;
+        assert_eq!(top_copies(&traders, &marks), ["t19", "t18"].iter().map(|s| s.to_string()).collect());
+        // Too few copy fills: the next one in.
+        traders.get_mut("t19").unwrap().copy_fills = 2;
+        assert_eq!(top_copies(&traders, &marks), ["t18", "t17"].iter().map(|s| s.to_string()).collect());
+        // None at a profit: none.
+        for t in traders.values_mut() {
+            t.acct.cash = 900.0;
+        }
+        assert!(top_copies(&traders, &marks).is_empty());
+    }
+
+    #[test]
     fn low_leverage_large_accounts() {
         let mut t = Trader { acct: Account::new(1000.0), equity: 50_000.0, ..Default::default() };
         assert!(!is_low_lev(&t)); // nothing read yet
@@ -1221,8 +1262,13 @@ fn describe(v: &Variant) -> String {
         signals::Who::All => "",
         signals::Who::Best => "profitable copies only: ",
         signals::Who::LowLev => "low-leverage large accounts only: ",
+        signals::Who::Top => "top 10% copies (hourly) only: ",
     };
     let e = &v.exit;
+    if v.follow {
+        let exit = format!("out when they are out, stop {}%, no tp", e.stop_pct);
+        return format!("{}{who}{what}; {exit}, {:.0} h max", if v.fade { "against: " } else { "" }, v.hold_s / 3600.0);
+    }
     let mut exit = format!("stop {}x the coin's 1 h range ({}-{}%; {}% until known)", e.vol_k, signals::VOL_STOP_MIN, signals::VOL_STOP_MAX,
         e.stop_pct);
     if e.trail_pct > 0.0 {
@@ -1234,6 +1280,24 @@ fn describe(v: &Variant) -> String {
         exit += &format!(", to break even at {}R", v.exit.be_r);
     }
     format!("{}{who}{what}; {exit}, {:.0} min max", if v.fade { "against: " } else { "" }, v.hold_s / 60.0)
+}
+
+/// Out with the traders (`Variant::follow`): those `v` reads no longer hold `coin` the way
+/// they took it (the way of a trade on `side`, or against it for a fade): out or turned.
+fn out_with_them(inputs: &Inputs, v: &Variant, coin: &str, side: f64) -> bool {
+    let theirs = if v.fade { -side } else { side };
+    inputs.held(v, coin) * theirs <= 0.0
+}
+
+/// The top `signals::TOP_SHARE` of the copies (of all not liquidated) by PnL, those at a
+/// profit with 3+ copy fills.
+fn top_copies(traders: &HashMap<String, Trader>, marks: &impl Fn(&str) -> Option<f64>) -> HashSet<String> {
+    let live: Vec<(&String, f64, u64)> = traders.iter().filter(|(_, t)| !t.acct.liquidated)
+        .map(|(a, t)| (a, t.acct.equity(marks) - t.acct.start, t.copy_fills)).collect();
+    let n = ((live.len() as f64 * signals::TOP_SHARE).ceil() as usize).max(1);
+    let mut ranked: Vec<_> = live.into_iter().filter(|x| x.1 > 0.0 && x.2 >= 3).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+    ranked.into_iter().take(n).map(|x| x.0.clone()).collect()
 }
 
 /// Low leverage and a large account: every leverage setting read (closed trips and open ones)

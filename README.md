@@ -111,6 +111,15 @@ behind the best price since the entry as the stop, or twice that, no take profit
 once the trade is 1R up, `-60` held at most 60 min. A name reads e.g. `h15m-5t-75-M`: heads, 15
 min, 5+ traders, 75%+ of them one way, exit M.
 
+**Top traders, out with them** (`top-…`). Only the top 10% of the followed traders by their copy's
+PnL (those at a profit, 3+ copy fills), the list worked out again every hour, so who is in it
+rotates (`top10` in `bot_status`). `-F<n>` variants exit with the traders instead of at a take
+profit: held while the listed traders' positions in the coin, summed as % of each one's equity,
+stay the way they took ("traders out" once they are out or turned), a fixed n% stop (5 / 10 / 20,
+not from the volatility), at most 48 h; a fresh flow they already undid is not entered. The same
+signal also runs under the usual exit (`-M`, `-L`), `best-h15m-3t-70-F10` takes every profitable
+copy with that exit, `fade-top-h15m-2t-70-F10` is the control.
+
 **Smart money by action** (`sm-…`, `src/smart.rs`). Each followed trader's fills become actions
 on its position — open from flat, add, reduce, close, flip (fills of one order, 2 s apart, are
 one action; a close and an open the other way within 10 min, a flip) — with their context: the

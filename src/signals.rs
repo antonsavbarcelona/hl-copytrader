@@ -62,7 +62,16 @@ pub enum Who {
     Best,
     /// The traders with low leverage settings and a large account (`LOW_LEV_*`).
     LowLev,
+    /// The top `TOP_SHARE` of the followed traders by their copy's PnL, those at a profit.
+    Top,
 }
+
+/// `Who::Top`: this share of the followed traders, the best copies first.
+pub const TOP_SHARE: f64 = 0.1;
+/// The top list is worked out again this often (s): who is in it rotates.
+pub const TOP_EVERY_S: f64 = 3600.0;
+/// Exits with the traders: held at most this long.
+const FOLLOW_HOLD_S: f64 = 48.0 * 3600.0;
 
 /// Stop / take profit, % from the entry; a trailing stop (% from the best price since the
 /// entry, 0 = none) and the stop moved to the entry once the trade is `be_r` times its risk up
@@ -142,6 +151,9 @@ pub struct Variant {
     /// Smart money: which kind of action, and its size (% of the trader's equity) at least.
     pub rule: Rule,
     pub min_pct: f64,
+    /// Exit with the traders (`who`): held while their positions in the coin, summed as % of
+    /// each one's equity, stay the way they took (`Inputs::held`); a fixed stop, no take profit.
+    pub follow: bool,
 }
 
 const BASE: Variant = Variant {
@@ -164,6 +176,7 @@ const BASE: Variant = Variant {
     min_oi_pct: 0.0,
     rule: Rule::None,
     min_pct: 0.0,
+    follow: false,
 };
 
 /// Heads over `window_m`: `traders`+ on one side and `agree` of those taking one.
@@ -228,6 +241,18 @@ const fn best(v: Variant, name: &'static str) -> Variant {
 
 const fn low_lev(v: Variant, name: &'static str) -> Variant {
     Variant { name, who: Who::LowLev, ..v }
+}
+
+const fn top(v: Variant, name: &'static str) -> Variant {
+    Variant { name, who: Who::Top, ..v }
+}
+
+/// Out when the traders are out (see `Variant::follow`): a fixed stop `stop_pct`% away (not
+/// from the volatility), no take profit (a run is ridden as long as they ride it), held at most
+/// `FOLLOW_HOLD_S`.
+const fn with_them(v: Variant, stop_pct: f64, name: &'static str) -> Variant {
+    let exit = Exit { stop_pct, tp_pct: NO_TP, trail_pct: 0.0, be_r: 0.0, vol_k: 0.0 };
+    Variant { name, follow: true, exit, hold_s: FOLLOW_HOLD_S, ..v }
 }
 
 const fn fade(v: Variant, name: &'static str) -> Variant {
@@ -329,6 +354,23 @@ pub const VARIANTS: &[Variant] = &[
     low_lev(conviction("", 15.0, 1, 5.0, MID, 120.0), "low-c15m-1t-5c-M"),
     low_lev(heads("", 15.0, 2, 0.70, MID, 120.0), "low-h15m-2t-70-M"),
     low_lev(volume("", 15.0, 1, 0.70, 250_000.0, MID, 120.0), "low-v15m-1t-70-250k-M"),
+    // Only the top tenth by copy PnL, the list worked out hourly (`top-`). `-F<n>`: out when
+    // they are out, an n% stop, no take profit, 48 h max; one signal under 5 / 10 / 20% stops
+    // and under the usual exit, to tell the stop from the signal.
+    top(heads("", 15.0, 2, 0.70, MID, 120.0), "top-h15m-2t-70-M"),
+    with_them(top(heads("", 15.0, 2, 0.70, MID, 120.0), ""), 5.0, "top-h15m-2t-70-F5"),
+    with_them(top(heads("", 15.0, 2, 0.70, MID, 120.0), ""), 10.0, "top-h15m-2t-70-F10"),
+    with_them(top(heads("", 15.0, 2, 0.70, MID, 120.0), ""), 20.0, "top-h15m-2t-70-F20"),
+    // The first top trader in, not waiting for a second.
+    with_them(top(heads("", 5.0, 1, 1.0, MID, 120.0), ""), 10.0, "top-h5m-1t-F10"),
+    with_them(top(heads("", 5.0, 1, 1.0, MID, 120.0), ""), 20.0, "top-h5m-1t-F20"),
+    top(heads("", 60.0, 2, 0.75, LONG, 360.0), "top-h60m-2t-75-L"),
+    with_them(top(heads("", 60.0, 2, 0.75, LONG, 360.0), ""), 10.0, "top-h60m-2t-75-F10"),
+    with_them(top(heads("", 60.0, 2, 0.75, LONG, 360.0), ""), 20.0, "top-h60m-2t-75-F20"),
+    with_them(top(conviction("", 15.0, 1, 5.0, MID, 120.0), ""), 10.0, "top-c15m-1t-5c-F10"),
+    // The exit apart from who: every profitable copy, out with them; and the control.
+    with_them(best(heads("", 15.0, 3, 0.70, MID, 120.0), ""), 10.0, "best-h15m-3t-70-F10"),
+    fade(with_them(top(heads("", 15.0, 2, 0.70, MID, 120.0), ""), 10.0, ""), "fade-top-h15m-2t-70-F10"),
     // The best signals so far, other exits.
     breakeven(best(conviction("", 15.0, 2, 5.0, MID, 120.0), ""), 1.0, "best-c15m-2t-5c-M-be"),
     trail(best(conviction("", 15.0, 2, 5.0, MID, 120.0), ""), 1.5, "best-c15m-2t-5c-M-tr"),
@@ -772,6 +814,8 @@ pub struct Data<'a> {
     pub positions: &'a HashMap<String, Vec<(String, f64)>>,
     pub best: &'a HashSet<String>,
     pub low_lev: &'a HashSet<String>,
+    /// The top `TOP_SHARE` by copy PnL (`Who::Top`).
+    pub top10: &'a HashSet<String>,
     pub whales: &'a WhaleFlow,
     pub prices: &'a Prices,
     pub ctx: &'a Ctx,
@@ -813,7 +857,14 @@ impl<'a> Inputs<'a> {
             Who::All => None,
             Who::Best => Some(self.d.best),
             Who::LowLev => Some(self.d.low_lev),
+            Who::Top => Some(self.d.top10),
         }
+    }
+
+    /// The positions of `v`'s traders in `coin` summed, each as a share of its equity: + long.
+    pub fn held(&self, v: &Variant, coin: &str) -> f64 {
+        let who = self.who(v.who);
+        self.d.positions.get(coin).into_iter().flatten().filter(|(t, _)| who.is_none_or(|s| s.contains(t))).map(|(_, x)| x).sum()
     }
 
     fn nets(&self, coin: &str, window_s: f64, who: Who) -> Option<Rc<Vec<(f64, f64)>>> {
@@ -1017,6 +1068,7 @@ mod tests {
         positions: HashMap<String, Vec<(String, f64)>>,
         best: HashSet<String>,
         low_lev: HashSet<String>,
+        top10: HashSet<String>,
         whales: WhaleFlow,
         prices: Prices,
         ctx: Ctx,
@@ -1026,11 +1078,16 @@ mod tests {
     }
 
     impl World {
-        fn read(&self, name: &str, coin: &str, now_ms: u64) -> Reading {
+        fn inputs(&self, now_ms: u64) -> Inputs<'_> {
             Inputs::new(Data {
-                flow: &self.flow, positions: &self.positions, best: &self.best, low_lev: &self.low_lev, whales: &self.whales,
-                prices: &self.prices, ctx: &self.ctx, levels: &self.levels, smart: &self.smart, risk_adj: &self.risk_adj, now_ms,
-            }).read(var(name), coin)
+                flow: &self.flow, positions: &self.positions, best: &self.best, low_lev: &self.low_lev, top10: &self.top10,
+                whales: &self.whales, prices: &self.prices, ctx: &self.ctx, levels: &self.levels, smart: &self.smart,
+                risk_adj: &self.risk_adj, now_ms,
+            })
+        }
+
+        fn read(&self, name: &str, coin: &str, now_ms: u64) -> Reading {
+            self.inputs(now_ms).read(var(name), coin)
         }
     }
 
@@ -1109,6 +1166,31 @@ mod tests {
 
     fn holders(longs: usize, shorts: usize) -> Vec<(String, f64)> {
         (0..longs).map(|i| (format!("l{i}"), 0.5)).chain((0..shorts).map(|i| (format!("s{i}"), -0.5))).collect()
+    }
+
+    #[test]
+    fn top_and_out_with_them() {
+        // top- reads only the top list.
+        let mut w = World { flow: flow(&[("a", 100.0, 1e4), ("b", 100.0, 1e4), ("x", -100.0, 1e4)]), ..Default::default() };
+        w.top10 = set(&["a"]);
+        assert_eq!(w.read("top-h15m-2t-70-F10", "BTC", 1_000_100).side, 0.0);
+        w.top10 = set(&["a", "b"]);
+        assert_eq!(w.read("top-h15m-2t-70-F10", "BTC", 1_000_100).side, 1.0);
+        assert_eq!(w.read("fade-top-h15m-2t-70-F10", "BTC", 1_000_100).side, -1.0);
+        // Held: the top traders' positions only, as shares of their equity.
+        w.positions.insert("BTC".into(), vec![("a".into(), 0.3), ("b".into(), -0.1), ("x".into(), -5.0)]);
+        let i = w.inputs(1_000_100);
+        assert!((i.held(var("top-h15m-2t-70-F10"), "BTC") - 0.2).abs() < 1e-12);
+        assert!((i.held(var("h15m-3t-70-M"), "BTC") + 4.8).abs() < 1e-12);
+        assert_eq!(i.held(var("top-h15m-2t-70-F10"), "ETH"), 0.0);
+        // Their exit: a fixed stop whatever the volatility, no take profit, 48 h.
+        for (name, stop) in [("top-h15m-2t-70-F5", 5.0), ("top-h15m-2t-70-F10", 10.0), ("top-h15m-2t-70-F20", 20.0)] {
+            let v = var(name);
+            assert!(v.follow && v.hold_s == 48.0 * 3600.0);
+            assert_eq!(v.exit.at(Some(3.0)), (stop, NO_TP, 0.0));
+            assert_eq!(v.exit.at(None), (stop, NO_TP, 0.0));
+        }
+        assert!(!var("top-h15m-2t-70-M").follow);
     }
 
     #[test]

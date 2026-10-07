@@ -10,13 +10,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Each followed account gets its own copy account starting with this much.
     pub start_usd: f64,
-    /// Followed: leaderboard accounts that traded this month with at least this equity
-    /// (a $1000 copy of a smaller account would multiply its positions).
-    pub min_equity: f64,
-    /// ... and at least this leaderboard PnL this month (USD) ...
-    pub min_month_pnl: f64,
-    /// ... and at least this leaderboard ROI this month (fraction, 0.5 = +50%).
-    pub min_month_roi: f64,
     /// Our order lands this long after the account's fill reaches us.
     pub exec_delay_ms: u64,
     /// Hyperliquid taker fee (base tier).
@@ -40,9 +33,6 @@ impl Default for Config {
         Self {
             data_dir: PathBuf::from("data"),
             start_usd: 1000.0,
-            min_equity: 1000.0,
-            min_month_pnl: 10_000.0,
-            min_month_roi: 0.5,
             exec_delay_ms: 1000,
             taker_fee: TAKER_FEE,
             min_order_usd: 10.0,
@@ -65,9 +55,6 @@ impl Config {
             match args[i].as_str() {
                 "--data" => c.data_dir = PathBuf::from(v()?),
                 "--start" => c.start_usd = v()?.parse()?,
-                "--min-equity" => c.min_equity = v()?.parse()?,
-                "--min-pnl" => c.min_month_pnl = v()?.parse()?,
-                "--min-roi" => c.min_month_roi = v()?.parse::<f64>()? / 100.0,
                 "--delay-ms" => c.exec_delay_ms = v()?.parse()?,
                 "--weight" => c.weight_per_min = v()?.parse()?,
                 "--run" => c.run_id = v()?,

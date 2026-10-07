@@ -41,8 +41,8 @@ pub struct Leader {
     pub account_value: f64,
     pub month_volume: f64,
     pub month_pnl: f64,
-    /// Month ROI as a fraction (0.5 = +50%).
-    pub month_roi: f64,
+    /// PnL over its whole life.
+    pub all_pnl: f64,
     pub name: Option<String>,
 }
 
@@ -58,9 +58,6 @@ pub struct CoinCtx {
     /// Funding rate (hourly) and mark price.
     pub funding: f64,
     pub mark: f64,
-    /// Open interest and 24 h volume, USD.
-    pub oi_usd: f64,
-    pub day_volume: f64,
 }
 
 /// How a position of the account is set up on the exchange.
@@ -154,7 +151,7 @@ impl Api {
         bail!("info {body}: still failing")
     }
 
-    /// Active perp coins (main dex) and, per coin, its funding, mark, open interest, volume.
+    /// Active perp coins (main dex) and, per coin, its funding and mark.
     pub async fn meta(&self) -> Result<(Vec<CoinInfo>, HashMap<String, CoinCtx>)> {
         let v = self.info(json!({"type": "metaAndAssetCtxs"}), 20).await?;
         let mut coins = Vec::new();
@@ -164,21 +161,13 @@ impl Api {
         for (i, u) in universe.iter().enumerate() {
             let name = u["name"].as_str().unwrap_or("").to_string();
             if let Some(c) = ctxs.get(i) {
-                let mark = num(&c["markPx"]);
-                ctx.insert(name.clone(), CoinCtx { funding: num(&c["funding"]), mark, oi_usd: num(&c["openInterest"]) * mark,
-                                                   day_volume: num(&c["dayNtlVlm"]) });
+                ctx.insert(name.clone(), CoinCtx { funding: num(&c["funding"]), mark: num(&c["markPx"]) });
             }
             if !u["isDelisted"].as_bool().unwrap_or(false) {
                 coins.push(CoinInfo { name, sz_decimals: u["szDecimals"].as_u64().unwrap_or(0) as u32 });
             }
         }
         Ok((coins, ctx))
-    }
-
-    /// One-minute candles' closes of `coin` from `start_ms` on: (open time ms, close).
-    pub async fn candles(&self, coin: &str, start_ms: u64) -> Result<Vec<(u64, f64)>> {
-        let v = self.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": start_ms}}), 20).await?;
-        Ok(v.as_array().cloned().unwrap_or_default().iter().filter_map(|k| Some((k["t"].as_u64()?, num(&k["c"])))).collect())
     }
 
     pub async fn account(&self, user: &str) -> Result<AccountState> {
@@ -205,6 +194,12 @@ impl Api {
             setups,
             time_ms: v["time"].as_u64().unwrap_or(0),
         })
+    }
+
+    /// Its PnL and account value histories (see `stable::History`).
+    pub async fn portfolio(&self, user: &str) -> Result<crate::stable::History> {
+        let v = self.info(json!({"type": "portfolio", "user": user}), 20).await?;
+        crate::stable::History::from_portfolio(&v).ok_or_else(|| anyhow::anyhow!("portfolio {user}: no perp history"))
     }
 
     /// Its resting stop and take-profit orders.
@@ -248,10 +243,12 @@ impl Api {
         let v: Value = self.http.get(LEADERBOARD).send().await?.json().await?;
         let mut out = Vec::new();
         for r in v["leaderboardRows"].as_array().cloned().unwrap_or_default() {
-            let mut month = (0.0, 0.0, 0.0);
+            let (mut month, mut all_pnl) = ((0.0, 0.0), 0.0);
             for w in r["windowPerformances"].as_array().cloned().unwrap_or_default() {
                 if w[0] == "month" {
-                    month = (num(&w[1]["vlm"]), num(&w[1]["pnl"]), num(&w[1]["roi"]));
+                    month = (num(&w[1]["vlm"]), num(&w[1]["pnl"]));
+                } else if w[0] == "allTime" {
+                    all_pnl = num(&w[1]["pnl"]);
                 }
             }
             out.push(Leader {
@@ -259,7 +256,7 @@ impl Api {
                 account_value: num(&r["accountValue"]),
                 month_volume: month.0,
                 month_pnl: month.1,
-                month_roi: month.2,
+                all_pnl,
                 name: r["displayName"].as_str().map(str::to_string),
             });
         }

@@ -25,12 +25,9 @@ use crate::account::{Account, round_size, walk};
 use crate::api::{AccountState, Api, CoinCtx, CoinInfo, Leader, Trigger, exchange_now, now};
 use crate::config::Config;
 use crate::log;
-use crate::maker::{self, MakerTrade};
-use crate::smart::{self, Smart};
-use crate::signals::{self, Ctx, Data, Flow, Inputs, Level, OpenSignal, Prices, Reading, SignalState, VARIANTS, Variant, WhaleFlow};
 use crate::stats::{Plan, Stats, Trip};
-use crate::store::{MakerRow, Row, SignalRow, Store, TradeRow};
-use crate::ws::{Book, Books, UserFill, Watched, Whales};
+use crate::store::{Row, Store};
+use crate::ws::{Book, Books, UserFill};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Trader {
@@ -58,29 +55,7 @@ pub struct Trader {
     /// Our open positions as trips from flat (coin -> trip).
     #[serde(default)]
     pub trips: HashMap<String, Trip>,
-    /// Signal accounts (`signal:<variant>`) only: their open signal trades.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal: Option<SignalState>,
-    /// Its positions' stops and liquidation prices as last read (coin -> set-up).
-    #[serde(default)]
-    pub setups: HashMap<String, Setup>,
 }
-
-/// A trader's position set-up as read: its side, liquidation price, stop orders (trigger
-/// price, size or None for the whole position).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Setup {
-    pub side: f64,
-    pub liq_px: Option<f64>,
-    pub stops: Vec<(f64, Option<f64>)>,
-    pub at: f64,
-}
-
-/// A set-up older than this is not used for the clusters.
-const SETUP_MAX_AGE_S: f64 = 6.0 * 3600.0;
-
-/// Signal accounts are kept under this prefix, next to the copy accounts.
-pub const SIGNAL_PREFIX: &str = "signal:";
 
 /// Its fills on one coin that one scheduled execution of ours follows.
 #[derive(Clone, Copy, Debug)]
@@ -101,15 +76,9 @@ pub enum Msg {
     /// Its positions' set-up and its stop / take-profit orders.
     Plan { user: String, state: anyhow::Result<(AccountState, Vec<Trigger>)> },
     Leaders(Vec<Leader>),
+    /// The day's list of traders to follow (`stable`).
+    Selected(crate::stable::Selection),
     Funding(HashMap<String, CoinCtx>),
-    /// Funding, open interest and volume per coin, every few minutes.
-    Ctx(HashMap<String, CoinCtx>),
-    /// A coin's recent one-minute closes, read at a start (price signals need not wait hours).
-    Seed { coin: String, closes: Vec<(u64, f64)> },
-    /// A trade in a watched coin (`taker_buy`: its aggressor bought).
-    Print { coin: String, px: f64, sz: f64, taker_buy: bool, time_ms: u64 },
-    /// A watched coin's book changed.
-    Book(String),
     Tick,
     /// Save and stop.
     Shutdown,
@@ -121,22 +90,8 @@ pub struct Engine {
     books: Books,
     coins: HashMap<String, CoinInfo>,
     pub followed: Arc<RwLock<HashSet<String>>>,
-    /// Coins with open signal trades or limit-order twins: their trades and book changes come
-    /// in as they happen (stops, take profits, limit fills).
-    pub watched: Watched,
-    /// Everyone's taker flow (the trades websocket adds to it).
-    pub whales: Whales,
-    /// Mids every minute, and the exchange's per-coin state, for the price and crowding signals.
-    prices: Prices,
-    ctx: Ctx,
     leaders: HashMap<String, Leader>,
     traders: HashMap<String, Trader>,
-    /// One account per signal variant (`signal:<name>`).
-    signals: HashMap<String, Trader>,
-    /// The followed traders' recent fills, for the signals.
-    flow: Flow,
-    /// Their actions on their positions, and their ratings (smart money).
-    smart: Smart,
     /// Accounts whose positions are being read.
     reading: HashSet<String>,
     /// Accounts with a set-up read scheduled.
@@ -150,12 +105,9 @@ pub struct Engine {
     store: Store,
     read_limit: Arc<Semaphore>,
     dirty: bool,
-    /// The top `signals::TOP_SHARE` of the copies by PnL, worked out every `TOP_EVERY_S`, and
-    /// when (0: not yet).
-    top10: HashSet<String>,
-    top10_at: f64,
-    /// Time spent per tick since the last status line: ticks, total and longest (ms), and
-    /// of it the signals.
+    /// Traders on the day's list (`stable`).
+    selected: usize,
+    /// Time spent per tick since the last status line: ticks, total and longest (ms).
     load: Load,
 }
 
@@ -164,12 +116,6 @@ struct Load {
     ticks: u64,
     tick_ms: f64,
     tick_max_ms: f64,
-    signals_ms: f64,
-    signals_max_ms: f64,
-    /// Trades and book changes of the watched coins, and the time spent on them (ms).
-    market_msgs: u64,
-    market_ms: f64,
-    market_max_ms: f64,
 }
 
 /// An account over `stale_leverage` is read again only if its last read is older than this.
@@ -188,22 +134,8 @@ fn r(x: f64, d: i32) -> f64 {
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(cfg: Config, api: Api, books: Books, coins: Vec<CoinInfo>, tx: mpsc::UnboundedSender<Msg>, traders: HashMap<String, Trader>,
-               store: Store, smart_saved: Option<String>) -> anyhow::Result<Self> {
-        let (sigs, traders): (HashMap<String, Trader>, HashMap<String, Trader>) =
-            traders.into_iter().partition(|(a, _)| a.starts_with(SIGNAL_PREFIX));
-        let mut signals = HashMap::new();
-        for v in VARIANTS {
-            let key = format!("{SIGNAL_PREFIX}{}", v.name);
-            let t = sigs.get(&key).cloned().unwrap_or_else(|| Trader {
-                address: key.clone(),
-                name: Some(describe(v)),
-                enrolled_at: now(),
-                acct: Account::new(cfg.start_usd),
-                ..Default::default()
-            });
-            signals.insert(key, Trader { signal: Some(t.signal.clone().unwrap_or_default()), ..t });
-        }
-        log!("state: {} copy accounts, {} signal accounts", traders.len(), signals.len());
+               store: Store) -> anyhow::Result<Self> {
+        log!("state: {} copy accounts", traders.len());
         let resync = traders.iter().filter(|(_, t)| !t.acct.liquidated && (!t.acct.positions.is_empty() || !t.theirs.is_empty()))
             .map(|(a, _)| a.clone()).collect();
         Ok(Self {
@@ -211,15 +143,8 @@ impl Engine {
             books,
             coins: coins.into_iter().map(|c| (c.name.clone(), c)).collect(),
             followed: Arc::new(RwLock::new(HashSet::new())),
-            watched: Arc::new(RwLock::new(HashSet::new())),
-            whales: Arc::new(std::sync::Mutex::new(WhaleFlow::new((exchange_now() * 1000.0) as u64))),
-            prices: Prices::new((exchange_now() * 1000.0) as u64),
-            ctx: Ctx::default(),
             leaders: HashMap::new(),
             traders,
-            signals,
-            flow: Flow::new((exchange_now() * 1000.0) as u64),
-            smart: Smart::load(smart_saved.as_deref(), (exchange_now() * 1000.0) as u64),
             reading: HashSet::new(),
             planning: HashSet::new(),
             resync,
@@ -228,8 +153,7 @@ impl Engine {
             store,
             read_limit: Arc::new(Semaphore::new(4)),
             dirty: false,
-            top10: HashSet::new(),
-            top10_at: 0.0,
+            selected: 0,
             load: Load::default(),
             cfg,
         })
@@ -245,20 +169,6 @@ impl Engine {
     fn save(&mut self) {
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
-        let sig_rows = self.signals.iter().filter_map(|(a, t)| {
-            let equity = t.acct.equity(&marks);
-            Some(SignalRow {
-                variant: a.trim_start_matches(SIGNAL_PREFIX).to_string(),
-                rule: t.name.clone().unwrap_or_default(),
-                equity,
-                roi_pct: if t.acct.start > 0.0 { (equity / t.acct.start - 1.0) * 100.0 } else { 0.0 },
-                taken: t.signal.as_ref().map(|s| s.taken).unwrap_or(0) as i64,
-                closed: t.stats.trips as i64,
-                wins: t.stats.wins as i64,
-                open_positions: t.acct.positions.len() as i32,
-                state: serde_json::to_string(t).ok()?,
-            })
-        }).collect();
         let rows = self.traders.iter().filter_map(|(a, t)| {
             let equity = t.acct.equity(&marks);
             Some(Row {
@@ -274,7 +184,6 @@ impl Engine {
         }).collect();
         drop(b);
         self.store.save(rows);
-        self.store.save_signals(sig_rows);
         self.dirty = false;
     }
 
@@ -287,18 +196,11 @@ impl Engine {
                 Msg::Read { user, why, state } => self.on_read(user, why, state),
                 Msg::Plan { user, state } => self.on_plan(user, state),
                 Msg::Leaders(l) => self.on_leaders(l),
+                Msg::Selected(s) => self.on_selected(s),
                 Msg::Funding(ctx) => self.on_funding(ctx),
-                Msg::Seed { coin, closes } => self.prices.seed(&coin, &closes),
-                Msg::Ctx(ctx) => {
-                    let rows = ctx.iter().map(|(c, x)| (c, x.funding, x.day_volume, x.oi_usd));
-                    self.ctx.update((exchange_now() * 1000.0) as u64, rows);
-                }
-                Msg::Print { coin, px, sz, taker_buy, time_ms } => self.timed(|e| e.on_print(&coin, px, sz, taker_buy, time_ms)),
-                Msg::Book(coin) => self.timed(|e| e.on_book(&coin)),
                 Msg::Tick => self.on_tick(),
                 Msg::Shutdown => {
                     self.save();
-                    self.store.smart(self.smart.saved());
                     self.store.flush().await;
                     log!("stopped, state saved");
                     return;
@@ -311,28 +213,21 @@ impl Engine {
         }
     }
 
+    /// The leaderboard: names and equity of the accounts (who is followed is `on_selected`).
     fn on_leaders(&mut self, leaders: Vec<Leader>) {
-        let (min, min_pnl, min_roi) = (self.cfg.min_equity, self.cfg.min_month_pnl, self.cfg.min_month_roi);
-        let mut set: HashSet<String> = HashSet::new();
-        self.leaders.clear();
-        for l in leaders {
-            if l.month_volume > 0.0 && l.account_value >= min && l.month_pnl >= min_pnl && l.month_roi > min_roi {
-                set.insert(l.address.clone());
-            }
-            self.leaders.insert(l.address.clone(), l);
-        }
+        self.leaders = leaders.into_iter().map(|l| (l.address.clone(), l)).collect();
+    }
+
+    fn on_selected(&mut self, sel: crate::stable::Selection) {
+        let mut set = sel.addresses();
         // Accounts we already copy stay followed while their copy holds positions.
-        for (a, t) in &self.traders {
-            if !t.acct.positions.is_empty() && !t.acct.liquidated {
-                set.insert(a.clone());
-            }
-        }
-        let n = set.len();
+        let kept = self.traders.iter().filter(|(a, t)| !t.acct.positions.is_empty() && !t.acct.liquidated && !set.contains(*a))
+            .map(|(a, _)| a.clone()).collect::<Vec<_>>();
+        let n = kept.len();
+        set.extend(kept);
+        log!("selection: {} traders followed (picked {} of {} read, {} kept for their open copies)", set.len(), sel.picks.len(), sel.read, n);
+        self.selected = sel.picks.len();
         *self.followed.write().unwrap() = set;
-        log!(
-            "leaderboard: {n} accounts followed (this month: traded, PnL >= ${min_pnl}, ROI > {}%; equity >= ${min})",
-            min_roi * 100.0
-        );
     }
 
     fn read_account(&mut self, user: &str, why: &'static str) {
@@ -356,13 +251,6 @@ impl Engine {
         let pos_after = self.traders.get(&f.user).filter(|_| applied).map(|t| t.theirs.get(&f.coin).copied().unwrap_or(0.0) + f.delta);
         self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
             "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
-        let equity = self.traders.get(&f.user).map(|t| t.equity).filter(|&e| e > 0.0)
-            .or_else(|| self.leaders.get(&f.user).map(|l| l.account_value)).unwrap_or(0.0);
-        self.flow.push(&f.coin, f.time_ms, &f.user, f.delta * f.px, equity);
-        if applied {
-            let before = self.traders.get(&f.user).and_then(|t| t.theirs.get(&f.coin).copied()).unwrap_or(0.0);
-            self.smart.on_fill(&f.user, &f.coin, before, f.delta, f.px, f.time_ms, equity, &self.prices);
-        }
         let Some(t) = self.traders.get_mut(&f.user) else {
             // First sight: read its positions, then mirror them.
             self.read_account(&f.user.clone(), "enroll");
@@ -424,7 +312,6 @@ impl Engine {
         // Coins where it or we hold something: mirror to its current positions.
         let mut coins_now: HashSet<String> = theirs.keys().cloned().collect();
         coins_now.extend(t.acct.positions.keys().cloned());
-        self.smart.sync(&user, &theirs, |c| state.setups.get(c).map(|s| s.entry));
         t.theirs = theirs;
         self.dirty = true;
         if new {
@@ -468,12 +355,6 @@ impl Engine {
         };
         let Some(t) = self.traders.get_mut(&user) else { return };
         t.plan_read = now();
-        // Its stops and liquidation prices, every position (for the clusters).
-        t.setups = state.positions.iter().map(|(coin, &size)| {
-            let stops = triggers.iter().filter(|o| &o.coin == coin && o.stop && o.sell == (size > 0.0)).map(|o| (o.trigger_px, o.size)).collect();
-            let liq_px = state.setups.get(coin).and_then(|s| s.liq_px);
-            (coin.clone(), Setup { side: size.signum(), liq_px, stops, at: t.plan_read })
-        }).collect();
         let equity = if t.equity > 0.0 { t.equity } else { state.account_value };
         let mut evs = Vec::new();
         for (coin, trip) in t.trips.iter_mut() {
@@ -571,7 +452,7 @@ impl Engine {
 
     fn on_funding(&mut self, ctx: HashMap<String, CoinCtx>) {
         let mut total = 0.0;
-        for t in self.traders.values_mut().chain(self.signals.values_mut()) {
+        for t in self.traders.values_mut() {
             if t.acct.liquidated {
                 continue;
             }
@@ -589,7 +470,7 @@ impl Engine {
             }
         }
         self.dirty = true;
-        log!("funding: ${total:.2} across copy and signal accounts");
+        log!("funding: ${total:.2} across copy accounts");
         let live: Vec<&Trader> = self.traders.values().filter(|t| !t.acct.liquidated).collect();
         log!(
             "status: {} copy accounts ({} liquidated), {} followed, {} positions open; {} copy fills in all",
@@ -599,15 +480,6 @@ impl Engine {
             live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
         );
-        let b = self.books.read().unwrap();
-        let marks = |c: &str| b.get(c).and_then(Book::mid);
-        let line: Vec<String> = VARIANTS.iter().filter_map(|v| {
-            let t = self.signals.get(&format!("{SIGNAL_PREFIX}{}", v.name))?;
-            let s = t.signal.as_ref()?;
-            Some(format!("{} ${:.0} ({} taken, {} open)", v.name, t.acct.equity(&marks), s.taken, s.open.len()))
-        }).collect();
-        log!("signals: {}", line.join(", "));
-
     }
 
     /// Liquidations and reconciliation of active accounts.
@@ -633,29 +505,14 @@ impl Engine {
                 stale.push(a.clone());
             }
         }
-        for t in self.signals.values_mut() {
-            let equity = t.acct.equity(&marks);
-            mark(t, &marks, equity);
-        }
-        let now_ms = (exchange_now() * 1000.0) as u64;
-        for (c, book) in b.iter() {
-            if let Some(m) = book.mid() {
-                self.prices.sample(c, now_ms, m);
-            }
-        }
         drop(b);
-        self.smart.tick(now_ms, &self.prices);
         for a in liquidate {
             self.liquidate(&a);
         }
-        let signals_at = std::time::Instant::now();
-        self.run_signals();
-        let (tick, sig) = (started.elapsed().as_secs_f64() * 1000.0, signals_at.elapsed().as_secs_f64() * 1000.0);
+        let tick = started.elapsed().as_secs_f64() * 1000.0;
         self.load.ticks += 1;
         self.load.tick_ms += tick;
         self.load.tick_max_ms = self.load.tick_max_ms.max(tick);
-        self.load.signals_ms += sig;
-        self.load.signals_max_ms = self.load.signals_max_ms.max(sig);
         if self.load.ticks >= 120 {
             self.status();
         }
@@ -680,7 +537,7 @@ impl Engine {
             "copy_accounts": self.traders.len(),
             "liquidated": self.traders.len() - live.len(),
             "followed": self.followed.read().unwrap().len(),
-            "top10": self.top10.len(),
+            "selected": self.selected,
             "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
             "api_weight": weight,
@@ -688,391 +545,9 @@ impl Engine {
             "ticks": l.ticks,
             "tick_avg_ms": r(l.tick_ms / n, 2),
             "tick_max_ms": r(l.tick_max_ms, 2),
-            "signals_avg_ms": r(l.signals_ms / n, 2),
-            "signals_max_ms": r(l.signals_max_ms, 2),
-            "market_msgs": l.market_msgs,
-            "market_avg_ms": r(l.market_ms / (l.market_msgs.max(1) as f64), 3),
-            "market_max_ms": r(l.market_max_ms, 2),
-            "watched_coins": self.watched.read().unwrap().len(),
-            "whale_wallets": self.whales.lock().unwrap().wallets(),
-            "ctx_coins": self.ctx.volume.len(),
-            "maker_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.makers.len()).sum::<usize>(),
-            "flow_fills": self.flow.len(),
-            "signal_trades_open": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.open.len()).sum::<usize>(),
-            "signal_trades_taken": self.signals.values().filter_map(|t| t.signal.as_ref()).map(|s| s.taken).sum::<u64>(),
-            "smart_actions": self.smart.len(),
-            "smart_traders_rated": self.smart.rated(),
         });
         log!("status: {st}");
         self.store.status(st);
-        self.store.smart(self.smart.saved());
-    }
-
-    /// Runs a handler of the watched coins' trades / book changes, timing it.
-    fn timed(&mut self, f: impl FnOnce(&mut Self)) {
-        let started = std::time::Instant::now();
-        f(self);
-        let ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.load.market_msgs += 1;
-        self.load.market_ms += ms;
-        self.load.market_max_ms = self.load.market_max_ms.max(ms);
-    }
-
-    /// A trade in a watched coin: the limit orders of the twins it fills.
-    fn on_print(&mut self, coin: &str, px: f64, sz: f64, taker_buy: bool, time_ms: u64) {
-        let books = self.books.clone();
-        let b = books.read().unwrap();
-        let book = b.get(coin);
-        let at = now();
-        let mut rows = Vec::new();
-        for (key, t) in self.signals.iter_mut() {
-            let Some(s) = t.signal.as_mut() else { continue };
-            for m in s.makers.iter_mut().filter(|m| m.coin == coin) {
-                if m.on_print(taker_buy, px, sz, time_ms, book, at) {
-                    rows.push(maker_row(key.trim_start_matches(SIGNAL_PREFIX), m));
-                }
-            }
-            s.makers.retain(|m| m.closed_at.is_none());
-        }
-        drop(b);
-        if !rows.is_empty() {
-            self.dirty = true;
-        }
-        for row in rows {
-            self.store.maker(row);
-        }
-    }
-
-    /// A watched coin's book changed: market trades' stops and take profits at the mid, as
-    /// soon as the book shows them; the twins' fills from the book, orders following the
-    /// price, entry deadlines and stops.
-    fn on_book(&mut self, coin: &str) {
-        let books = self.books.clone();
-        let b = books.read().unwrap();
-        let Some(book) = b.get(coin) else { return };
-        let Some(mid) = book.mid() else { return };
-        let at = now();
-        let mut closes: Vec<(String, &'static str)> = Vec::new();
-        for (key, t) in self.signals.iter_mut() {
-            let Some(os) = t.signal.as_mut().and_then(|s| s.open.get_mut(coin)) else { continue };
-            let stop = os.stop;
-            os.follow(mid);
-            if os.stop != stop {
-                self.dirty = true;
-            }
-            if let Some(why) = stop_or_tp(os, mid) {
-                closes.push((key.clone(), why));
-            }
-        }
-        let mut rows = Vec::new();
-        for (key, t) in self.signals.iter_mut() {
-            let Some(s) = t.signal.as_mut() else { continue };
-            for m in s.makers.iter_mut().filter(|m| m.coin == coin) {
-                if m.on_book(book, at) {
-                    rows.push(maker_row(key.trim_start_matches(SIGNAL_PREFIX), m));
-                }
-            }
-            s.makers.retain(|m| m.closed_at.is_none());
-        }
-        drop(b);
-        if !rows.is_empty() {
-            self.dirty = true;
-        }
-        for row in rows {
-            self.store.maker(row);
-        }
-        for (key, why) in closes {
-            self.close_signal(&key, coin, why, None);
-        }
-    }
-
-    /// The coins to watch: open signal trades and twins.
-    fn update_watched(&self) {
-        let mut set = HashSet::new();
-        for s in self.signals.values().filter_map(|t| t.signal.as_ref()) {
-            set.extend(s.open.keys().cloned());
-            set.extend(s.makers.iter().map(|m| m.coin.clone()));
-        }
-        *self.watched.write().unwrap() = set;
-    }
-
-    /// Every variant reads the coins with recent flow (and the held ones): open trades are
-    /// closed at their stop, take profit, expiry or when the traders turn the other way; new
-    /// ones are opened where a variant fires. The twins are closed at expiry or when the
-    /// traders turn, and checked against the book (in case its changes did not come in).
-    fn run_signals(&mut self) {
-        let now_ms = (exchange_now() * 1000.0) as u64;
-        self.flow.prune(now_ms);
-        let at = now();
-        let books = self.books.clone();
-        let b = books.read().unwrap();
-        let marks = |c: &str| b.get(c).and_then(Book::mid);
-        // Trailing / break-even stops follow the price.
-        for t in self.signals.values_mut() {
-            for (c, os) in t.signal.iter_mut().flat_map(|s| s.open.iter_mut()) {
-                if let Some(m) = marks(c) {
-                    os.follow(m);
-                }
-            }
-        }
-        // The traders whose copies we run at a profit, those with low leverage settings and a
-        // large account, every copied trader's positions as a share of its equity, and their
-        // stops and liquidation prices.
-        let best: HashSet<String> = self.traders.iter()
-            .filter(|(_, t)| !t.acct.liquidated && t.copy_fills >= 3 && t.acct.equity(&marks) > t.acct.start)
-            .map(|(a, _)| a.clone()).collect();
-        let low_lev: HashSet<String> = self.traders.iter().filter(|(_, t)| is_low_lev(t)).map(|(a, _)| a.clone()).collect();
-        if at - self.top10_at >= signals::TOP_EVERY_S {
-            let top = top_copies(&self.traders, &marks);
-            let (added, dropped) = (top.difference(&self.top10).count(), self.top10.difference(&top).count());
-            log!("top list: {} traders, {added} in, {dropped} out", top.len());
-            self.top10 = top;
-            self.top10_at = at;
-        }
-        let risk_adj: HashSet<String> = self.traders.iter().filter(|(_, t)| is_risk_adj(t)).map(|(a, _)| a.clone()).collect();
-        let levels = trigger_levels(&self.traders, at);
-        let mut positions: HashMap<String, Vec<(String, f64)>> = HashMap::new();
-        for (a, t) in &self.traders {
-            if t.acct.liquidated || t.equity <= 0.0 {
-                continue;
-            }
-            for (c, s) in &t.theirs {
-                if let Some(m) = marks(c) {
-                    positions.entry(c.clone()).or_default().push((a.clone(), s * m / t.equity));
-                }
-            }
-        }
-        let whales = self.whales.clone();
-        let w = whales.lock().unwrap();
-        let liquid = self.ctx.liquid(signals::TREND_COINS);
-        let mut coins: Vec<String> = self.flow.coins().chain(positions.keys()).chain(levels.keys()).chain(liquid.iter()).chain(w.coins())
-            .cloned().collect::<HashSet<_>>().into_iter().collect();
-        coins.sort();
-        let inputs = Inputs::new(Data {
-            flow: &self.flow, positions: &positions, best: &best, low_lev: &low_lev, top10: &self.top10, whales: &w, prices: &self.prices, ctx: &self.ctx,
-            levels: &levels, smart: &self.smart, risk_adj: &risk_adj, now_ms,
-        });
-        let mut closes: Vec<(String, String, &'static str, Reading)> = Vec::new();
-        let mut opens: Vec<(&'static Variant, String, Reading)> = Vec::new();
-        let mut twin_closes: Vec<(String, String, &'static str)> = Vec::new();
-        for v in VARIANTS {
-            let key = format!("{SIGNAL_PREFIX}{}", v.name);
-            let Some(state) = self.signals.get(&key).and_then(|t| t.signal.as_ref()) else { continue };
-            for m in &state.makers {
-                let why = if at >= m.expires {
-                    "expiry"
-                } else if v.follow {
-                    if out_with_them(&inputs, v, &m.coin, m.side) { "traders out" } else { continue }
-                } else if inputs.read(v, &m.coin).side == -m.side {
-                    "traders turned"
-                } else {
-                    continue;
-                };
-                twin_closes.push((key.clone(), m.id.clone(), why));
-            }
-            for (coin, os) in &state.open {
-                let Some(mid) = marks(coin) else { continue };
-                let rd = inputs.read(v, coin);
-                let why = if let Some(why) = stop_or_tp(os, mid) {
-                    why
-                } else if at >= os.expires {
-                    "expiry"
-                } else if v.follow {
-                    if out_with_them(&inputs, v, coin, os.side) { "traders out" } else { continue }
-                } else if rd.side == -os.side {
-                    "traders turned"
-                } else {
-                    continue;
-                };
-                closes.push((key.clone(), coin.clone(), why, rd));
-            }
-            let mut open = state.open.len();
-            for coin in &coins {
-                if open >= if v.follow { signals::MAX_OPEN_FOLLOW } else { signals::MAX_OPEN } {
-                    break;
-                }
-                if state.open.contains_key(coin) || state.closed_at.get(coin).is_some_and(|&t| at - t < v.cooldown_s) || marks(coin).is_none() {
-                    continue;
-                }
-                let rd = inputs.read(v, coin);
-                // Out with them: only while they hold it the way they took (not a flow they
-                // already undid).
-                if rd.side != 0.0 && !(v.follow && out_with_them(&inputs, v, coin, rd.side)) {
-                    opens.push((v, coin.clone(), rd));
-                    open += 1;
-                }
-            }
-        }
-        drop(inputs);
-        drop(w);
-        // The twins: expiry and the traders turning at the book; the rest as on a book change.
-        let mut rows = Vec::new();
-        for (key, t) in self.signals.iter_mut() {
-            let Some(s) = t.signal.as_mut() else { continue };
-            let variant = key.trim_start_matches(SIGNAL_PREFIX);
-            for m in s.makers.iter_mut() {
-                let Some(book) = b.get(&m.coin) else { continue };
-                let why = twin_closes.iter().find(|(k, id, _)| k == key && id == &m.id).map(|x| x.2);
-                if why.is_some_and(|why| m.close_at_book(book, at, why)) || m.on_book(book, at) {
-                    rows.push(maker_row(variant, m));
-                }
-            }
-            s.makers.retain(|m| m.closed_at.is_none());
-        }
-        drop(b);
-        if !rows.is_empty() {
-            self.dirty = true;
-        }
-        for row in rows {
-            self.store.maker(row);
-        }
-        for (key, coin, why, rd) in closes {
-            self.close_signal(&key, &coin, why, Some(&rd));
-        }
-        for (v, coin, rd) in opens {
-            self.open_signal(v, &coin, &rd);
-        }
-        self.update_watched();
-    }
-
-    /// Opens `v`'s trade in `coin`: a taker order sized to risk `RISK_PCT` of the account at the
-    /// variant's stop, stop and take profit set from the fill.
-    fn open_signal(&mut self, v: &Variant, coin: &str, rd: &Reading) {
-        let key = format!("{SIGNAL_PREFIX}{}", v.name);
-        let Some(info) = self.coins.get(coin).cloned() else { return };
-        let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
-        let Some(mid) = book.mid() else { return };
-        let (equity, gross) = {
-            let b = self.books.read().unwrap();
-            let marks = |c: &str| b.get(c).and_then(Book::mid);
-            let Some(t) = self.signals.get(&key) else { return };
-            let gross: f64 = t.acct.positions.iter().map(|(c, p)| p.size.abs() * marks(c).unwrap_or(p.entry)).sum();
-            (t.acct.equity(&marks), gross)
-        };
-        if equity <= 0.0 {
-            return;
-        }
-        // The stop from the coin's volatility (the fixed one until it is known).
-        let range = self.prices.hourly_range_pct(coin, (exchange_now() * 1000.0) as u64);
-        let (stop_pct, tp_pct, trail_pct) = v.exit.at(range);
-        let usd = signals::notional(equity, gross, stop_pct);
-        let size = round_size(usd / mid, info.sz_decimals);
-        if size * mid < self.cfg.min_order_usd {
-            return;
-        }
-        let side_levels = if rd.side > 0.0 { &book.asks } else { &book.bids };
-        let (got, px) = walk(side_levels, size);
-        if got <= 0.0 {
-            return;
-        }
-        let best_px = side_levels[0].0;
-        let fee = got * px * self.cfg.taker_fee;
-        let at = now();
-        let Some(t) = self.signals.get_mut(&key) else { return };
-        book_fill(t, coin, got * rd.side, px, fee, equity, at, true);
-        // Price vs the mid when the signal fired: the spread and the book walked.
-        let (mv, impact) = (got * (best_px - mid) * rd.side, got * (px - best_px) * rd.side);
-        t.stats.copy(0.0, 0.0, got * px, mv + impact, mv, impact);
-        let stop = px * (1.0 - rd.side * stop_pct / 100.0);
-        let os = OpenSignal {
-            id: format!("{}-{coin}-{}", v.name, (at * 1000.0) as u64),
-            side: rd.side,
-            entry: px,
-            stop,
-            tp: px * (1.0 + rd.side * tp_pct / 100.0),
-            opened: at,
-            expires: at + v.hold_s,
-            mid,
-            size: got,
-            risk_usd: got * (px - stop).abs(),
-            risk_pct: got * (px - stop).abs() / equity * 100.0,
-            fee,
-            reason: json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3), "score_pct": r(rd.score, 2),
-                "buy_usd": r(rd.buy_usd, 0), "sell_usd": r(rd.sell_usd, 0), "window_s": v.window_s, "book_ms": book.time_ms,
-                "stop_pct": r(stop_pct, 3), "range_1h_pct": range.map(|x| r(x, 3))}),
-            stop_pct,
-            trail_pct,
-            be_r: v.exit.be_r,
-            peak: 0.0,
-        };
-        let state = t.signal.get_or_insert_with(Default::default);
-        state.taken += 1;
-        state.open.insert(coin.to_string(), os.clone());
-        // Its limit-order twins: the same size, entering with a post-only order instead.
-        let mut rows = Vec::new();
-        for mode in maker::MODES {
-            let mut m = MakerTrade {
-                id: format!("{}:{}", os.id, mode.name()),
-                parent: os.id.clone(),
-                mode: Some(mode),
-                coin: coin.to_string(),
-                side: rd.side,
-                size: got,
-                placed: at,
-                mid,
-                market_entry: px,
-                stop_pct,
-                tp_pct,
-                trail_pct,
-                be_r: v.exit.be_r,
-                expires: os.expires,
-                equity,
-                sz_decimals: info.sz_decimals,
-                reason: os.reason.clone(),
-                ..Default::default()
-            };
-            if m.place(&book, at) {
-                rows.push(maker_row(v.name, &m));
-                state.makers.push(m);
-            }
-        }
-        self.dirty = true;
-        self.store.trade(ticket(v.name, coin, &os, None));
-        for row in rows {
-            self.store.maker(row);
-        }
-    }
-
-    /// Closes `key`'s trade in `coin` at the book; `rd`: the traders then, when read.
-    fn close_signal(&mut self, key: &str, coin: &str, why: &'static str, rd: Option<&Reading>) {
-        let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
-        let fee_rate = self.cfg.taker_fee;
-        let at = now();
-        let Some(t) = self.signals.get_mut(key) else { return };
-        let ours = t.acct.size(coin);
-        let Some(os) = t.signal.as_ref().and_then(|s| s.open.get(coin)).cloned() else { return };
-        if ours != 0.0 {
-            let (got, px) = walk(if ours > 0.0 { &book.bids } else { &book.asks }, ours.abs());
-            if got <= 0.0 {
-                return;
-            }
-            let fee = got * px * fee_rate;
-            let pnl = t.trips.get(coin).map(|x| x.pnl).unwrap_or(0.0) + (px - os.entry) * got * os.side - fee;
-            let opened_equity = t.trips.get(coin).map(|x| x.equity).unwrap_or(t.acct.start);
-            book_fill(t, coin, -ours.signum() * got, px, fee, 0.0, at, false);
-            if t.acct.size(coin) != 0.0 {
-                // Not all of it filled (thin book): the rest goes at the next tick.
-                if let Some(o) = t.signal.as_mut().and_then(|s| s.open.get_mut(coin)) {
-                    o.fee += fee;
-                }
-                return;
-            }
-            let variant = key.trim_start_matches(SIGNAL_PREFIX).to_string();
-            let mut row = ticket(&variant, coin, &os, Some((at, px, why)));
-            row.fees = os.fee + fee;
-            row.pnl = Some(r(pnl, 4));
-            row.pnl_pct = Some(r(pnl / opened_equity * 100.0, 3));
-            if let (serde_json::Value::Object(m), Some(rd)) = (&mut row.reason, rd) {
-                m.insert("traders_at_close".into(), json!({"longs": rd.longs, "shorts": rd.shorts, "agree": r(rd.agree, 3)}));
-            }
-            self.store.trade(row);
-        }
-        let Some(t) = self.signals.get_mut(key) else { return };
-        if let Some(s) = t.signal.as_mut() {
-            s.open.remove(coin);
-            s.closed_at.insert(coin.to_string(), at);
-        }
-        self.dirty = true;
     }
 
     fn liquidate(&mut self, user: &str) {
@@ -1168,250 +643,5 @@ mod tests {
         assert!((t.stats.loss_usd - 10.2).abs() < 1e-9);
         assert!(t.trips.is_empty());
         assert_eq!(t.stats.entries, 3);
-    }
-
-    #[test]
-    fn stop_and_liquidation_levels() {
-        let setup = |side: f64, liq: Option<f64>, stops: Vec<(f64, Option<f64>)>, at: f64| Setup { side, liq_px: liq, stops, at };
-        let mut long = Trader { acct: Account::new(1000.0), ..Default::default() };
-        long.theirs.insert("ETH".into(), 10.0);
-        long.theirs.insert("SOL".into(), -5.0);
-        // ETH long 10: a stop for 4 at 1900, a position stop at 1850 (capped at the position), liq 1500.
-        long.setups.insert("ETH".into(), setup(1.0, Some(1500.0), vec![(1900.0, Some(4.0)), (1850.0, None)], 1000.0));
-        // SOL: read when it was long, now short: stale, not used.
-        long.setups.insert("SOL".into(), setup(1.0, Some(90.0), vec![], 1000.0));
-        let mut old = Trader { acct: Account::new(1000.0), ..Default::default() };
-        old.theirs.insert("ETH".into(), -1.0);
-        old.setups.insert("ETH".into(), setup(-1.0, Some(2500.0), vec![], 1000.0 - SETUP_MAX_AGE_S - 1.0));
-        let traders: HashMap<String, Trader> = [("a".to_string(), long), ("b".to_string(), old)].into_iter().collect();
-        let lv = trigger_levels(&traders, 1000.0);
-        assert!(!lv.contains_key("SOL"));
-        let eth = &lv["ETH"];
-        assert_eq!(eth.len(), 3);
-        let usd: Vec<(f64, f64, f64)> = eth.iter().map(|l| (l.px, l.usd, l.dir)).collect();
-        assert_eq!(usd, vec![(1900.0, 7600.0, -1.0), (1850.0, 18_500.0, -1.0), (1500.0, 15_000.0, -1.0)]);
-    }
-
-    #[test]
-    fn top_copies_by_pnl() {
-        // 20 copies: the top tenth is 2, of those at a profit with 3+ copy fills.
-        let mut traders = HashMap::new();
-        for i in 0..20 {
-            let mut t = Trader { acct: Account::new(1000.0), copy_fills: 10, ..Default::default() };
-            t.acct.cash = 1000.0 + i as f64 * 10.0 - 50.0;
-            traders.insert(format!("t{i:02}"), t);
-        }
-        let marks = |_: &str| None;
-        assert_eq!(top_copies(&traders, &marks), ["t19", "t18"].iter().map(|s| s.to_string()).collect());
-        // Too few copy fills: the next one in.
-        traders.get_mut("t19").unwrap().copy_fills = 2;
-        assert_eq!(top_copies(&traders, &marks), ["t18", "t17"].iter().map(|s| s.to_string()).collect());
-        // None at a profit: none.
-        for t in traders.values_mut() {
-            t.acct.cash = 900.0;
-        }
-        assert!(top_copies(&traders, &marks).is_empty());
-    }
-
-    #[test]
-    fn low_leverage_large_accounts() {
-        let mut t = Trader { acct: Account::new(1000.0), equity: 50_000.0, ..Default::default() };
-        assert!(!is_low_lev(&t)); // nothing read yet
-        t.stats.planned = 3;
-        t.stats.lev_max = 5.0;
-        assert!(is_low_lev(&t));
-        // An open trip read at 20x counts too.
-        let mut trip = Trip::new(0.0, 1000.0);
-        trip.plan(Plan { leverage: 20.0, ..Default::default() });
-        t.trips.insert("BTC".into(), trip);
-        assert!(!is_low_lev(&t));
-        t.trips.clear();
-        t.equity = 20_000.0;
-        assert!(!is_low_lev(&t));
-    }
-}
-
-/// One line on what a variant does, for its account's name.
-fn describe(v: &Variant) -> String {
-    let w = v.window_s / 60.0;
-    let what = match v.kind {
-        signals::Kind::Heads => format!("{}+ traders, {:.0}%+ of them one way over {w:.0} min", v.min_traders, v.min_agree * 100.0),
-        signals::Kind::Conviction => format!("{}+ traders, net {}% of equity one way over {w:.0} min", v.min_traders, v.min_score),
-        signals::Kind::Volume => format!("${:.0}k+ net, {:.0}%+ of it one way, {}+ traders, over {w:.0} min", v.min_usd / 1000.0,
-            v.min_agree * 100.0, v.min_traders),
-        signals::Kind::Positioning => {
-            let mut s = format!("{}+ traders holding, {:.0}%+ one way", v.min_traders, v.min_agree * 100.0);
-            if v.min_funding > 0.0 {
-                s += &format!(", funding {:.5}%/h+ their way", v.min_funding * 100.0);
-            }
-            if v.min_oi_pct > 0.0 {
-                s += &format!(", open interest +{}%+ over 4 h", v.min_oi_pct);
-            }
-            s
-        }
-        signals::Kind::Cluster => format!("${:.0}k+ of the traders' stops / liquidations within {}% on one side, {:.0}%+ of those in the band",
-            v.min_usd / 1000.0, v.band_pct, v.min_agree * 100.0),
-        signals::Kind::Whales => format!("{}+ wallets with ${:.0}k+ net taker flow, {:.0}%+ of the whales' dollars one way, over {w:.0} min",
-            v.min_traders, v.min_usd / 1000.0, v.min_agree * 100.0),
-        signals::Kind::Trend => format!("moved {}%+ over {w:.0} min (top {} coins by volume)", v.move_pct, signals::TREND_COINS),
-        signals::Kind::CrossMomentum => format!("{} strongest long / weakest short vs BTC over {w:.0} min (top {} coins by volume)",
-            v.top_k, signals::XMOM_COINS),
-        signals::Kind::Smart => smart::describe(v),
-    };
-    let who = match v.who {
-        signals::Who::All => "",
-        signals::Who::Best => "profitable copies only: ",
-        signals::Who::LowLev => "low-leverage large accounts only: ",
-        signals::Who::Top => "top 10% copies (hourly) only: ",
-    };
-    let e = &v.exit;
-    if v.follow {
-        let exit = format!("out when they are out, stop {}%, no tp", e.stop_pct);
-        return format!("{}{who}{what}; {exit}, {:.0} h max", if v.fade { "against: " } else { "" }, v.hold_s / 3600.0);
-    }
-    let mut exit = format!("stop {}x the coin's 1 h range ({}-{}%; {}% until known)", e.vol_k, signals::VOL_STOP_MIN, signals::VOL_STOP_MAX,
-        e.stop_pct);
-    if e.trail_pct > 0.0 {
-        exit += &format!(", trailing {:.1}x the stop", e.trail_pct / e.stop_pct);
-    } else {
-        exit += &format!(", tp {:.1}x the stop", e.tp_pct / e.stop_pct);
-    }
-    if v.exit.be_r > 0.0 {
-        exit += &format!(", to break even at {}R", v.exit.be_r);
-    }
-    format!("{}{who}{what}; {exit}, {:.0} min max", if v.fade { "against: " } else { "" }, v.hold_s / 60.0)
-}
-
-/// Out with the traders (`Variant::follow`): those `v` reads no longer hold `coin` the way
-/// they took it (the way of a trade on `side`, or against it for a fade): out or turned.
-fn out_with_them(inputs: &Inputs, v: &Variant, coin: &str, side: f64) -> bool {
-    let theirs = if v.fade { -side } else { side };
-    inputs.held(v, coin) * theirs <= 0.0
-}
-
-/// The top `signals::TOP_SHARE` of the copies (of all not liquidated) by PnL, those at a
-/// profit with 3+ copy fills.
-fn top_copies(traders: &HashMap<String, Trader>, marks: &impl Fn(&str) -> Option<f64>) -> HashSet<String> {
-    let live: Vec<(&String, f64, u64)> = traders.iter().filter(|(_, t)| !t.acct.liquidated)
-        .map(|(a, t)| (a, t.acct.equity(marks) - t.acct.start, t.copy_fills)).collect();
-    let n = ((live.len() as f64 * signals::TOP_SHARE).ceil() as usize).max(1);
-    let mut ranked: Vec<_> = live.into_iter().filter(|x| x.1 > 0.0 && x.2 >= 3).collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
-    ranked.into_iter().take(n).map(|x| x.0.clone()).collect()
-}
-
-/// Low leverage and a large account: every leverage setting read (closed trips and open ones)
-/// at most `LOW_LEV_MAX`, at least one read, equity at least `LOW_LEV_MIN_EQUITY`.
-fn is_low_lev(t: &Trader) -> bool {
-    let open = t.trips.values().filter_map(|x| x.plan.as_ref());
-    let max = open.clone().map(|p| p.leverage).fold(t.stats.lev_max, f64::max);
-    let read = t.stats.planned > 0 || open.count() > 0;
-    !t.acct.liquidated && read && max > 0.0 && max <= signals::LOW_LEV_MAX && t.equity >= signals::LOW_LEV_MIN_EQUITY
-}
-
-/// Its copy made more than its worst drawdown (USD) over 5+ closed trips.
-fn is_risk_adj(t: &Trader) -> bool {
-    let s = &t.stats;
-    let pnl = s.win_usd - s.loss_usd;
-    !t.acct.liquidated && s.trips >= 5 && pnl > 0.0 && pnl >= s.max_dd_pct / 100.0 * t.acct.start
-}
-
-/// The copied traders' stops and liquidation prices per coin, from set-ups read within
-/// `SETUP_MAX_AGE_S` of positions they still hold that way.
-fn trigger_levels(traders: &HashMap<String, Trader>, at: f64) -> HashMap<String, Vec<Level>> {
-    let mut out: HashMap<String, Vec<Level>> = HashMap::new();
-    for (a, t) in traders {
-        if t.acct.liquidated {
-            continue;
-        }
-        for (coin, s) in &t.setups {
-            let pos = t.theirs.get(coin).copied().unwrap_or(0.0);
-            if at - s.at > SETUP_MAX_AGE_S || pos == 0.0 || pos.signum() != s.side {
-                continue;
-            }
-            let (abs, dir) = (pos.abs(), -s.side);
-            let lv = out.entry(coin.clone()).or_default();
-            for &(px, size) in &s.stops {
-                lv.push(Level { px, usd: size.unwrap_or(abs).min(abs) * px, dir, who: a.clone() });
-            }
-            if let Some(px) = s.liq_px {
-                lv.push(Level { px, usd: abs * px, dir, who: a.clone() });
-            }
-        }
-    }
-    out
-}
-
-/// A market signal trade's stop or take profit, if the mid has reached it.
-fn stop_or_tp(os: &OpenSignal, mid: f64) -> Option<&'static str> {
-    if (mid - os.stop) * os.side <= 0.0 {
-        Some("stop")
-    } else if (mid - os.tp) * os.side >= 0.0 {
-        Some("take profit")
-    } else {
-        None
-    }
-}
-
-/// A limit-order twin's row.
-fn maker_row(variant: &str, m: &MakerTrade) -> MakerRow {
-    let entered = m.entered_at.is_some() && m.filled > 0.0;
-    let closed = m.closed_at.is_some();
-    MakerRow {
-        id: m.id.clone(),
-        parent_id: m.parent.clone(),
-        variant: variant.to_string(),
-        mode: m.mode.map(|x| x.name()).unwrap_or("").to_string(),
-        coin: m.coin.clone(),
-        side: if m.side > 0.0 { "long" } else { "short" }.to_string(),
-        placed_at: r(m.placed, 3),
-        mid: m.mid,
-        market_entry: m.market_entry,
-        size: m.size,
-        filled: m.filled,
-        maker_pct: if m.filled > 0.0 { r(m.maker_filled / m.filled * 100.0, 2) } else { 0.0 },
-        entry: (m.filled > 0.0).then(|| m.entry()),
-        wait_s: m.entered_at.map(|e| r(e - m.placed, 3)),
-        requotes: m.requotes as i64,
-        stop: entered.then(|| m.stop()),
-        take_profit: entered.then(|| m.tp()),
-        expires_at: r(m.expires, 3),
-        reason: m.reason.clone(),
-        closed_at: m.closed_at.map(|c| r(c, 3)),
-        exit_px: (m.exited > 0.0).then(|| m.exit_value / m.exited),
-        exit_reason: m.exit_reason.clone(),
-        exit_maker_pct: (m.exited > 0.0).then(|| r(m.exit_maker / m.exited * 100.0, 2)),
-        pnl: closed.then(|| r(m.pnl(), 4)),
-        pnl_pct: closed.then(|| r(m.pnl() / m.equity.max(1e-9) * 100.0, 3)),
-        entry_fees: r(m.entry_fee, 6),
-        exit_fees: r(m.exit_fee, 6),
-        fees: r(m.entry_fee + m.exit_fee, 6),
-    }
-}
-
-/// A signal trade's row: its ticket, and how it closed once it has.
-fn ticket(variant: &str, coin: &str, os: &OpenSignal, closed: Option<(f64, f64, &str)>) -> TradeRow {
-    TradeRow {
-        id: os.id.clone(),
-        variant: variant.to_string(),
-        coin: coin.to_string(),
-        side: if os.side > 0.0 { "long" } else { "short" }.to_string(),
-        opened_at: r(os.opened, 3),
-        mid: os.mid,
-        entry: os.entry,
-        stop: os.stop,
-        take_profit: os.tp,
-        size: os.size,
-        notional: r(os.size * os.entry, 4),
-        risk_usd: r(os.risk_usd, 4),
-        risk_pct: r(os.risk_pct, 4),
-        expires_at: r(os.expires, 3),
-        reason: os.reason.clone(),
-        closed_at: closed.map(|c| r(c.0, 3)),
-        exit_px: closed.map(|c| c.1),
-        exit_reason: closed.map(|c| c.2.to_string()),
-        pnl: None,
-        pnl_pct: None,
-        fees: r(os.fee, 6),
     }
 }

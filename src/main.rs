@@ -1,18 +1,15 @@
-//! Paper copy-trading of the top Hyperliquid leaderboard accounts, $1000 copy account each,
-//! mirrored 1:1 against the live books.
+//! Paper copy-trading of Hyperliquid accounts that make money steadily (picked daily, see
+//! `stable`), $1000 copy account each, mirrored 1:1 against the live books.
 //!
-//!     hl-copytrader run    [--data DIR] [--start 1000] [--min-equity 1000] [--min-pnl 10000] [--min-roi 50]
-//!                          [--delay-ms 1000] [--weight 400]
+//!     hl-copytrader run    [--data DIR] [--start 1000] [--delay-ms 1000] [--weight 400]
 //!     hl-copytrader report [--data DIR] [--min-fills 10] [--top 30]
 
 mod account;
 mod api;
 mod config;
 mod engine;
-mod maker;
 mod report;
-mod signals;
-mod smart;
+mod stable;
 mod stats;
 mod store;
 mod ws;
@@ -45,16 +42,16 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let api = api::Api::new(cfg.weight_per_min)?;
-    let (coins, ctx0) = api.meta().await?;
+    let (coins, _) = api.meta().await?;
     log!("{} perp coins", coins.len());
     let names: Vec<String> = coins.iter().map(|c| c.name.clone()).collect();
     let books: ws::Books = Default::default();
     let (tx, rx) = mpsc::unbounded_channel();
     let traders = store::load(&cfg).await?;
-    let smart = store::load_smart(&cfg).await?;
+    let selection = store::load_selection(&cfg).await?;
     let store = store::open(&cfg).await?;
-    let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store, smart)?;
-    let (followed, watched, whales) = (engine.followed.clone(), engine.watched.clone(), engine.whales.clone());
+    let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
+    let followed = engine.followed.clone();
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
     {
@@ -69,77 +66,52 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             }
         });
     }
-    // Leaderboard now and every 6 h.
+    // Leaderboard now and every 6 h; from it, once a day, the traders to follow (the saved
+    // list until it is a day old).
     {
-        let (api, tx) = (api.clone(), tx.clone());
+        let (api, tx, cfg) = (api.clone(), tx.clone(), cfg.clone());
+        let mut last = 0.0;
+        if let Some(s) = selection {
+            log!("selection: saved one of {:.1} h ago, {} traders", (api::now() - s.at) / 3600.0, s.picks.len());
+            last = s.at;
+            let _ = tx.send(engine::Msg::Selected(s));
+        }
         tokio::spawn(async move {
             loop {
                 let wait = match api.leaders().await {
                     Ok(l) => {
-                        let _ = tx.send(engine::Msg::Leaders(l));
-                        6 * 3600
+                        let _ = tx.send(engine::Msg::Leaders(l.clone()));
+                        if api::now() - last >= stable::EVERY_S {
+                            let pause = if last > 0.0 { stable::PAUSE_S } else { 0.0 };
+                            let s = stable::select(&api, &l, pause).await;
+                            last = s.at;
+                            if let Err(e) = store::save_selection(&cfg, &s).await {
+                                log!("selection: not saved: {e:#}");
+                            }
+                            let _ = tx.send(engine::Msg::Selected(s));
+                        }
+                        (6.0 * 3600.0f64).min(last + stable::EVERY_S - api::now()).max(60.0)
                     }
                     Err(e) => {
                         log!("leaderboard read failed: {e}");
-                        300
+                        300.0
                     }
                 };
-                tokio::time::sleep(Duration::from_secs(wait)).await;
+                tokio::time::sleep(Duration::from_secs_f64(wait)).await;
             }
         });
     }
-    // Fills, trades and book changes go through their own channel into the engine's.
+    // Fills go through their own channel into the engine's.
     let (ftx, mut frx) = mpsc::unbounded_channel();
-    tokio::spawn(ws::run_books(names.clone(), books.clone(), watched.clone(), ftx.clone()));
-    tokio::spawn(ws::run_trades(names.clone(), followed, watched, whales, ftx));
+    tokio::spawn(ws::run_books(names.clone(), books.clone()));
+    tokio::spawn(ws::run_trades(names.clone(), followed, ftx));
     {
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some(f) = frx.recv().await {
-                let msg = match f {
-                    ws::Feed::Fill(f) => engine::Msg::Fill(f),
-                    ws::Feed::Print { coin, px, sz, taker_buy, time_ms } => engine::Msg::Print { coin, px, sz, taker_buy, time_ms },
-                    ws::Feed::Book(coin) => engine::Msg::Book(coin),
-                };
-                if tx.send(msg).is_err() {
+                if tx.send(engine::Msg::Fill(f)).is_err() {
                     break;
                 }
-            }
-        });
-    }
-    // Every coin's last hours of prices, most traded first, so the price signals and the
-    // volatility stops start at once.
-    {
-        let (api, tx) = (api.clone(), tx.clone());
-        let mut liquid: Vec<(String, f64)> =
-            ctx0.iter().filter(|(c, _)| names.contains(c)).map(|(c, x)| (c.clone(), x.day_volume)).collect();
-        liquid.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let start = ((api::now() - signals::PRICE_KEEP_S) * 1000.0) as u64;
-        tokio::spawn(async move {
-            let n = liquid.len();
-            for (coin, _) in liquid {
-                match api.candles(&coin, start).await {
-                    Ok(closes) => {
-                        let _ = tx.send(engine::Msg::Seed { coin, closes });
-                    }
-                    Err(e) => log!("candles {coin}: {e}"),
-                }
-            }
-            log!("prices: last {} h of {n} coins read", signals::PRICE_KEEP_S / 3600.0);
-        });
-    }
-    // Funding, open interest and volume per coin now and every 5 min (crowding, trend coins).
-    {
-        let (api, tx) = (api.clone(), tx.clone());
-        tokio::spawn(async move {
-            loop {
-                match api.meta().await {
-                    Ok((_, ctx)) => {
-                        let _ = tx.send(engine::Msg::Ctx(ctx));
-                    }
-                    Err(e) => log!("coin context read failed: {e}"),
-                }
-                tokio::time::sleep(Duration::from_secs(300)).await;
             }
         });
     }

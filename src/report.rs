@@ -73,8 +73,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
         }
         i += 2;
     }
-    let (signals, traders): (HashMap<String, Trader>, HashMap<String, Trader>) =
-        crate::store::load(cfg).await?.into_iter().partition(|(a, _)| a.starts_with(crate::engine::SIGNAL_PREFIX));
+    let traders: HashMap<String, Trader> = crate::store::load(cfg).await?;
     let mids: Value = reqwest::Client::new()
         .post("https://api.hyperliquid.xyz/info")
         .json(&json!({"type": "allMids"}))
@@ -201,24 +200,5 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
             s.planned, r.stop_pct(), r.isolated_pct(), r.avg_lev(), s.lev_max, r.avg_plan_pct(), s.plan_pct_max)?;
     }
     println!("all accounts: {}", path.display());
-
-    // Signal accounts: one per variant.
-    let mut sig: Vec<(&String, &Trader)> = signals.iter().collect();
-    sig.sort_by(|a, b| b.1.acct.equity(&mid).total_cmp(&a.1.acct.equity(&mid)));
-    println!("
-signal accounts (${:.0} each; 1% risk a trade, up to 10x):", cfg.start_usd);
-    println!("  {:24} {:>8} {:>7} {:>6} {:>6} {:>5} {:>8} {:>8} {:>6} {:>5} {:>6}  rule",
-        "variant", "equity", "roi%", "taken", "closed", "win%", "avg win", "avg loss", "dd%", "open", "slipbp");
-    for (key, t) in sig {
-        let s = &t.stats;
-        let eq = t.acct.equity(&mid);
-        let open = t.signal.as_ref().map(|x| x.open.len()).unwrap_or(0);
-        let taken = t.signal.as_ref().map(|x| x.taken).unwrap_or(0);
-        let losses = s.trips - s.wins;
-        println!("  {:24} {:8.2} {:+7.2} {:6} {:6} {:5.0} {:8.2} {:8.2} {:6.1} {:5} {:+6.1}  {}",
-            key.trim_start_matches(crate::engine::SIGNAL_PREFIX), eq, (div(eq, t.acct.start) - 1.0) * 100.0, taken, s.trips,
-            div(s.wins as f64, s.trips as f64) * 100.0, div(s.win_usd, s.wins as f64), -div(s.loss_usd, losses as f64), s.max_dd_pct, open,
-            div(s.slip_usd, s.slip_notional) * 1e4, t.name.as_deref().unwrap_or(""));
-    }
     Ok(())
 }

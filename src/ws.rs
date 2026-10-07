@@ -1,8 +1,6 @@
 //! Hyperliquid's public websocket: every trade on every perp coin (each names its buyer and
 //! seller, so followed accounts' fills are picked out of it) and the live L2 books the paper
-//! copies are filled against. For the watched coins (open signal trades and their limit-order
-//! twins) every trade and every book change is passed on too; every trade's taker flow goes to
-//! the whale signals (`WhaleFlow`).
+//! copies are filled against.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -16,7 +14,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::{exchange_now, num};
 use crate::log;
-use crate::signals::WhaleFlow;
 
 const WS: &str = "wss://api.hyperliquid.xyz/ws";
 const SILENCE_S: u64 = 30;
@@ -35,19 +32,6 @@ pub struct UserFill {
     /// When it reached us, on the exchange's clock.
     pub recv: f64,
 }
-
-/// What the websockets pass on to the engine.
-#[derive(Debug)]
-pub enum Feed {
-    Fill(UserFill),
-    /// A trade in a watched coin (`taker_buy`: its aggressor bought).
-    Print { coin: String, px: f64, sz: f64, taker_buy: bool, time_ms: u64 },
-    /// A watched coin's book changed (it is in `Books`).
-    Book(String),
-}
-
-pub type Watched = Arc<RwLock<HashSet<String>>>;
-pub type Whales = Arc<std::sync::Mutex<WhaleFlow>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Book {
@@ -110,9 +94,8 @@ async fn run(name: &str, subs: Vec<Value>, mut on_msg: impl FnMut(&Value)) {
     }
 }
 
-/// Fills of the followed accounts, every trade in a watched coin, and everyone's taker flow.
-pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>>>, watched: Watched, whales: Whales,
-                        tx: mpsc::UnboundedSender<Feed>) {
+/// Fills of the followed accounts.
+pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>>>, tx: mpsc::UnboundedSender<UserFill>) {
     let subs = coins.iter().map(|c| json!({"type": "trades", "coin": c})).collect();
     // A plain lock, held for one message (never across an await).
     let followed2 = followed.clone();
@@ -129,8 +112,6 @@ pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>
         let mut list: Vec<&Value> = list.iter().collect();
         list.sort_by_key(|t| (t["time"].as_u64().unwrap_or(0), t["tid"].as_u64().unwrap_or(0)));
         let set = followed2.read().unwrap();
-        let watch = watched.read().unwrap();
-        let mut whale = whales.lock().unwrap();
         let recv = exchange_now();
         for t in list {
             let coin = t["coin"].as_str().unwrap_or("").to_string();
@@ -144,19 +125,13 @@ pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>
                 ids.clear();
                 ids.insert(tid);
             }
-            if watch.contains(&coin) {
-                let _ = tx.send(Feed::Print { coin: coin.clone(), px: num(&t["px"]), sz: num(&t["sz"]), taker_buy: t["side"] == "B", time_ms });
-            }
             let users = t["users"].as_array();
             let (Some(buyer), Some(seller)) = (users.and_then(|u| u.first()).and_then(Value::as_str),
                                                 users.and_then(|u| u.get(1)).and_then(Value::as_str)) else { continue };
             let (px, sz) = (num(&t["px"]), num(&t["sz"]));
-            // The taker: the buyer of a trade its aggressor bought ("B"), else the seller.
-            let taker_buy = t["side"] == "B";
-            whale.push(&coin, &if taker_buy { buyer } else { seller }.to_lowercase(), time_ms, if taker_buy { sz * px } else { -sz * px });
             for (user, sign) in [(buyer.to_lowercase(), 1.0), (seller.to_lowercase(), -1.0)] {
                 if set.contains(&user) {
-                    let _ = tx.send(Feed::Fill(UserFill { user, coin: coin.clone(), delta: sign * sz, px, time_ms, tid, recv }));
+                    let _ = tx.send(UserFill { user, coin: coin.clone(), delta: sign * sz, px, time_ms, tid, recv });
                 }
             }
         }
@@ -165,8 +140,8 @@ pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>
     drop(followed);
 }
 
-/// Keeps `books` current for every coin; a watched coin's changes are passed on.
-pub async fn run_books(coins: Vec<String>, books: Books, watched: Watched, tx: mpsc::UnboundedSender<Feed>) {
+/// Keeps `books` current for every coin.
+pub async fn run_books(coins: Vec<String>, books: Books) {
     let subs = coins.iter().map(|c| json!({"type": "l2Book", "coin": c})).collect();
     run("books", subs, move |v| {
         if v["channel"] != "l2Book" {
@@ -179,9 +154,6 @@ pub async fn run_books(coins: Vec<String>, books: Books, watched: Watched, tx: m
         let book = Book { bids: side(0), asks: side(1), time_ms: d["time"].as_u64().unwrap_or(0) };
         if let Some(coin) = d["coin"].as_str() {
             books.write().unwrap().insert(coin.to_string(), book);
-            if watched.read().unwrap().contains(coin) {
-                let _ = tx.send(Feed::Book(coin.to_string()));
-            }
         }
     })
     .await;

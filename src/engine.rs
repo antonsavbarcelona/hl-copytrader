@@ -888,7 +888,7 @@ impl Engine {
             }
             let mut open = state.open.len();
             for coin in &coins {
-                if open >= signals::MAX_OPEN {
+                if open >= if v.follow { signals::MAX_OPEN_FOLLOW } else { signals::MAX_OPEN } {
                     break;
                 }
                 if state.open.contains_key(coin) || state.closed_at.get(coin).is_some_and(|&t| at - t < v.cooldown_s) || marks(coin).is_none() {

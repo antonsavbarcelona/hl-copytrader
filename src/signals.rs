@@ -438,8 +438,10 @@ pub const LOW_LEV_MIN_EQUITY: f64 = 30_000.0;
 pub const RISK_PCT: f64 = 1.0;
 /// ... with all positions together at most this many times equity (the leverage cap)...
 pub const MAX_GROSS: f64 = 10.0;
-/// ... and at most this many open at once.
+/// ... and at most this many open at once; those exiting with the traders (held for hours) up
+/// to all of the equity as 1% margins.
 pub const MAX_OPEN: usize = 10;
+pub const MAX_OPEN_FOLLOW: usize = 100;
 /// A trader takes a side when its net flow in the window is at least this share of its equity
 /// (0.2%), or, for positioning, its position is (1%).
 const MIN_FLOW: f64 = 0.002;

@@ -164,7 +164,7 @@ Controls: `fade-sm-open-…`, `fade-sm-flip-…`, `fade-sm-coord-…`. The rated
 
 Every entry is a complete trade, a row of `signal_trades`: coin, side, entry, stop, take
 profit, expiry, size from 1% of the account's equity at risk at the stop (all positions at
-most 10x equity, at most 10 open), and why (traders each way, agreement, conviction, dollars
+most 10x equity, at most 10 open; 100 for those exiting with the traders), and why (traders each way, agreement, conviction, dollars
 each way). A trade is closed at its stop, take profit or expiry, or when the traders turn the
 other way — the same row gets the exit, its reason, PnL after fees and the fees — and the coin
 then rests for the variant's window. Signals are read every 5 s; after a start, a window is read only once the

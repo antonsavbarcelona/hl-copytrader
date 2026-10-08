@@ -16,8 +16,10 @@ pub struct Config {
     pub taker_fee: f64,
     /// Exchange minimum order value (closing a position is always allowed).
     pub min_order_usd: f64,
-    /// Position / equity above this is a stale equity read: read the account again.
-    pub stale_leverage: f64,
+    /// Each position of a trader we enter risks this much of our equity (%) to our stop...
+    pub risk_pct: f64,
+    /// ... which is this far against our average entry (%).
+    pub stop_pct: f64,
     /// An active account's positions are read again this often (drift correction).
     pub reconcile_s: f64,
     /// Info API weight per minute this process may use (1200 per IP in total).
@@ -36,7 +38,8 @@ impl Default for Config {
             exec_delay_ms: 1000,
             taker_fee: TAKER_FEE,
             min_order_usd: 10.0,
-            stale_leverage: 60.0,
+            risk_pct: 2.0,
+            stop_pct: 20.0,
             reconcile_s: 2.0 * 3600.0,
             weight_per_min: 400.0,
             database_url: std::env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()),
@@ -55,6 +58,8 @@ impl Config {
             match args[i].as_str() {
                 "--data" => c.data_dir = PathBuf::from(v()?),
                 "--start" => c.start_usd = v()?.parse()?,
+                "--risk" => c.risk_pct = v()?.parse()?,
+                "--stop" => c.stop_pct = v()?.parse()?,
                 "--delay-ms" => c.exec_delay_ms = v()?.parse()?,
                 "--weight" => c.weight_per_min = v()?.parse()?,
                 "--run" => c.run_id = v()?,

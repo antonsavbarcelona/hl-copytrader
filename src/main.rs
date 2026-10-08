@@ -1,7 +1,8 @@
 //! Paper copy-trading of Hyperliquid accounts that make money steadily (picked daily, see
-//! `stable`), $1000 copy account each, mirrored 1:1 against the live books.
+//! `stable`), $1000 copy account each, following their trades against the live books with a
+//! 2% risk per entry to a 20% stop (see `engine`).
 //!
-//!     hl-copytrader run    [--data DIR] [--start 1000] [--delay-ms 1000] [--weight 400]
+//!     hl-copytrader run    [--data DIR] [--start 1000] [--risk 2] [--stop 20] [--delay-ms 1000] [--weight 400]
 //!     hl-copytrader report [--data DIR] [--min-fills 10] [--top 30]
 
 mod account;

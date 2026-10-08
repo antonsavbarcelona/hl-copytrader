@@ -85,7 +85,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     let mut rows = Vec::new();
     for (addr, t) in &traders {
         let equity = t.acct.equity(&mid);
-        // Fills that followed its trades; the seed mirror of old positions does not count.
+        // Fills that followed its trades; resizes of positions held before do not count.
         let fills = t.copy_fills;
         let days = ((now() - t.enrolled_at) / 86400.0).max(1.0 / 24.0);
         let roi = (div(equity, t.acct.start) - 1.0) * 100.0;
@@ -102,7 +102,7 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
     let liq = rows.iter().filter(|r| r.t.acct.liquidated).count();
     let traded: Vec<&Row> = rows.iter().filter(|r| r.t.copy_fills > 0).collect();
     let up = traded.iter().filter(|r| r.equity > cfg.start_usd).count();
-    println!("copy accounts: {n} (${:.0} each), copied a trade {}, only the seed mirror so far {}, liquidated {liq}",
+    println!("copy accounts: {n} (${:.0} each), copied a trade {}, none yet {}, liquidated {liq}",
         cfg.start_usd, traded.len(), n - traded.len());
     println!("all accounts together: ${total_start:.0} -> ${total_eq:.0} ({:+.2}%), {up} of {} traded accounts up",
         (total_eq / total_start.max(1.0) - 1.0) * 100.0, traded.len());

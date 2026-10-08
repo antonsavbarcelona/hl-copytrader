@@ -1,17 +1,24 @@
-//! The paper copier. Every followed account gets its own $1000 copy account that mirrors it
-//! 1:1: for every coin, our position = its position x (our start / its equity). Nothing else
-//! is ours — no caps, stops or filters (see README); only the venue's mechanics are modelled:
+//! The paper copier. Every followed account gets its own $1000 copy account that follows its
+//! trades with our own sizing and stop:
+//!   - when it opens a position (from flat, or flips), we open in its direction sized so that
+//!     our stop, `stop_pct` against our entry, loses `risk_pct` of our equity (2% / 20%: a
+//!     position of 10% of equity);
+//!   - while it adds, we hold that size; as it reduces from its largest size in the position
+//!     we reduce in proportion, and we close when it is flat;
+//!   - at our stop we close and stay out of that position until it is flat;
+//!   - positions it held before we followed it are not entered.
+//!
+//! Only the venue's mechanics are modelled beyond that:
 //!   - fills are taker fills on the live L2 book, `exec_delay_ms` after the account's fill
 //!     reaches us (the order would land then), at the taker fee;
 //!   - an order under $10 is not placed (exchange minimum) unless it closes the position: the
 //!     difference waits for the next change;
 //!   - funding is paid/received every hour on open positions at the coin's rate;
-//!   - a copy account at zero equity is liquidated (closed out at the book) and stops;
-//!   - position / equity over 60x means a stale equity read: the account is read again first.
+//!   - a copy account at zero equity is liquidated (closed out at the book) and stops.
 //!
-//! An account is enrolled on its first fill: its positions are read (clearinghouseState) and
-//! mirrored at once ("seed" fills), then each of its fills moves the mirror. Its positions are
-//! read again every `reconcile_s` while it is active, to correct drift.
+//! An account is enrolled on its first fill: its positions are read (clearinghouseState), then
+//! each of its fills moves our copy. Its positions are read again every `reconcile_s` while it
+//! is active, to correct drift.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -42,7 +49,7 @@ pub struct Trader {
     pub enrolled_at: f64,
     pub last_fill: f64,
     pub their_fills: u64,
-    /// Our fills that followed one of its trades (not the seed mirror of its old positions,
+    /// Our fills that followed one of its trades (not resizes of positions held before,
     /// nor drift corrections): the activity measure.
     #[serde(default)]
     pub copy_fills: u64,
@@ -55,6 +62,40 @@ pub struct Trader {
     /// Our open positions as trips from flat (coin -> trip).
     #[serde(default)]
     pub trips: HashMap<String, Trip>,
+    /// Its positions we follow (coin -> leg).
+    #[serde(default)]
+    pub legs: HashMap<String, Leg>,
+}
+
+/// Our side of one of its positions, from its entry until it is flat again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Leg {
+    /// Its direction (+1 long, -1 short).
+    pub dir: f64,
+    /// Its largest size in the position.
+    pub peak: f64,
+    /// Our size while it holds its largest: set when it enters, from the risk to our stop.
+    pub full: f64,
+    /// Not followed: our stop was hit, or it held the position before we followed it.
+    pub out: bool,
+}
+
+/// Our target size in `coin` for its position `theirs`. A position it enters (`entry`: we saw
+/// its fill open it) is ours at `full`, and followed down in proportion as it reduces from its
+/// peak; one it already held is not entered, except that a copy we hold is kept (resized).
+fn target(legs: &mut HashMap<String, Leg>, coin: &str, theirs: f64, ours: f64, entry: bool, full: f64) -> f64 {
+    if theirs.abs() < 1e-12 {
+        legs.remove(coin);
+        return 0.0;
+    }
+    let dir = theirs.signum();
+    let leg = legs.entry(coin.to_string()).or_default();
+    if leg.dir == dir {
+        leg.peak = leg.peak.max(theirs.abs());
+    } else {
+        *leg = Leg { dir, peak: theirs.abs(), full, out: !(entry || ours * dir > 0.0) };
+    }
+    if leg.out { 0.0 } else { dir * leg.full * theirs.abs() / leg.peak }
 }
 
 /// Its fills on one coin that one scheduled execution of ours follows.
@@ -63,9 +104,10 @@ struct Pending {
     /// Exchange time of the first (ms) and when it reached us (s, exchange clock).
     time_ms: u64,
     recv: f64,
-    /// Size and size x price of all of them (their average price).
+    /// Size and size x price of all of them (their average price), and their signed sum.
     size: f64,
     size_px: f64,
+    net: f64,
 }
 
 #[derive(Debug)]
@@ -94,6 +136,8 @@ pub struct Engine {
     traders: HashMap<String, Trader>,
     /// Accounts whose positions are being read.
     reading: HashSet<String>,
+    /// Accounts being enrolled, and the coin and size of the fill that brought them.
+    enrolling: HashMap<String, (String, f64)>,
     /// Accounts with a set-up read scheduled.
     planning: HashSet<String>,
     /// Active accounts to read again after a start: fills between the last save and the stop
@@ -117,9 +161,6 @@ struct Load {
     tick_ms: f64,
     tick_max_ms: f64,
 }
-
-/// An account over `stale_leverage` is read again only if its last read is older than this.
-const STALE_REREAD_S: f64 = 60.0;
 
 /// A set-up read follows an entry by this much (its stop orders usually follow the entry)...
 const PLAN_AFTER_S: f64 = 10.0;
@@ -146,6 +187,7 @@ impl Engine {
             leaders: HashMap::new(),
             traders,
             reading: HashSet::new(),
+            enrolling: HashMap::new(),
             planning: HashSet::new(),
             resync,
             scheduled: HashMap::new(),
@@ -252,7 +294,8 @@ impl Engine {
         self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
             "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
         let Some(t) = self.traders.get_mut(&f.user) else {
-            // First sight: read its positions, then mirror them.
+            // First sight: read its positions; the position this fill opened is followed.
+            self.enrolling.entry(f.user.clone()).or_insert((f.coin.clone(), f.delta));
             self.read_account(&f.user.clone(), "enroll");
             return;
         };
@@ -270,8 +313,9 @@ impl Engine {
         if let Some(p) = self.scheduled.get_mut(&key) {
             p.size += f.delta.abs();
             p.size_px += f.delta.abs() * f.px;
+            p.net += f.delta;
         } else {
-            let p = Pending { time_ms: f.time_ms, recv: f.recv, size: f.delta.abs(), size_px: f.delta.abs() * f.px };
+            let p = Pending { time_ms: f.time_ms, recv: f.recv, size: f.delta.abs(), size_px: f.delta.abs() * f.px, net: f.delta };
             self.scheduled.insert(key, p);
             let (tx, delay) = (self.tx.clone(), self.cfg.exec_delay_ms);
             let (user, coin) = (f.user, f.coin);
@@ -284,6 +328,7 @@ impl Engine {
 
     fn on_read(&mut self, user: String, why: &'static str, state: anyhow::Result<AccountState>) {
         self.reading.remove(&user);
+        let first = self.enrolling.remove(&user);
         let state = match state {
             Ok(s) => s,
             Err(e) => {
@@ -309,16 +354,22 @@ impl Engine {
         }
         t.equity = equity;
         t.read_ms = state.time_ms;
-        // Coins where it or we hold something: mirror to its current positions.
+        // Coins where it or we hold something: move ours to our target for its positions.
         let mut coins_now: HashSet<String> = theirs.keys().cloned().collect();
         coins_now.extend(t.acct.positions.keys().cloned());
         t.theirs = theirs;
+        // On enrollment, the position its first fill opened (it was flat or the other way
+        // before it) is an entry like any later one; the rest it held before.
+        let entered = first.filter(|(c, d)| {
+            let size = t.theirs.get(c).copied().unwrap_or(0.0);
+            size.abs() > 1e-12 && size * (size - d) <= 1e-12
+        }).map(|(c, _)| c);
         self.dirty = true;
         if new {
             self.write(json!({"kind": "enroll", "user": user, "equity": r(equity, 2), "positions": coins_now.len()}));
         }
-        let why = if new { "seed" } else { why };
         for c in coins_now {
+            let why = if entered.as_ref() == Some(&c) { "copy" } else if new { "seed" } else { why };
             self.exec(&user, &c, why);
         }
         self.read_plan(&user);
@@ -375,35 +426,30 @@ impl Engine {
         }
     }
 
-    /// Moves our position in `coin` to the mirror of theirs, at the book.
+    /// Moves our position in `coin` to our target for its position (`target`), at the book.
     fn exec(&mut self, user: &str, coin: &str, why: &'static str) {
         let first = self.scheduled.remove(&(user.to_string(), coin.to_string()));
         let Some(info) = self.coins.get(coin).cloned() else { return };
         let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
         let Some(mid) = book.mid() else { return };
-        let (min_order, max_lev, fee_rate) = (self.cfg.min_order_usd, self.cfg.stale_leverage, self.cfg.taker_fee);
-        let (equity, theirs, ours, start, read_ms) = match self.traders.get(user) {
-            Some(t) if !t.acct.liquidated && t.equity > 0.0 => (t.equity, t.theirs.clone(), t.acct.size(coin), t.acct.start, t.read_ms),
-            _ => return,
-        };
-        let ratio = start / equity;
-        let target = theirs.get(coin).copied().unwrap_or(0.0) * ratio;
-        let (gross, equity_now) = {
+        let (min_order, fee_rate) = (self.cfg.min_order_usd, self.cfg.taker_fee);
+        let equity_now = {
             let b = self.books.read().unwrap();
-            let gross: f64 = theirs.iter().map(|(c, s)| (s * ratio).abs() * b.get(c).and_then(|x| x.mid()).unwrap_or(0.0)).sum();
             let marks = |c: &str| b.get(c).and_then(Book::mid);
-            (gross, self.traders.get(user).map(|t| t.acct.equity(&marks)).unwrap_or(0.0))
-        };
-        if gross / start > max_lev {
-            // Its equity is out of date (or far over any real leverage): read it again first,
-            // unless it was just read (then it really is that far over, e.g. about to be
-            // liquidated: not copied until that changes).
-            if exchange_now() - read_ms as f64 / 1000.0 > STALE_REREAD_S {
-                let user = user.to_string();
-                self.read_account(&user, "stale equity");
+            match self.traders.get(user) {
+                Some(t) if !t.acct.liquidated => t.acct.equity(&marks),
+                _ => return,
             }
-            return;
-        }
+        };
+        // Our size for a position it enters: the stop away, it loses `risk_pct` of our equity.
+        let full = (self.cfg.risk_pct / self.cfg.stop_pct * equity_now.max(0.0) / mid).max(0.0);
+        let Some(t) = self.traders.get_mut(user) else { return };
+        let ours = t.acct.size(coin);
+        let theirs = t.theirs.get(coin).copied().unwrap_or(0.0);
+        // An entry: its fills opened the position (it was flat or the other way before them);
+        // a copy without fills pending is the one its enrollment fill opened.
+        let entry = why == "copy" && first.is_none_or(|p| (theirs - p.net) * theirs <= 1e-12);
+        let target = target(&mut t.legs, coin, theirs, ours, entry, full);
         let closing = target.abs() < 1e-12;
         let mut delta = round_size(target - ours, info.sz_decimals);
         if closing {
@@ -489,8 +535,10 @@ impl Engine {
         let b = books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
         let mut liquidate = Vec::new();
+        let mut stops = Vec::new();
         let mut stale = Vec::new();
         let n = now();
+        let stop = self.cfg.stop_pct / 100.0;
         for (a, t) in self.traders.iter_mut() {
             if t.acct.liquidated {
                 continue;
@@ -500,6 +548,11 @@ impl Engine {
             if !t.acct.positions.is_empty() && equity <= 0.0 {
                 liquidate.push(a.clone());
             }
+            for (c, p) in &t.acct.positions {
+                if marks(c).is_some_and(|m| (m / p.entry - 1.0) * p.size.signum() <= -stop) {
+                    stops.push((a.clone(), c.clone()));
+                }
+            }
             let active = !t.acct.positions.is_empty() || !t.theirs.is_empty();
             if active && n - (t.read_ms as f64 / 1000.0) > self.cfg.reconcile_s {
                 stale.push(a.clone());
@@ -508,6 +561,9 @@ impl Engine {
         drop(b);
         for a in liquidate {
             self.liquidate(&a);
+        }
+        for (a, c) in stops {
+            self.stop_out(&a, &c);
         }
         let tick = started.elapsed().as_secs_f64() * 1000.0;
         self.load.ticks += 1;
@@ -548,6 +604,28 @@ impl Engine {
         });
         log!("status: {st}");
         self.store.status(st);
+    }
+
+    /// Our stop: closes our position in `coin` at the book and stays out of its position.
+    fn stop_out(&mut self, user: &str, coin: &str) {
+        let Some(book) = self.books.read().unwrap().get(coin).cloned() else { return };
+        let fee_rate = self.cfg.taker_fee;
+        let Some(t) = self.traders.get_mut(user).filter(|t| !t.acct.liquidated) else { return };
+        let ours = t.acct.size(coin);
+        let entry = t.acct.positions.get(coin).map(|p| p.entry).unwrap_or(0.0);
+        let (got, px) = walk(if ours < 0.0 { &book.asks } else { &book.bids }, ours.abs());
+        if got <= 0.0 {
+            return;
+        }
+        let theirs = t.theirs.get(coin).copied().unwrap_or(0.0);
+        t.legs.entry(coin.to_string()).or_insert(Leg { dir: theirs.signum(), peak: theirs.abs(), ..Default::default() }).out = true;
+        let filled = -ours.signum() * got;
+        let fee = got * px * fee_rate;
+        let realized = book_fill(t, coin, filled, px, fee, 0.0, now(), false);
+        let ev = json!({"kind": "fill", "why": "stop", "user": user, "coin": coin, "size": filled, "px": px,
+            "notional": r(got * px, 4), "fee": r(fee, 6), "realized": r(realized, 6), "pos_after": t.acct.size(coin),
+            "entry": r(entry, 8), "book_ms": book.time_ms});
+        self.write(ev);
     }
 
     fn liquidate(&mut self, user: &str) {
@@ -620,6 +698,29 @@ fn mark(t: &mut Trader, marks: &dyn Fn(&str) -> Option<f64>, equity: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn targets_follow_its_position_at_our_size() {
+        let mut legs = HashMap::new();
+        // It enters long 2: we hold our full 0.5; it adds to 4: we hold 0.5.
+        assert_eq!(target(&mut legs, "ETH", 2.0, 0.0, true, 0.5), 0.5);
+        assert_eq!(target(&mut legs, "ETH", 4.0, 0.5, true, 0.7), 0.5);
+        // It reduces to 1 of its peak 4: we hold a quarter; back to 3: three quarters.
+        assert_eq!(target(&mut legs, "ETH", 1.0, 0.5, false, 0.7), 0.125);
+        assert_eq!(target(&mut legs, "ETH", 3.0, 0.125, true, 0.7), 0.375);
+        // It flips short: a new entry at the full size of then.
+        assert_eq!(target(&mut legs, "ETH", -1.0, 0.375, true, 0.7), -0.7);
+        // Our stop: out until it is flat, then its next entry is followed.
+        legs.get_mut("ETH").unwrap().out = true;
+        assert_eq!(target(&mut legs, "ETH", -2.0, 0.0, true, 0.7), 0.0);
+        assert_eq!(target(&mut legs, "ETH", 0.0, 0.0, false, 0.7), 0.0);
+        assert!(legs.is_empty());
+        assert_eq!(target(&mut legs, "ETH", 1.0, 0.0, true, 0.6), 0.6);
+        // A position it held before we followed is not entered; a copy we hold is resized.
+        assert_eq!(target(&mut legs, "BTC", 1.0, 0.0, false, 0.1), 0.0);
+        assert_eq!(target(&mut legs, "BTC", 2.0, 0.0, true, 0.1), 0.0);
+        assert_eq!(target(&mut legs, "SOL", -5.0, -3.0, false, 2.0), -2.0);
+    }
 
     #[test]
     fn trips_through_add_reduce_flip() {

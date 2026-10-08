@@ -1,8 +1,9 @@
 # hl-copytrader
 
 Paper copy-trading of Hyperliquid accounts that make money steadily (picked daily from the
-leaderboard by their last 3 months): each gets its own $1000 copy account that mirrors it 1:1
-against the live order books.
+leaderboard by their last 3 months): each gets its own $1000 copy account that follows its
+trades against the live order books, sized so that each entry risks 2% of the account to a
+20% stop.
 
 ```
 cargo build --release
@@ -10,7 +11,8 @@ target/release/hl-copytrader run    --data data          # runs until stopped
 target/release/hl-copytrader report --data data [--min-fills 10] [--top 30]
 ```
 
-`run` options: `--start 1000` (USD per copy account),
+`run` options: `--start 1000` (USD per copy account), `--risk 2` (% of equity each entry
+loses at our stop), `--stop 20` (% against our entry),
 `--delay-ms 1000` (our order lands this long after the trader's fill reaches us),
 `--weight 400` (info API weight per minute; 1200 per IP shared with anything else).
 Needs Rust 1.85+. The running copy uses `data/bin/hl-copytrader.exe` so rebuilds are not
@@ -59,16 +61,21 @@ minute) is per IP, and the image takes 800 of it.
   all accounts in 2 of 3 months checked (July-September 2026); picked this way, 69% / 50% / 68%
   were at a profit the next month against 54% / 57% / 51% of all. With a drawdown limit too
   (20%) it was 71% / 83% / 80%, but the list is a third as long.
-- **How**: our position in each coin = its position x $1000 / its equity (leaderboard
-  accountValue, or its perp account value if larger). Its fills are picked out of the public
-  trades stream (every trade names buyer and seller), our order is a taker fill on the live
-  L2 book 1 s later. No caps, stops or filters of our own.
-- **Enrollment**: on its first fill we read its positions and mirror them at once ("seed"
-  fills, not counted as its activity); its positions are read again every 2 h while active.
+- **How**: its fills are picked out of the public trades stream (every trade names buyer and
+  seller), our order is a taker fill on the live L2 book 1 s later.
+  - When it opens a position (from flat, or flips), we open in its direction at a size whose
+    stop loses 2% of our equity: 2% / 20% = a position of 10% of equity.
+  - While it adds, we hold that size. As it reduces from its largest size in the position we
+    reduce in proportion, and we close when it is flat.
+  - Our stop: 20% against our average entry (checked every 5 s at the book's mid), closed at
+    the book; we stay out of that position until it is flat (`legs` in the state).
+- **Enrollment**: on its first fill we read its positions; the one that fill opened is
+  followed, the ones it held before are not entered. Its positions are read again every 2 h
+  while active (a copy we already hold is resized to our size then).
 - **Venue mechanics**: taker fee 0.045%; orders under $10 are not placed unless they close a
   position (the difference waits for its next change); hourly funding at each coin's rate;
-  a copy account at zero equity is liquidated and stops; position / equity over 60x is
-  treated as a stale equity read and re-read first. Main perp dex only (no HIP-3 dexes).
+  a copy account at zero equity is liquidated and stops. Main perp dex only (no HIP-3
+  dexes).
 
 ## What is measured
 
@@ -107,7 +114,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   - `their_fill`: every fill of a followed account as it reached us (size signed, price,
     exchange time, the exchange's trade id `tid`, feed delay, its position after) — what the
     traders did;
-  - `fill`: ours (`why`: seed / copy / reconcile / restart / stale), with lag, the trader's
+  - `fill`: ours (`why`: seed / copy / reconcile / restart / stop), with lag, the trader's
     price and slippage vs it (`slip_bps`, of it `move_bps`);
   - `enroll`, `plan` (the trader's set-up for a position), `liquidated`.
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).

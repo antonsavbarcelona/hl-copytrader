@@ -278,6 +278,16 @@ const MIGRATIONS: &[(&str, &str)] = &[
           '0x8aa077f5998d234ac8641d73d6bc4976e2a210fc',
           '0xe79d69fd1ed52dd14d7f55155259519ea20d0534',
           '0x9db82c502472d76742fdd69609dfcc6e01327401')"),
+    // ... and the other 6 of the 19 that can be copied, at a loss then: all 19 golden.
+    ("2026-10-09-golden-seed-all",
+     "UPDATE copy_accounts SET golden = true, state = jsonb_set(state, '{golden}', 'true')
+      WHERE address IN (
+          '0x40a632026febd007b0e4431a29170507f7aa3896',
+          '0xa8cbf4200595efcd94b7526d04deafe0f284af2d',
+          '0x0ffd670749d4179558b6b367e30e72ce2efea28f',
+          '0x5f96906b85010f729e36d5a4141d027194a47b60',
+          '0x2d23559bab0bbcb483056e77c9b2837438215cc2',
+          '0xf29c6bc1147a841519b382459a6d7a373c6b9971')"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

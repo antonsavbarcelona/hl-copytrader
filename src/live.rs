@@ -273,7 +273,16 @@ impl Live {
         }
         let held = self.state.legs.get(&u.coin).map(|l| (l.user == u.user, l.dir));
         let r = match held {
-            Some((false, _)) => return,
+            Some((false, _)) => {
+                // The coin is held for another account: its entry is not followed.
+                if u.entry && u.golden && u.frac > 0.0 {
+                    self.state.skipped += 1;
+                    let holder = self.state.legs[&u.coin].user.clone();
+                    self.event(json!({"what": "skipped", "why": "coin held", "user": u.user, "coin": u.coin, "held_for": holder}));
+                    self.save().await;
+                }
+                return;
+            }
             Some((true, dir)) if u.frac <= 0.0 || u.dir != dir => {
                 let r = self.close(&u.coin, if u.frac <= 0.0 { "exit" } else { "flip" }).await;
                 if r.is_ok() && u.frac > 0.0 && u.entry && u.golden {

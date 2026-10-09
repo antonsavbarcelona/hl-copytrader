@@ -24,8 +24,9 @@
 //! Followed: the day's list (`stable`), the golden list, and any account our copy still holds
 //! a position of. The golden list is the accounts whose copy makes money: measured from its
 //! enrollment (or, for copies from before the list, from its first start), after
-//! `GOLDEN_MIN_DAYS` and `GOLDEN_MIN_TRIPS` closed trips, its copy's PnL above zero. A golden
-//! account is followed even after it drops off the day's list.
+//! `GOLDEN_MIN_DAYS` and `GOLDEN_MIN_TRIPS` closed trips, its copy's PnL above zero; until then
+//! an account keeps its place (the list started with the accounts put on it by hand, see the
+//! migrations). A golden account is followed even after it drops off the day's list.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -95,12 +96,13 @@ pub struct Base {
 const GOLDEN_MIN_DAYS: f64 = 3.0;
 const GOLDEN_MIN_TRIPS: u64 = 5;
 
-/// ... and at a profit since: its PnL since, and whether it is golden.
+/// ... and at a profit since: its PnL since, and whether it is golden (until it is measured
+/// that long, it stays as it is: on the list if it was put there).
 fn measured(t: &Trader, equity: f64, at: f64) -> (f64, bool) {
-    let Some(b) = &t.base else { return (0.0, false) };
+    let Some(b) = &t.base else { return (0.0, t.golden && !t.acct.liquidated) };
     let pnl = equity - b.equity;
     let long = at - b.at >= GOLDEN_MIN_DAYS * 86400.0 && t.stats.trips.saturating_sub(b.trips) >= GOLDEN_MIN_TRIPS;
-    (pnl, long && pnl > 0.0 && !t.acct.liquidated)
+    (pnl, !t.acct.liquidated && if long { pnl > 0.0 } else { t.golden })
 }
 
 /// Our side of one of its positions, from its entry until it is flat again.
@@ -807,16 +809,20 @@ mod tests {
         t.stats.trips = 7;
         let day = 86400.0;
         assert_eq!(measured(&t, 950.0, 3.0 * day), (50.0, true));
-        // Too soon, too few trips, at a loss since, liquidated, not measured.
+        // Too soon or too few trips: as it is (not golden, or golden if put on the list).
         assert!(!measured(&t, 950.0, 2.9 * day).1);
         t.stats.trips = 6;
         assert!(!measured(&t, 950.0, 3.0 * day).1);
+        t.golden = true;
+        assert!(measured(&t, 850.0, 3.0 * day).1);
+        // Measured long enough: at a loss since, off; liquidated, off.
         t.stats.trips = 7;
         assert_eq!(measured(&t, 890.0, 3.0 * day), (-10.0, false));
         t.acct.liquidated = true;
         assert!(!measured(&t, 950.0, 3.0 * day).1);
+        t.acct.liquidated = false;
         t.base = None;
-        assert_eq!(measured(&t, 950.0, 3.0 * day), (0.0, false));
+        assert_eq!(measured(&t, 950.0, 3.0 * day), (0.0, true));
     }
 
     #[test]

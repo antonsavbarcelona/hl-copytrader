@@ -63,8 +63,11 @@ minute) is per IP, and the image takes 800 of it.
   candidate). An account that drops out stays followed while our copy holds positions.
 - **Golden list** (`src/engine.rs`): the accounts whose copy makes money. Each copy is measured
   from its enrollment (copies from before the list: from the 2026-10-09 start); after 3 days
-  and 5 closed trips, it is golden while its PnL since is above zero. Worked out every 10 min;
-  golden accounts are followed even after they drop off the day's list.
+  and 5 closed trips, it is golden while its PnL since is above zero; until then an account
+  keeps its place. The list started (migration `2026-10-09-golden-seed`) with the 13 accounts
+  that can be copied (swing traders on liquid coins, not market makers, HFT or grids) whose
+  copies were at a profit on 2026-10-09. Worked out every 10 min; golden accounts are followed
+  even after they drop off the day's list.
   Why: picked by one month's ROI (50%+, as before) the accounts did worse the next month than
   all accounts in 2 of 3 months checked (July-September 2026); picked this way, 69% / 50% / 68%
   were at a profit the next month against 54% / 57% / 51% of all. With a drawdown limit too
@@ -155,7 +158,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);
   `2026-10-07-reset` emptied every table above, for all runs, when the traders' pick changed,
   and dropped the tables of the signals the run used to trade (removed with them);
-  `2026-10-09-golden` added the golden columns.
+  `2026-10-09-golden` added the golden columns, `2026-10-09-golden-seed` put the first 13
+  accounts on the golden list.
 - `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
   used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`), and more
   in `data` (`selected`: traders on the day's list; `golden`, `golden_pnl`: on the golden

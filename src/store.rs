@@ -241,6 +241,24 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("2026-10-09-golden",
      "ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS golden boolean NOT NULL DEFAULT false,
                                 ADD COLUMN IF NOT EXISTS measured_pnl float8 NOT NULL DEFAULT 0"),
+    // The golden list starts with the copies at a profit on 2026-10-09 of the accounts that can
+    // be copied (swing traders; not market makers, HFT or grids: see the README).
+    ("2026-10-09-golden-seed",
+     "UPDATE copy_accounts SET golden = true, state = jsonb_set(state, '{golden}', 'true')
+      WHERE address IN (
+          '0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98',
+          '0x95da8596c44dd09f4b8becce87ad3b7894fb2328',
+          '0x0f4fbea1aaecd66967af7ef02c7fa4693999834a',
+          '0xc0b2a1ce425d0cd8bc321c445fa6ae0eaed2e688',
+          '0x8fc7c0442e582bca195978c5a4fdec2e7c5bb0f7',
+          '0x9c68cd0568eb47bad36ecd8090e6c1d1396a7783',
+          '0x1a94785cc11b1b4225374a8e0015f788b222a538',
+          '0x9a991732cd4cf14712b07fbeb8c5d87de90dd21a',
+          '0x25554a80781ee62414c3747e81c3f50157c634b1',
+          '0x1d74a7760df9d563d0b6610b1705266c4e2fdb26',
+          '0x8aa077f5998d234ac8641d73d6bc4976e2a210fc',
+          '0xe79d69fd1ed52dd14d7f55155259519ea20d0534',
+          '0x9db82c502472d76742fdd69609dfcc6e01327401')"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

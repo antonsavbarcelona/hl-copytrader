@@ -8,10 +8,14 @@
 //!     order resting on the exchange at that price;
 //!   - it is followed (reduced in proportion as the account reduces from its peak in the
 //!     position, closed when it is flat) to its end, golden or not by then;
-//!   - one position per coin (the account's, ours are one per coin on the exchange): another
-//!     account's entry in a coin we hold is not followed; at `max_positions` open none is;
-//!   - every minute the exchange's positions are read: a position gone there (our stop, or a
-//!     liquidation) ends ours.
+//!   - each account's position in a coin is a leg of ours on its own: its own entry, size and
+//!     stop order (reduce-only, for the leg's size: placed again when the leg's size changes),
+//!     its own exits. The exchange holds their sum in the coin. A leg the other way from the
+//!     legs held in the coin is not entered (one net position per coin on an account: a long
+//!     and a short there would cancel out, and their stops would act on each other's size);
+//!     at `max_positions` legs open none is;
+//!   - every minute the exchange's positions and orders are read: a leg whose stop order is
+//!     gone was stopped out; a coin's position gone there (a liquidation) ends its legs.
 //!
 //! Orders are IOC limits 5% through the mid (market orders, as the SDK places them). Prices are
 //! the live account's venue's: on testnet its own books, not mainnet's.
@@ -64,6 +68,8 @@ pub struct Update {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Leg {
+    #[serde(default)]
+    pub coin: String,
     pub user: String,
     pub dir: f64,
     /// Our size at the account's peak (set at entry), and ours now (signed).
@@ -77,11 +83,33 @@ pub struct Leg {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct State {
-    /// Coin -> our position.
+    /// `key(coin, account)` -> our leg.
     pub legs: HashMap<String, Leg>,
-    /// Entries not followed: the coin held for another account, or `max_positions` open.
+    /// Entries not followed: the other way from the coin's legs, or `max_positions` open.
     pub skipped: u64,
     pub orders: u64,
+}
+
+/// A leg's key: the coin and the account it follows.
+fn key(coin: &str, user: &str) -> String {
+    format!("{coin}|{user}")
+}
+
+impl State {
+    /// Legs saved by coin alone (one per coin, before legs per account) under their new keys.
+    fn upgrade(mut self) -> Self {
+        self.legs = self.legs.into_iter().map(|(k, mut l)| {
+            if !k.contains('|') {
+                l.coin = k;
+            }
+            (key(&l.coin, &l.user), l)
+        }).collect();
+        self
+    }
+
+    fn in_coin(&self, coin: &str) -> impl Iterator<Item = (&String, &Leg)> {
+        self.legs.iter().filter(move |(_, l)| l.coin == coin)
+    }
 }
 
 pub struct Live {
@@ -115,8 +143,8 @@ pub async fn start(cfg: &Config, store: Store) -> Result<Option<(mpsc::Unbounded
         .filter_map(|(i, u)| Some((u["name"].as_str()?.to_string(), (i as u32, u["szDecimals"].as_u64()? as u32))))
         .collect::<HashMap<_, _>>();
     let unified = ex.info(json!({"type": "userAbstraction", "user": account})).await.map(|v| v == "unifiedAccount").unwrap_or(false);
-    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-    log!("live: {} account {} (signer {}{}), {} coins, {} positions held", if base == MAINNET { "MAINNET" } else { "testnet" },
+    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value::<State>(v).ok()).unwrap_or_default().upgrade();
+    log!("live: {} account {} (signer {}{}), {} coins, {} legs held", if base == MAINNET { "MAINNET" } else { "testnet" },
         account, ex.signer(), if unified { ", unified" } else { "" }, coins.len(), state.legs.len());
     let status = Arc::new(Mutex::new(json!({})));
     let mut live = Live { ex, account, unified, coins, state, cfg: cfg.clone(), store, status: status.clone() };
@@ -222,7 +250,7 @@ impl Live {
     /// The start's check (see the module): bought and sold at once, recorded either way.
     async fn health(&mut self) {
         let started = std::time::Instant::now();
-        let Some(coin) = ["BTC", "ETH", "SOL"].into_iter().find(|c| self.coins.contains_key(*c) && !self.state.legs.contains_key(*c)) else {
+        let Some(coin) = ["BTC", "ETH", "SOL"].into_iter().find(|c| self.coins.contains_key(*c) && self.state.in_coin(c).next().is_none()) else {
             log!("live: health check skipped (BTC, ETH and SOL all held)");
             return;
         };
@@ -271,27 +299,17 @@ impl Live {
         if !self.coins.contains_key(&u.coin) {
             return;
         }
-        let held = self.state.legs.get(&u.coin).map(|l| (l.user == u.user, l.dir));
-        let r = match held {
-            Some((false, _)) => {
-                // The coin is held for another account: its entry is not followed.
-                if u.entry && u.golden && u.frac > 0.0 {
-                    self.state.skipped += 1;
-                    let holder = self.state.legs[&u.coin].user.clone();
-                    self.event(json!({"what": "skipped", "why": "coin held", "user": u.user, "coin": u.coin, "held_for": holder}));
-                    self.save().await;
-                }
-                return;
-            }
-            Some((true, dir)) if u.frac <= 0.0 || u.dir != dir => {
-                let r = self.close(&u.coin, if u.frac <= 0.0 { "exit" } else { "flip" }).await;
+        let k = key(&u.coin, &u.user);
+        let r = match self.state.legs.get(&k).map(|l| l.dir) {
+            Some(dir) if u.frac <= 0.0 || u.dir != dir => {
+                let r = self.close(&k, if u.frac <= 0.0 { "exit" } else { "flip" }).await;
                 if r.is_ok() && u.frac > 0.0 && u.entry && u.golden {
                     self.open(&u).await
                 } else {
                     r
                 }
             }
-            Some(_) => self.follow(&u).await,
+            Some(_) => self.follow(&k, &u).await,
             None if u.entry && u.golden && u.frac > 0.0 => self.open(&u).await,
             None => return,
         };
@@ -301,9 +319,18 @@ impl Live {
         self.save().await;
     }
 
+    fn skip(&mut self, u: &Update, why: &str) {
+        self.state.skipped += 1;
+        self.event(json!({"what": "skipped", "why": why, "user": u.user, "coin": u.coin}));
+    }
+
     async fn open(&mut self, u: &Update) -> Result<()> {
         if self.state.legs.len() >= self.cfg.max_positions {
-            self.state.skipped += 1;
+            self.skip(u, "max positions");
+            return Ok(());
+        }
+        if self.state.in_coin(&u.coin).any(|(_, l)| l.dir != u.dir) {
+            self.skip(u, "other way from the coin's legs");
             return Ok(());
         }
         let (equity, _) = self.equity().await?;
@@ -320,57 +347,75 @@ impl Live {
             bail!("nothing filled");
         }
         let stop_px = px * (1.0 - u.dir * self.cfg.stop_pct / 100.0);
-        let stop_oid = match self.stop(&u.coin, u.dir, full, stop_px).await {
-            Ok(oid) => Some(oid),
-            Err(e) => {
-                self.event(json!({"what": "stop failed", "coin": u.coin, "error": format!("{e:#}")}));
-                None
-            }
-        };
-        self.state.legs.insert(u.coin.clone(), Leg {
-            user: u.user.clone(), dir: u.dir, full, size: got, entry_px: px, stop_px, stop_oid, opened: now(),
+        let k = key(&u.coin, &u.user);
+        self.state.legs.insert(k.clone(), Leg {
+            coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size: got, entry_px: px, stop_px, stop_oid: None, opened: now(),
         });
+        self.restop(&k).await;
+        let oid = self.state.legs[&k].stop_oid;
         self.event(json!({"what": "open", "user": u.user, "coin": u.coin, "size": got, "px": px, "notional": got.abs() * px,
-            "equity": equity, "stop_px": stop_px, "stop_oid": stop_oid}));
+            "equity": equity, "stop_px": stop_px, "stop_oid": oid}));
         Ok(())
     }
 
-    /// Moves our size to its share of `full` (reduces only on the exchange's side if smaller).
-    async fn follow(&mut self, u: &Update) -> Result<()> {
-        let l = self.state.legs[&u.coin].clone();
-        let mid = self.mid(&u.coin).await?;
+    /// Puts the leg's stop order on for its size now (the old one cancelled): its size alone,
+    /// so it does not close the coin's other legs.
+    async fn restop(&mut self, k: &str) {
+        let Some(l) = self.state.legs.get(k).cloned() else { return };
+        if let Some(oid) = l.stop_oid {
+            self.cancel(&l.coin, oid).await;
+        }
+        let oid = match self.stop(&l.coin, l.dir, l.size, l.stop_px).await {
+            Ok(oid) => Some(oid),
+            Err(e) => {
+                self.event(json!({"what": "stop failed", "user": l.user, "coin": l.coin, "error": format!("{e:#}")}));
+                None
+            }
+        };
+        if let Some(leg) = self.state.legs.get_mut(k) {
+            leg.stop_oid = oid;
+        }
+    }
+
+    /// Moves the leg's size to its share of `full`, its stop order with it.
+    async fn follow(&mut self, k: &str, u: &Update) -> Result<()> {
+        let l = self.state.legs[k].clone();
+        let mid = self.mid(&l.coin).await?;
         let target = l.dir * l.full * u.frac.min(1.0);
         if target.abs() * mid < MIN_LEFT_USD {
-            return self.close(&u.coin, "small").await;
+            return self.close(k, "small").await;
         }
         let delta = target - l.size;
-        if round_size(delta.abs(), self.coins[&u.coin].1) * mid < MIN_ORDER_USD {
+        if round_size(delta.abs(), self.coins[&l.coin].1) * mid < MIN_ORDER_USD {
             return Ok(());
         }
         let reduce = target.abs() < l.size.abs();
-        let (got, px) = self.market(&u.coin, delta, reduce).await?;
-        let leg = self.state.legs.get_mut(&u.coin).context("leg gone")?;
+        let (got, px) = self.market(&l.coin, delta, reduce).await?;
+        let leg = self.state.legs.get_mut(k).context("leg gone")?;
         leg.size += got;
         let after = leg.size;
-        self.event(json!({"what": if reduce { "reduce" } else { "add" }, "user": u.user, "coin": u.coin, "size": got, "px": px,
+        self.restop(k).await;
+        self.event(json!({"what": if reduce { "reduce" } else { "add" }, "user": l.user, "coin": l.coin, "size": got, "px": px,
             "pos_after": after}));
         Ok(())
     }
 
-    async fn close(&mut self, coin: &str, why: &str) -> Result<()> {
-        let Some(l) = self.state.legs.get(coin).cloned() else { return Ok(()) };
-        let (got, px) = if l.size != 0.0 { self.market(coin, -l.size, true).await? } else { (0.0, 0.0) };
+    async fn close(&mut self, k: &str, why: &str) -> Result<()> {
+        let Some(l) = self.state.legs.get(k).cloned() else { return Ok(()) };
+        let (got, px) = if l.size != 0.0 { self.market(&l.coin, -l.size, true).await? } else { (0.0, 0.0) };
         if let Some(oid) = l.stop_oid {
-            self.cancel(coin, oid).await;
+            self.cancel(&l.coin, oid).await;
         }
-        self.state.legs.remove(coin);
+        self.state.legs.remove(k);
         let pnl = -got * (px - l.entry_px);
-        self.event(json!({"what": "close", "why": why, "user": l.user, "coin": coin, "size": got, "px": px, "pnl_approx": pnl}));
+        self.event(json!({"what": "close", "why": why, "user": l.user, "coin": l.coin, "size": got, "px": px, "pnl_approx": pnl}));
         Ok(())
     }
 
-    /// The exchange's positions: one of ours gone there (our stop filled, or a liquidation)
-    /// ends it; sizes are taken from there. Then the status.
+    /// The exchange's positions and orders: a leg whose stop order is no longer resting was
+    /// stopped out; a coin's position gone (a liquidation) or the other way ends its legs; the
+    /// rest take their share of what is held. A leg without a stop order gets one. Then the
+    /// status.
     async fn reconcile(&mut self) {
         let (equity, positions) = match self.equity().await {
             Ok(x) => x,
@@ -379,58 +424,124 @@ impl Live {
                 return;
             }
         };
+        let resting: Option<std::collections::HashSet<u64>> = match self.ex.info(json!({"type": "frontendOpenOrders", "user": self.account})).await {
+            Ok(v) => Some(v.as_array().into_iter().flatten().filter_map(|o| o["oid"].as_u64()).collect()),
+            Err(e) => {
+                log!("live: orders read failed: {e:#}");
+                None
+            }
+        };
         let mut changed = false;
-        for coin in self.state.legs.keys().cloned().collect::<Vec<_>>() {
-            let held = positions.get(&coin).copied().unwrap_or(0.0);
-            let l = self.state.legs[&coin].clone();
-            if held == 0.0 || held.signum() != l.dir {
-                if let Some(oid) = l.stop_oid.filter(|_| held != 0.0) {
-                    self.cancel(&coin, oid).await;
+        if let Some(resting) = &resting {
+            for (k, l) in self.state.legs.clone() {
+                if l.stop_oid.is_some_and(|o| !resting.contains(&o)) {
+                    self.state.legs.remove(&k);
+                    self.event(json!({"what": "stopped", "user": l.user, "coin": l.coin, "size_was": l.size, "stop_px": l.stop_px,
+                        "entry_px": l.entry_px}));
+                    changed = true;
                 }
-                self.state.legs.remove(&coin);
-                self.event(json!({"what": "gone", "user": l.user, "coin": coin, "size_was": l.size, "stop_px": l.stop_px}));
+            }
+        }
+        let coins: std::collections::HashSet<String> = self.state.legs.values().map(|l| l.coin.clone()).collect();
+        for coin in coins {
+            let held = positions.get(&coin).copied().unwrap_or(0.0);
+            let legs: Vec<(String, Leg)> = self.state.in_coin(&coin).map(|(k, l)| (k.clone(), l.clone())).collect();
+            let sum: f64 = legs.iter().map(|(_, l)| l.size).sum();
+            if held == 0.0 || legs.iter().any(|(_, l)| held.signum() != l.dir) {
+                for (k, l) in legs {
+                    if let Some(oid) = l.stop_oid.filter(|_| held != 0.0) {
+                        self.cancel(&coin, oid).await;
+                    }
+                    self.state.legs.remove(&k);
+                    self.event(json!({"what": "gone", "user": l.user, "coin": coin, "size_was": l.size, "stop_px": l.stop_px}));
+                }
                 changed = true;
-            } else if (held - l.size).abs() > 1e-12 {
-                self.state.legs.get_mut(&coin).unwrap().size = held;
+            } else if sum != 0.0 && (held - sum).abs() > 1e-9 {
+                for (k, _) in &legs {
+                    if let Some(leg) = self.state.legs.get_mut(k) {
+                        leg.size *= held / sum;
+                    }
+                }
+                changed = true;
+            }
+        }
+        if resting.is_some() {
+            for k in self.state.legs.iter().filter(|(_, l)| l.stop_oid.is_none()).map(|(k, _)| k.clone()).collect::<Vec<_>>() {
+                self.restop(&k).await;
                 changed = true;
             }
         }
         if changed {
             self.save().await;
         }
-        let ours = self.state.legs.len();
-        let other = positions.keys().filter(|c| !self.state.legs.contains_key(*c)).count();
-        *self.status.lock().unwrap() = json!({"equity": (equity * 100.0).round() / 100.0, "positions": ours, "other_positions": other,
-            "skipped": self.state.skipped, "orders": self.state.orders});
+        let coins_held: std::collections::HashSet<&String> = self.state.legs.values().map(|l| &l.coin).collect();
+        let other = positions.keys().filter(|c| !coins_held.contains(c)).count();
+        *self.status.lock().unwrap() = json!({"equity": (equity * 100.0).round() / 100.0, "positions": self.state.legs.len(),
+            "coins": coins_held.len(), "other_positions": other, "skipped": self.state.skipped, "orders": self.state.orders});
     }
 }
 
-/// `live-check [COIN]`: one trade on the live account through the same path as a golden
-/// account's (entry with its stop, half out, out), to see it work (testnet unless set).
+/// `live-check [COIN]`: trades on the live account through the same path as golden accounts'
+/// (testnet unless set): two accounts' legs in one coin, each with its own stop order; one
+/// half out (its stop resized), the other out, then the first out; a third one's entry the
+/// other way is skipped.
 pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
     let store = crate::store::open(cfg).await?;
     let (tx, _) = start(cfg, store.clone()).await?.context("LIVE_KEY and LIVE_ACCOUNT are not set")?;
     let account = std::env::var("LIVE_ACCOUNT")?.trim().to_lowercase();
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let info = Exchange::new(base, &std::env::var("LIVE_KEY")?)?;
-    let send = |frac: f64, entry: bool| tx.send(Update { user: "live-check".into(), coin: coin.into(), dir: 1.0, frac, entry, golden: true });
+    let send = |user: &str, dir: f64, frac: f64, entry: bool| {
+        tx.send(Update { user: format!("live-check-{user}"), coin: coin.into(), dir, frac, entry, golden: true })
+    };
+    let show = |what: &'static str| {
+        let (info, account, coin) = (&info, &account, coin);
+        async move {
+            let orders = info.info(json!({"type": "frontendOpenOrders", "user": account})).await?;
+            let stops: Vec<String> = orders.as_array().into_iter().flatten().filter(|o| o["coin"] == coin)
+                .map(|o| format!("{} {} @ {}", o["side"], o["sz"], o["triggerPx"])).collect();
+            let st = info.info(json!({"type": "clearinghouseState", "user": account})).await?;
+            let pos: Vec<String> = st["assetPositions"].as_array().into_iter().flatten().filter(|p| p["position"]["coin"] == coin)
+                .map(|p| p["position"]["szi"].to_string()).collect();
+            log!("live-check: {what}: position {pos:?}, stop orders {stops:?}");
+            anyhow::Ok(())
+        }
+    };
     let pause = |s| tokio::time::sleep(std::time::Duration::from_secs(s));
     pause(3).await;
-    send(1.0, true)?;
+    send("a", 1.0, 1.0, true)?;
+    send("b", 1.0, 1.0, true)?;
+    send("c", -1.0, 1.0, true)?;
+    pause(10).await;
+    show("a and b in, c skipped").await?;
+    send("a", 1.0, 0.5, false)?;
     pause(6).await;
-    let orders = info.info(json!({"type": "frontendOpenOrders", "user": account})).await?;
-    for o in orders.as_array().into_iter().flatten().filter(|o| o["coin"] == coin) {
-        log!("live-check: resting {} {} {} trigger {} ({})", o["orderType"], o["side"], o["sz"], o["triggerPx"], o["triggerCondition"]);
-    }
-    send(0.5, false)?;
+    show("a half out").await?;
+    send("b", 1.0, 0.0, false)?;
     pause(6).await;
-    send(0.0, false)?;
+    show("b out").await?;
+    send("a", 1.0, 0.0, false)?;
     pause(6).await;
-    let orders = info.info(json!({"type": "frontendOpenOrders", "user": account})).await?;
-    let left = orders.as_array().map(|a| a.iter().filter(|o| o["coin"] == coin).count()).unwrap_or(0);
-    let st = info.info(json!({"type": "clearinghouseState", "user": account})).await?;
-    let pos = st["assetPositions"].as_array().map(|a| a.iter().filter(|p| p["position"]["coin"] == coin).count()).unwrap_or(0);
-    log!("live-check: {coin} after: {pos} position(s), {left} order(s) resting");
+    show("a out").await?;
     store.flush().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legs_saved_by_coin_get_keys_per_account() {
+        let v = json!({"legs": {"BTC": {"user": "0xa", "dir": 1.0, "full": 0.1, "size": 0.1, "entry_px": 1.0, "stop_px": 0.8,
+            "stop_oid": 7, "opened": 0.0}}, "skipped": 0, "orders": 2});
+        let s = serde_json::from_value::<State>(v).unwrap().upgrade();
+        let l = &s.legs["BTC|0xa"];
+        assert_eq!((l.coin.as_str(), l.stop_oid), ("BTC", Some(7)));
+        // Already per account: unchanged.
+        let again = s.clone().upgrade();
+        assert_eq!(again.legs.keys().collect::<Vec<_>>(), vec!["BTC|0xa"]);
+        assert_eq!(again.in_coin("BTC").count(), 1);
+        assert_eq!(again.in_coin("ETH").count(), 0);
+    }
 }

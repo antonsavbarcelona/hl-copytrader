@@ -106,15 +106,20 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
   peak, closed when it is flat, or closed whole when a reduce would leave under $11, which
   could not be sold: the exchange checks its $10 minimum at the order's price), golden or not
   by then.
-- One position per coin: another account's entry in a coin we hold is not followed; at 50 open
-  none is (`skipped`). Every minute the exchange's positions are read: one gone there (the stop
-  filled, or a liquidation) ends ours.
+- Each account's position in a coin is a leg of ours on its own: its own entry, size, stop
+  order (for the leg's size, placed again when the leg's size changes) and exits; the exchange
+  holds their sum. A leg the other way from the coin's legs is not entered (on one account a
+  long and a short in a coin would cancel out, and their stops act on each other's size); at
+  50 legs open none is (`skipped`, with why). Every minute the exchange's positions and orders
+  are read: a leg whose stop order is gone was stopped out; a coin's position gone (a
+  liquidation) ends its legs.
 - Prices are the live venue's own: on testnet, its books, not mainnet's.
 - State in `docs` (name `live`; `live.json` without a database); every action an event of kind
   `live` (`what`: open / add / reduce / close / gone / error); `live` in `bot_status.data`
   (equity, positions, orders, skipped).
-- `hl-copytrader live-check [COIN]` makes one trade through the same path (entry with its
-  stop, half out, out) to check the account and key.
+- `hl-copytrader live-check [COIN]` trades through the same path to check the account and key:
+  two accounts' legs in the coin with their stops, one half out, both out, a third one's entry
+  the other way skipped.
 
 ## Liquidation research
 

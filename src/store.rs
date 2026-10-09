@@ -216,6 +216,13 @@ CREATE TABLE IF NOT EXISTS selection (
     state       jsonb       NOT NULL,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS docs (
+    run_id      text        NOT NULL,
+    name        text        NOT NULL,
+    state       jsonb       NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, name)
+);
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name        text        PRIMARY KEY,
     applied_at  timestamptz NOT NULL DEFAULT now()
@@ -289,6 +296,41 @@ pub async fn save_selection(cfg: &Config, sel: &Selection) -> Result<()> {
         None => {
             std::fs::create_dir_all(&cfg.data_dir)?;
             let (path, tmp) = (cfg.data_dir.join("selection.json"), cfg.data_dir.join("selection.tmp"));
+            std::fs::write(&tmp, s)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A named state document of this run (e.g. "live"), if saved.
+pub async fn load_doc(cfg: &Config, name: &str) -> Result<Option<Value>> {
+    let s = match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            migrate(&client).await?;
+            client.query_opt("SELECT state::text FROM docs WHERE run_id = $1 AND name = $2", &[&cfg.run_id, &name]).await?.map(|r| r.get::<_, String>(0))
+        }
+        None => std::fs::read_to_string(cfg.data_dir.join(format!("{name}.json"))).ok(),
+    };
+    Ok(s.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Saves a named state document (written at once; for rare changes).
+pub async fn save_doc(cfg: &Config, name: &str, state: &Value) -> Result<()> {
+    let s = state.to_string();
+    match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            client.execute(
+                "INSERT INTO docs (run_id, name, state, updated_at) VALUES ($1, $2, $3::text::jsonb, now())
+                 ON CONFLICT (run_id, name) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
+                &[&cfg.run_id, &name, &s],
+            ).await?;
+        }
+        None => {
+            std::fs::create_dir_all(&cfg.data_dir)?;
+            let (path, tmp) = (cfg.data_dir.join(format!("{name}.json")), cfg.data_dir.join(format!("{name}.tmp")));
             std::fs::write(&tmp, s)?;
             std::fs::rename(&tmp, &path)?;
         }

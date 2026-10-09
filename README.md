@@ -27,7 +27,8 @@ blocked by a locked exe.
    `DATABASE_URL` = `${{Postgres.DATABASE_URL}}`. Tables are created on first start.
 3. No port, domain or volume is needed: it is a worker.
 
-- Optional variables: `RUN_ID` (default `main`), `API_WEIGHT` (default 800), `EXTRA_ARGS`
+- Optional variables: `RUN_ID` (default `main`), `API_WEIGHT` (default 800), `LIVE_*` (see
+  Live), `EXTRA_ARGS`
   (more `run` options, e.g. `--start 2000`).
 - Report: locally with `DATABASE_URL` set to the database's public URL (in `.env`, see
   `.env.example`): `hl-copytrader report`. Or SQL on the tables below.
@@ -86,6 +87,27 @@ minute) is per IP, and the image takes 800 of it.
   a copy account at zero equity is liquidated and stops. Main perp dex only (no HIP-3
   dexes).
 
+## Live
+
+With `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key, or an API
+wallet's approved for it) set, the golden list is also traded for real on that account:
+testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`).
+
+- A position a golden account enters is entered with a market order (IOC 5% through the mid)
+  at a size whose stop loses 2% of the account's equity (unified account: perp value plus the
+  spot USDC not held as margin), and a reduce-only stop-market order rests on the exchange 20%
+  against our fill. It is then followed to its end (reduced as the trader reduces from its
+  peak, closed when it is flat), golden or not by then.
+- One position per coin: another account's entry in a coin we hold is not followed; at 50 open
+  none is (`skipped`). Every minute the exchange's positions are read: one gone there (the stop
+  filled, or a liquidation) ends ours.
+- Prices are the live venue's own: on testnet, its books, not mainnet's.
+- State in `docs` (name `live`; `live.json` without a database); every action an event of kind
+  `live` (`what`: open / add / reduce / close / gone / error); `live` in `bot_status.data`
+  (equity, positions, orders, skipped).
+- `hl-copytrader live-check [COIN]` makes one trade through the same path (entry with its
+  stop, half out, out) to check the account and key.
+
 ## What is measured
 
 Per copy account, kept in `state.json` (`stats`) and summed up by `report`:
@@ -129,6 +151,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   - `enroll`, `plan` (the trader's set-up for a position), `golden` (an account joins or
     leaves the golden list), `liquidated`.
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).
+- `docs`: named state documents of a run (`live`: the live account's positions).
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);
   `2026-10-07-reset` emptied every table above, for all runs, when the traders' pick changed,
   and dropped the tables of the signals the run used to trade (removed with them);

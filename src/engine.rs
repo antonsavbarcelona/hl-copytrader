@@ -189,6 +189,8 @@ pub struct Engine {
     listed: HashSet<String>,
     /// Time spent per tick since the last status line: ticks, total and longest (ms).
     load: Load,
+    /// Real orders for the golden list (`live`): its updates and its status.
+    live: Option<(mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)>,
 }
 
 #[derive(Default)]
@@ -233,8 +235,13 @@ impl Engine {
             dirty: false,
             listed: HashSet::new(),
             load: Load::default(),
+            live: None,
             cfg,
         })
+    }
+
+    pub fn set_live(&mut self, live: (mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)) {
+        self.live = Some(live);
     }
 
     fn write(&mut self, mut ev: serde_json::Value) {
@@ -492,6 +499,7 @@ impl Engine {
         // An entry: its fills opened the position (it was flat or the other way before them);
         // a copy without fills pending is the one its enrollment fill opened.
         let mut entry = why == "copy" && first.is_none_or(|p| (theirs - p.net) * theirs <= 1e-12);
+        let opened = entry;
         // At `max_positions` open over all copies, a new position is not entered (a flip of
         // one we hold is).
         if entry && ours == 0.0 && open >= self.cfg.max_positions && !t.legs.get(coin).is_some_and(|l| l.dir == theirs.signum()) {
@@ -499,6 +507,13 @@ impl Engine {
             t.skipped += 1;
         }
         let target = target(&mut t.legs, coin, theirs, ours, entry, full);
+        // The live account follows its position on its own (golden accounts' entries).
+        if let Some((live, _)) = &self.live {
+            let peak = t.legs.get(coin).map(|l| l.peak).unwrap_or(0.0);
+            let frac = if peak > 0.0 { theirs.abs() / peak } else { 0.0 };
+            let _ = live.send(crate::live::Update { user: user.to_string(), coin: coin.to_string(), dir: theirs.signum(), frac,
+                entry: opened, golden: t.golden });
+        }
         let closing = target.abs() < 1e-12;
         let mut delta = round_size(target - ours, info.sz_decimals);
         if closing {
@@ -651,6 +666,7 @@ impl Engine {
             "selected": self.listed.len(),
             "golden": golden,
             "golden_pnl": r(golden_pnl, 2),
+            "live": self.live.as_ref().map(|(_, s)| s.lock().unwrap().clone()),
             "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
             "api_weight": weight,

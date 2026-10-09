@@ -9,6 +9,8 @@ mod account;
 mod api;
 mod config;
 mod engine;
+mod exchange;
+mod live;
 mod report;
 mod stable;
 mod stats;
@@ -37,7 +39,8 @@ async fn main() -> anyhow::Result<()> {
     match cmd.as_str() {
         "run" => run(cfg).await,
         "report" => report::run(&cfg, &rest).await,
-        other => anyhow::bail!("unknown command {other} (run | report)"),
+        "live-check" => live::check(&cfg, rest.first().map(String::as_str).unwrap_or("BTC")).await,
+        other => anyhow::bail!("unknown command {other} (run | report | live-check)"),
     }
 }
 
@@ -51,7 +54,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let traders = store::load(&cfg).await?;
     let selection = store::load_selection(&cfg).await?;
     let store = store::open(&cfg).await?;
-    let engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
+    let live = live::start(&cfg, store.clone()).await?;
+    let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
+    if let Some(l) = live {
+        engine.set_live(l);
+    }
     let followed = engine.followed.clone();
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

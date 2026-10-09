@@ -20,6 +20,8 @@ pub struct Config {
     pub risk_pct: f64,
     /// ... which is this far against our average entry (%).
     pub stop_pct: f64,
+    /// A copy account enters no new position while it holds this many.
+    pub max_positions: usize,
     /// An active account's positions are read again this often (drift correction).
     pub reconcile_s: f64,
     /// Info API weight per minute this process may use (1200 per IP in total).
@@ -40,6 +42,7 @@ impl Default for Config {
             min_order_usd: 10.0,
             risk_pct: 2.0,
             stop_pct: 20.0,
+            max_positions: 50,
             reconcile_s: 2.0 * 3600.0,
             weight_per_min: 400.0,
             database_url: std::env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()),
@@ -60,6 +63,7 @@ impl Config {
                 "--start" => c.start_usd = v()?.parse()?,
                 "--risk" => c.risk_pct = v()?.parse()?,
                 "--stop" => c.stop_pct = v()?.parse()?,
+                "--max-positions" => c.max_positions = v()?.parse()?,
                 "--delay-ms" => c.exec_delay_ms = v()?.parse()?,
                 "--weight" => c.weight_per_min = v()?.parse()?,
                 "--run" => c.run_id = v()?,

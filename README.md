@@ -54,9 +54,16 @@ minute) is per IP, and the image takes 800 of it.
   (`stats-data.hyperliquid.xyz/Mainnet/leaderboard`), the accounts of $100k+ at a profit this
   month and over all time that trade 0.5-200x their equity a month (~3.7k on 2026-10-07); of
   those, the ones whose perp PnL history (`portfolio`) shows a profit in each of the last 3
-  months (30 days each) and in 8+ of the last 12 weeks (139 on 2026-10-07). Read one at a time
-  with pauses (a few hours); the list is saved (`selection`) so a restart within the day keeps
-  it. An account that drops out stays followed while our copy holds positions.
+  months (30 days each) and a loss in at most 4 of the last 12 weeks (a week without a trade
+  counts as neither; 139 on 2026-10-07). Read one at a time with pauses (a few hours); the
+  list is saved (`selection`) so a restart within the day keeps it. An account on the list
+  stays on it unless it clearly got worse: its last month at a loss, a loss in over 6 weeks,
+  or its perp account under $50k (read even if the leaderboard no longer makes it a
+  candidate). An account that drops out stays followed while our copy holds positions.
+- **Golden list** (`src/engine.rs`): the accounts whose copy makes money. Each copy is measured
+  from its enrollment (copies from before the list: from the 2026-10-09 start); after 3 days
+  and 5 closed trips, it is golden while its PnL since is above zero. Worked out every 10 min;
+  golden accounts are followed even after they drop off the day's list.
   Why: picked by one month's ROI (50%+, as before) the accounts did worse the next month than
   all accounts in 2 of 3 months checked (July-September 2026); picked this way, 69% / 50% / 68%
   were at a profit the next month against 54% / 57% / 51% of all. With a drawdown limit too
@@ -108,7 +115,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 `RUN_ID` (default `main`) names the run, so runs with different settings can share a database:
 
 - `copy_accounts`: one row per copy account — `equity`, `roi_pct`, `copy_fills`,
-  `open_positions`, `liquidated`, and `state` (jsonb: cash, positions, the trader's tracked
+  `open_positions`, `liquidated`, `golden` and `measured_pnl` (its PnL since measured for the
+  golden list), and `state` (jsonb: cash, positions, the trader's tracked
   positions, all the measures above, open trips), upserted every 30 s when changed.
 - `events`: `at`, `kind`, `address`, `coin`, `data` (jsonb):
   - `their_fill`: every fill of a followed account as it reached us (size signed, price,
@@ -116,14 +124,17 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
     traders did;
   - `fill`: ours (`why`: seed / copy / reconcile / restart / stop), with lag, the trader's
     price and slippage vs it (`slip_bps`, of it `move_bps`);
-  - `enroll`, `plan` (the trader's set-up for a position), `liquidated`.
+  - `enroll`, `plan` (the trader's set-up for a position), `golden` (an account joins or
+    leaves the golden list), `liquidated`.
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);
   `2026-10-07-reset` emptied every table above, for all runs, when the traders' pick changed,
-  and dropped the tables of the signals the run used to trade (removed with them).
+  and dropped the tables of the signals the run used to trade (removed with them);
+  `2026-10-09-golden` added the golden columns.
 - `bot_status`: the bot's health every 10 min — accounts, followed, open positions, API weight
   used and backlog, how long its 5 s ticks take on average and at most (`tick_*_ms`), and more
-  in `data` (`selected`: traders on the day's list). The ticks run on the loop the copies use:
+  in `data` (`selected`: traders on the day's list; `golden`, `golden_pnl`: on the golden
+  list and their copies' PnL since measured). The ticks run on the loop the copies use:
   a few ms is fine, hundreds would start to delay copies.
 
 The database being away does not stop the run: writes wait and go out once it is back.

@@ -19,6 +19,12 @@
 //! An account is enrolled on its first fill: its positions are read (clearinghouseState), then
 //! each of its fills moves our copy. Its positions are read again every `reconcile_s` while it
 //! is active, to correct drift.
+//!
+//! Followed: the day's list (`stable`), the golden list, and any account our copy still holds
+//! a position of. The golden list is the accounts whose copy makes money: measured from its
+//! enrollment (or, for copies from before the list, from its first start), after
+//! `GOLDEN_MIN_DAYS` and `GOLDEN_MIN_TRIPS` closed trips, its copy's PnL above zero. A golden
+//! account is followed even after it drops off the day's list.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -65,6 +71,32 @@ pub struct Trader {
     /// Its positions we follow (coin -> leg).
     #[serde(default)]
     pub legs: HashMap<String, Leg>,
+    /// Where the golden list measures our copy from.
+    #[serde(default)]
+    pub base: Option<Base>,
+    #[serde(default)]
+    pub golden: bool,
+}
+
+/// Our copy when its measuring for the golden list began.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Base {
+    pub at: f64,
+    pub equity: f64,
+    /// Closed trips then.
+    pub trips: u64,
+}
+
+/// The golden list: a copy measured this long, with this many trips closed since...
+const GOLDEN_MIN_DAYS: f64 = 3.0;
+const GOLDEN_MIN_TRIPS: u64 = 5;
+
+/// ... and at a profit since: its PnL since, and whether it is golden.
+fn measured(t: &Trader, equity: f64, at: f64) -> (f64, bool) {
+    let Some(b) = &t.base else { return (0.0, false) };
+    let pnl = equity - b.equity;
+    let long = at - b.at >= GOLDEN_MIN_DAYS * 86400.0 && t.stats.trips.saturating_sub(b.trips) >= GOLDEN_MIN_TRIPS;
+    (pnl, long && pnl > 0.0 && !t.acct.liquidated)
 }
 
 /// Our side of one of its positions, from its entry until it is flat again.
@@ -150,7 +182,7 @@ pub struct Engine {
     read_limit: Arc<Semaphore>,
     dirty: bool,
     /// Traders on the day's list (`stable`).
-    selected: usize,
+    listed: HashSet<String>,
     /// Time spent per tick since the last status line: ticks, total and longest (ms).
     load: Load,
 }
@@ -195,7 +227,7 @@ impl Engine {
             store,
             read_limit: Arc::new(Semaphore::new(4)),
             dirty: false,
-            selected: 0,
+            listed: HashSet::new(),
             load: Load::default(),
             cfg,
         })
@@ -221,6 +253,8 @@ impl Engine {
                 copy_fills: t.copy_fills as i64,
                 open_positions: t.acct.positions.len() as i32,
                 liquidated: t.acct.liquidated,
+                golden: t.golden,
+                measured_pnl: t.base.as_ref().map(|b| equity - b.equity).unwrap_or(0.0),
                 state: serde_json::to_string(t).ok()?,
             })
         }).collect();
@@ -261,15 +295,18 @@ impl Engine {
     }
 
     fn on_selected(&mut self, sel: crate::stable::Selection) {
-        let mut set = sel.addresses();
-        // Accounts we already copy stay followed while their copy holds positions.
-        let kept = self.traders.iter().filter(|(a, t)| !t.acct.positions.is_empty() && !t.acct.liquidated && !set.contains(*a))
-            .map(|(a, _)| a.clone()).collect::<Vec<_>>();
-        let n = kept.len();
-        set.extend(kept);
-        log!("selection: {} traders followed (picked {} of {} read, {} kept for their open copies)", set.len(), sel.picks.len(), sel.read, n);
-        self.selected = sel.picks.len();
+        self.listed = sel.addresses();
+        let n = self.refollow();
+        log!("selection: {n} traders followed ({} picked of {} read, the rest golden or holding our copies)", sel.picks.len(), sel.read);
+    }
+
+    /// Follows the day's list, the golden list and the accounts our copy holds positions of.
+    fn refollow(&mut self) -> usize {
+        let mut set = self.listed.clone();
+        set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
+        let n = set.len();
         *self.followed.write().unwrap() = set;
+        n
     }
 
     fn read_account(&mut self, user: &str, why: &'static str) {
@@ -347,6 +384,7 @@ impl Engine {
             name: lb.as_ref().and_then(|l| l.name.clone()),
             enrolled_at: now(),
             acct: Account::new(start),
+            base: Some(Base { at: now(), equity: start, trips: 0 }),
             ..Default::default()
         });
         if equity <= 0.0 {
@@ -545,6 +583,11 @@ impl Engine {
             }
             let equity = t.acct.equity(&marks);
             mark(t, &marks, equity);
+            // Copies from before the golden list are measured from now on (once every position
+            // has a price).
+            if t.base.is_none() && t.acct.positions.keys().all(|c| marks(c).is_some()) {
+                t.base = Some(Base { at: n, equity, trips: t.stats.trips });
+            }
             if !t.acct.positions.is_empty() && equity <= 0.0 {
                 liquidate.push(a.clone());
             }
@@ -584,6 +627,7 @@ impl Engine {
     /// Every 10 min (120 ticks): the bot's health to `bot_status` — what it follows and holds,
     /// the API budget, and how long its ticks take (they run on the one loop the copies use).
     fn status(&mut self) {
+        let (golden, golden_pnl) = self.golden();
         let l = std::mem::take(&mut self.load);
         let n = l.ticks.max(1) as f64;
         let (weight, backlog) = self.api.usage();
@@ -593,7 +637,9 @@ impl Engine {
             "copy_accounts": self.traders.len(),
             "liquidated": self.traders.len() - live.len(),
             "followed": self.followed.read().unwrap().len(),
-            "selected": self.selected,
+            "selected": self.listed.len(),
+            "golden": golden,
+            "golden_pnl": r(golden_pnl, 2),
             "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
             "api_weight": weight,
@@ -604,6 +650,35 @@ impl Engine {
         });
         log!("status: {st}");
         self.store.status(st);
+    }
+
+    /// Works out the golden list again (an event for each account that joins or leaves it) and
+    /// follows it: how many are on it and their copies' PnL since measured.
+    fn golden(&mut self) -> (usize, f64) {
+        let b = self.books.read().unwrap();
+        let marks = |c: &str| b.get(c).and_then(Book::mid);
+        let at = now();
+        let (mut evs, mut n, mut sum) = (Vec::new(), 0, 0.0);
+        for (a, t) in self.traders.iter_mut() {
+            let (pnl, golden) = measured(t, t.acct.equity(&marks), at);
+            if golden != t.golden {
+                t.golden = golden;
+                let days = t.base.as_ref().map(|b| (at - b.at) / 86400.0).unwrap_or(0.0);
+                log!("golden: {} {} (PnL ${pnl:.2} over {days:.1} d)", &a[..10], if golden { "joins" } else { "leaves" });
+                evs.push(json!({"kind": "golden", "user": a, "golden": golden, "pnl": r(pnl, 4), "days": r(days, 2),
+                    "trips": t.stats.trips.saturating_sub(t.base.as_ref().map(|b| b.trips).unwrap_or(0))}));
+            }
+            if golden {
+                n += 1;
+                sum += pnl;
+            }
+        }
+        drop(b);
+        for ev in evs {
+            self.write(ev);
+        }
+        self.refollow();
+        (n, sum)
     }
 
     /// Our stop: closes our position in `coin` at the book and stays out of its position.
@@ -698,6 +773,24 @@ fn mark(t: &mut Trader, marks: &dyn Fn(&str) -> Option<f64>, equity: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn golden_after_days_and_trips_at_a_profit() {
+        let mut t = Trader { acct: Account::new(1000.0), base: Some(Base { at: 0.0, equity: 900.0, trips: 2 }), ..Default::default() };
+        t.stats.trips = 7;
+        let day = 86400.0;
+        assert_eq!(measured(&t, 950.0, 3.0 * day), (50.0, true));
+        // Too soon, too few trips, at a loss since, liquidated, not measured.
+        assert!(!measured(&t, 950.0, 2.9 * day).1);
+        t.stats.trips = 6;
+        assert!(!measured(&t, 950.0, 3.0 * day).1);
+        t.stats.trips = 7;
+        assert_eq!(measured(&t, 890.0, 3.0 * day), (-10.0, false));
+        t.acct.liquidated = true;
+        assert!(!measured(&t, 950.0, 3.0 * day).1);
+        t.base = None;
+        assert_eq!(measured(&t, 950.0, 3.0 * day), (0.0, false));
+    }
 
     #[test]
     fn targets_follow_its_position_at_our_size() {

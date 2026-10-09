@@ -6,11 +6,17 @@
 //! cannot get). Each one's perp PnL history (`portfolio`) then has to show, over the last 90
 //! days:
 //!   - a profit in each of the 3 months (30 days each), and
-//!   - a profit in at least `MIN_WEEKS_UP` of the last 12 weeks,
+//!   - a loss in at most `MAX_WEEKS_DOWN` of the last 12 weeks (a week without a trade is
+//!     neither),
 //!
 //! with its perp account still `MIN_EQUITY`+. On the history (picked this way in July, August,
 //! September; the next month): 69%, 50%, 68% of the picks at a profit, against 54%, 57%, 51%
 //! of all accounts; no drawdown limit, so high-leverage accounts are in too (see the README).
+//!
+//! An account on the day before's list stays unless it clearly got worse: its last month at
+//! a loss, a loss in over `KEEP_WEEKS_DOWN` weeks, or its perp account under `KEEP_EQUITY` (one
+//! week moving across the line, or money taken out for a while, does not drop it). It is
+//! read even when the leaderboard no longer makes it a candidate.
 
 use std::collections::HashSet;
 
@@ -25,7 +31,9 @@ const MIN_TURNOVER: f64 = 0.5;
 const MAX_TURNOVER: f64 = 200.0;
 const MONTHS: u64 = 3;
 const WEEKS: u64 = 12;
-const MIN_WEEKS_UP: f64 = 0.6;
+const MAX_WEEKS_DOWN: u32 = 4;
+const KEEP_WEEKS_DOWN: u32 = 6;
+const KEEP_EQUITY: f64 = 50_000.0;
 /// A period's capital under this (USD) does not count: the account was funded later.
 const MIN_BASE: f64 = 1000.0;
 /// The list is worked out again this often...
@@ -107,8 +115,10 @@ pub struct Pick {
     /// PnL of each month, oldest first, and over the 3.
     pub months: Vec<f64>,
     pub pnl: f64,
-    /// Weeks of the last 12 at a profit.
+    /// Weeks of the last 12 at a profit, and at a loss.
     pub weeks_up: u32,
+    #[serde(default)]
+    pub weeks_down: u32,
 }
 
 /// The PnL from `a` to `b` and the capital it was made on: the value at `a`, or what was in by
@@ -118,8 +128,9 @@ fn period(h: &History, a: u64, b: u64) -> Option<(f64, f64)> {
     Some((p, at(&h.value, a)?.max(at(&h.value, b)? - p)))
 }
 
-/// `h` as of `now_ms` by the rule (see the module): its pick, or None.
-pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64) -> Option<Pick> {
+/// `h` as of `now_ms` by the rule (see the module; `kept`: it is on the list already): its
+/// pick, or None.
+pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64, kept: bool) -> Option<Pick> {
     let last = h.pnl.last()?.0.min(h.value.last()?.0);
     if last + 2 * DAY_MS < now_ms {
         return None;
@@ -130,29 +141,31 @@ pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64) -> Op
         return None;
     }
     let equity = at(&h.value, now)?;
-    if equity < MIN_EQUITY {
+    if equity < if kept { KEEP_EQUITY } else { MIN_EQUITY } {
         return None;
     }
     let mut months = Vec::new();
     for k in (1..=MONTHS).rev() {
         let (p, _) = period(h, now - k * 30 * DAY_MS, now - (k - 1) * 30 * DAY_MS)?;
-        if p <= 0.0 {
+        // Kept: only the last month has to be at a profit.
+        if p <= 0.0 && (!kept || k == 1) {
             return None;
         }
         months.push(p);
     }
-    let mut weeks_up = 0;
+    let (mut weeks_up, mut weeks_down) = (0, 0);
     for k in (1..=WEEKS).rev() {
         let (p, base) = period(h, now - k * 7 * DAY_MS, now - (k - 1) * 7 * DAY_MS)?;
         if base < MIN_BASE {
             return None;
         }
         weeks_up += u32::from(p > 0.0);
+        weeks_down += u32::from(p < 0.0);
     }
-    if (weeks_up as f64) < MIN_WEEKS_UP * WEEKS as f64 {
+    if weeks_down > if kept { KEEP_WEEKS_DOWN } else { MAX_WEEKS_DOWN } {
         return None;
     }
-    Some(Pick { address: address.to_string(), name, equity, pnl: months.iter().sum(), months, weeks_up })
+    Some(Pick { address: address.to_string(), name, equity, pnl: months.iter().sum(), months, weeks_up, weeks_down })
 }
 
 /// The picks of one day, kept so a restart does not work them out again.
@@ -171,18 +184,22 @@ impl Selection {
     }
 }
 
-/// Reads every candidate's history, `pause_s` apart, and picks by the rule.
-pub async fn select(api: &Api, leaders: &[Leader], pause_s: f64) -> Selection {
-    let cands = candidates(leaders);
-    log!("selection: reading {} candidates' histories", cands.len());
+/// Reads every candidate's history (and that of each one on the list already, `kept`),
+/// `pause_s` apart, and picks by the rule.
+pub async fn select(api: &Api, leaders: &[Leader], kept: &HashSet<String>, pause_s: f64) -> Selection {
+    let mut cands: Vec<(String, Option<String>)> = candidates(leaders).into_iter().map(|l| (l.address.clone(), l.name.clone())).collect();
+    let seen: HashSet<String> = cands.iter().map(|c| c.0.clone()).collect();
+    let names: std::collections::HashMap<&str, &Option<String>> = leaders.iter().map(|l| (l.address.as_str(), &l.name)).collect();
+    cands.extend(kept.iter().filter(|a| !seen.contains(*a)).map(|a| (a.clone(), names.get(a.as_str()).cloned().cloned().flatten())));
+    log!("selection: reading {} candidates' histories ({} on the list already)", cands.len(), kept.len());
     let (mut picks, mut read) = (Vec::new(), 0);
-    for (i, l) in cands.iter().enumerate() {
-        match api.portfolio(&l.address).await {
+    for (i, (address, name)) in cands.iter().enumerate() {
+        match api.portfolio(address).await {
             Ok(h) => {
                 read += 1;
-                picks.extend(pick(&l.address, l.name.clone(), &h, (exchange_now() * 1000.0) as u64));
+                picks.extend(pick(address, name.clone(), &h, (exchange_now() * 1000.0) as u64, kept.contains(address)));
             }
-            Err(e) => log!("selection: {}: {e}", &l.address[..10]),
+            Err(e) => log!("selection: {}: {e}", &address[..10]),
         }
         if (i + 1) % 500 == 0 {
             log!("selection: {} of {} read, {} picked so far", i + 1, cands.len(), picks.len());
@@ -212,32 +229,54 @@ mod tests {
     #[test]
     fn steady_profit_is_picked() {
         let now = 120 * DAY_MS;
-        let p = pick("a", None, &history(|_| 100.0, 200_000.0), now).unwrap();
+        let p = pick("a", None, &history(|_| 100.0, 200_000.0), now, false).unwrap();
         assert_eq!(p.weeks_up, 12);
         assert_eq!(p.months.len(), 3);
         assert!((p.pnl - 9000.0).abs() < 1e-6 && p.months.iter().all(|m| (m - 3000.0).abs() < 1e-6));
         // Too small an account.
-        assert!(pick("a", None, &history(|_| 100.0, 50_000.0), now).is_none());
+        assert!(pick("a", None, &history(|_| 100.0, 50_000.0), now, false).is_none());
         // Not 90 days of history.
         let mut h = history(|_| 100.0, 200_000.0);
         h.pnl.retain(|x| x.0 >= 40 * DAY_MS);
-        assert!(pick("a", None, &h, now).is_none());
+        assert!(pick("a", None, &h, now, false).is_none());
         // A history that stopped a week ago.
-        assert!(pick("a", None, &history(|_| 100.0, 200_000.0), now + 7 * DAY_MS).is_none());
+        assert!(pick("a", None, &history(|_| 100.0, 200_000.0), now + 7 * DAY_MS, false).is_none());
     }
 
     #[test]
     fn a_losing_month_or_too_few_good_weeks() {
         let now = 120 * DAY_MS;
         // The middle month (days 60-90) at a loss.
-        assert!(pick("a", None, &history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5), now).is_none());
+        assert!(pick("a", None, &history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5), now, false).is_none());
         // Every month up, but only every other week (counted back from now, day 120): 6 of 12.
         let h = history(|d| if ((120 - d) / 7) % 2 == 0 { 300.0 } else { -100.0 }, 2e5);
         let weeks: u32 = (1..=12).map(|k| u32::from(period(&h, now - k * 7 * DAY_MS, now - (k - 1) * 7 * DAY_MS).unwrap().0 > 0.0)).sum();
         assert_eq!(weeks, 6);
         let months: Vec<f64> = (1..=3).map(|k| period(&h, now - k * 30 * DAY_MS, now - (k - 1) * 30 * DAY_MS).unwrap().0).collect();
         assert!(months.iter().all(|&m| m > 0.0));
-        assert!(pick("a", None, &h, now).is_none());
+        assert!(pick("a", None, &h, now, false).is_none());
+    }
+
+    #[test]
+    fn idle_weeks_are_no_loss() {
+        // Three weeks without a trade (counted back from day 120: days 79-99).
+        let h = history(|d| if (79..=99).contains(&d) { 0.0 } else { 100.0 }, 2e5);
+        let p = pick("a", None, &h, 120 * DAY_MS, false).unwrap();
+        assert_eq!((p.weeks_up, p.weeks_down), (9, 0));
+    }
+
+    #[test]
+    fn kept_until_clearly_worse() {
+        let now = 120 * DAY_MS;
+        // A losing middle month, $50k left, 6 losing weeks: dropped if new, kept if on the list.
+        let mid = history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5);
+        assert!(pick("a", None, &mid, now, true).is_some());
+        assert!(pick("a", None, &history(|_| 100.0, 50_000.0), now, true).is_some());
+        let alt = history(|d| if ((120 - d) / 7) % 2 == 0 { 300.0 } else { -100.0 }, 2e5);
+        assert!(pick("a", None, &alt, now, true).is_some());
+        // The last month at a loss drops it; so does a smaller account.
+        assert!(pick("a", None, &history(|d| if d > 90 { -50.0 } else { 100.0 }, 2e5), now, true).is_none());
+        assert!(pick("a", None, &history(|_| 100.0, 40_000.0), now, true).is_none());
     }
 
     #[test]
@@ -247,7 +286,7 @@ mod tests {
         for x in h.value.iter_mut().filter(|x| x.0 >= 100 * DAY_MS) {
             x.1 = 200_000.0;
         }
-        assert!(pick("a", None, &h, 120 * DAY_MS).is_none());
+        assert!(pick("a", None, &h, 120 * DAY_MS, false).is_none());
     }
 
     #[test]

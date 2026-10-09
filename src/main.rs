@@ -71,10 +71,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     // list until it is a day old).
     {
         let (api, tx, cfg) = (api.clone(), tx.clone(), cfg.clone());
-        let mut last = 0.0;
+        let (mut last, mut listed) = (0.0, std::collections::HashSet::new());
         if let Some(s) = selection {
             log!("selection: saved one of {:.1} h ago, {} traders", (api::now() - s.at) / 3600.0, s.picks.len());
             last = s.at;
+            listed = s.addresses();
             let _ = tx.send(engine::Msg::Selected(s));
         }
         tokio::spawn(async move {
@@ -84,8 +85,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                         let _ = tx.send(engine::Msg::Leaders(l.clone()));
                         if api::now() - last >= stable::EVERY_S {
                             let pause = if last > 0.0 { stable::PAUSE_S } else { 0.0 };
-                            let s = stable::select(&api, &l, pause).await;
-                            last = s.at;
+                            let s = stable::select(&api, &l, &listed, pause).await;
+                            (last, listed) = (s.at, s.addresses());
                             if let Err(e) = store::save_selection(&cfg, &s).await {
                                 log!("selection: not saved: {e:#}");
                             }

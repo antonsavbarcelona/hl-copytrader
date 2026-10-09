@@ -37,6 +37,9 @@ pub struct Row {
     pub copy_fills: i64,
     pub open_positions: i32,
     pub liquidated: bool,
+    /// On the golden list, and the PnL it is judged by (since measured, see `engine`).
+    pub golden: bool,
+    pub measured_pnl: f64,
     /// The `Trader`, serialized.
     pub state: String,
 }
@@ -178,6 +181,8 @@ CREATE TABLE IF NOT EXISTS copy_accounts (
     copy_fills      bigint      NOT NULL,
     open_positions  integer     NOT NULL,
     liquidated      boolean     NOT NULL,
+    golden          boolean     NOT NULL DEFAULT false,
+    measured_pnl    float8      NOT NULL DEFAULT 0,
     state           jsonb       NOT NULL,
     updated_at      timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, address)
@@ -225,6 +230,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
      "TRUNCATE copy_accounts, events, bot_status, selection RESTART IDENTITY;
       DROP TABLE IF EXISTS signal_accounts, signal_trades, signal_maker_trades, smart_state;
       ALTER TABLE bot_status DROP COLUMN IF EXISTS signals_avg_ms, DROP COLUMN IF EXISTS signals_max_ms"),
+    // The golden list: copies judged by their PnL since then.
+    ("2026-10-09-golden",
+     "ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS golden boolean NOT NULL DEFAULT false,
+                                ADD COLUMN IF NOT EXISTS measured_pnl float8 NOT NULL DEFAULT 0"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -441,16 +450,20 @@ async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts
         let fills: Vec<i64> = rows.iter().map(|r| r.copy_fills).collect();
         let open: Vec<i32> = rows.iter().map(|r| r.open_positions).collect();
         let liq: Vec<bool> = rows.iter().map(|r| r.liquidated).collect();
+        let golden: Vec<bool> = rows.iter().map(|r| r.golden).collect();
+        let measured: Vec<f64> = rows.iter().map(|r| r.measured_pnl).collect();
         let state: Vec<&str> = rows.iter().map(|r| r.state.as_str()).collect();
         c.execute(
-            "INSERT INTO copy_accounts (run_id, address, name, equity, roi_pct, copy_fills, open_positions, liquidated, state, updated_at)
-             SELECT $1, a.address, a.name, a.equity, a.roi, a.fills, a.open, a.liq, a.state::jsonb, now()
-             FROM unnest($2::text[], $3::text[], $4::float8[], $5::float8[], $6::int8[], $7::int4[], $8::bool[], $9::text[])
-                  AS a(address, name, equity, roi, fills, open, liq, state)
+            "INSERT INTO copy_accounts (run_id, address, name, equity, roi_pct, copy_fills, open_positions, liquidated, golden, measured_pnl,
+                                        state, updated_at)
+             SELECT $1, a.address, a.name, a.equity, a.roi, a.fills, a.open, a.liq, a.golden, a.measured, a.state::jsonb, now()
+             FROM unnest($2::text[], $3::text[], $4::float8[], $5::float8[], $6::int8[], $7::int4[], $8::bool[], $9::bool[], $10::float8[],
+                         $11::text[])
+                  AS a(address, name, equity, roi, fills, open, liq, golden, measured, state)
              ON CONFLICT (run_id, address) DO UPDATE SET name = excluded.name, equity = excluded.equity, roi_pct = excluded.roi_pct,
                  copy_fills = excluded.copy_fills, open_positions = excluded.open_positions, liquidated = excluded.liquidated,
-                 state = excluded.state, updated_at = excluded.updated_at",
-            &[&run, &address, &name, &equity, &roi, &fills, &open, &liq, &state],
+                 golden = excluded.golden, measured_pnl = excluded.measured_pnl, state = excluded.state, updated_at = excluded.updated_at",
+            &[&run, &address, &name, &equity, &roi, &fills, &open, &liq, &golden, &measured, &state],
         )
         .await
         .context("saving copy accounts")?;

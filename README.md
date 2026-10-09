@@ -118,22 +118,27 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
 
 ## Liquidation research
 
-Nothing traded (`src/liq.rs`): when the price reaches a dense level of liquidations, does it run
-on through it (a cascade) or bounce back?
+A separate strategy, researched on paper apart from the copies (`src/liq.rs`; its own tables,
+its own paper accounts; it shares only the process, the books and the API budget, in which
+it goes last): when the price reaches a dense level of liquidations, does it run on through
+it (a cascade) or bounce back?
 
 - The positions of the leaderboard's accounts of $250k+ (~7.7k) are read one after another,
   each position's liquidation price kept; a pass takes ~30 min at ~300 weight a minute, and
-  waits while the API budget is over 5 s behind (the day's selection, the copies first).
+  waits while the API budget is over 5 s behind (the copies and the day's selection first).
 - Every 5 s, per coin trading $10M+ a day (~37): the notional to be liquidated summed by
   liquidation price in 0.5% bins, longs below the price and shorts above; a bin of $250k+ is
-  a cluster. Logged every 10 min (`liq:` lines, the biggest within 10% of the price).
-- When the mid (mainnet's books) enters a cluster's bin, that touch is followed for an hour:
-  the move from it in the cascade's direction at 5 / 15 / 60 min, its furthest point and
-  when, the bounce from there, the worst against, whether it went through the bin. Each an
-  event `liq_touch`.
-- At midnight UTC, the day's touches summed up per cluster size (0.25-1M, 1-5M, 5M+):
-  `liq_daily`, with what a cascade trade (with the move, in at the touch) and a bounce trade
-  (against it) would net at 15 / 60 min after 12 bp of costs.
+  a cluster. Logged every 10 min (`liq:` lines: the biggest within 10% of the price, and each
+  strategy's equity).
+- `liq_touches`: when the mid (mainnet's books) enters a cluster's bin, that touch followed for
+  an hour: the move from it in the cascade's direction at 5 / 15 / 60 min, its furthest point
+  and when, the bounce from there, the worst against, whether it went through the bin.
+- `liq_trades`: on every touch, four strategies trade on paper, each on its own $1000 account:
+  `cascade_15m` / `cascade_60m` (with the move) and `bounce_15m` / `bounce_60m` (against it),
+  out after 15 / 60 min or at a 2% stop, sized to lose 2% of the account there; taker fills on
+  the book in and out, taker fees. Their equities are kept across restarts (`docs`, `liq_sim`).
+- `liq_daily`: at midnight UTC, each strategy's day per cluster size (all, 0.25-1M, 1-5M, 5M+):
+  trades, winners, average PnL (bp of notional), PnL, equity at the end.
 
 ## What is measured
 
@@ -177,12 +182,13 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
     price and slippage vs it (`slip_bps`, of it `move_bps`);
   - `enroll`, `plan` (the trader's set-up for a position), `golden` (an account joins or
     leaves the golden list), `liquidated`;
-  - `live` (the live account's orders), `liq_touch` and `liq_daily` (the liquidation
-    research).
+  - `live` (the live account's orders).
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
+- `liq_touches`, `liq_trades`, `liq_daily`: the liquidation research (see above; migration
+  `2026-10-09-liq-tables`).
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);
   `2026-10-07-reset` emptied every table above, for all runs, when the traders' pick changed,
   and dropped the tables of the signals the run used to trade (removed with them);

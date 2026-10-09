@@ -89,7 +89,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         }
         // The liquidation research reads the larger accounts' positions (`liq`).
         let (acc_tx, acc_rx) = tokio::sync::watch::channel(Vec::new());
-        liq::spawn(api.clone(), books.clone(), acc_rx, store_liq);
+        liq::spawn(api.clone(), books.clone(), acc_rx, store_liq, cfg.clone());
         tokio::spawn(async move {
             loop {
                 let wait = match api.leaders().await {

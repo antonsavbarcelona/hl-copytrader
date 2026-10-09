@@ -46,6 +46,8 @@ pub struct Row {
 
 enum Cmd {
     Event(Value),
+    /// A row for one of the tables that take whole rows (`INSERT_TABLES`).
+    Insert(&'static str, Value),
     Save(Vec<Row>),
     Status(Value),
     Flush(oneshot::Sender<()>),
@@ -63,6 +65,13 @@ impl Store {
 
     pub fn save(&self, rows: Vec<Row>) {
         let _ = self.tx.send(Cmd::Save(rows));
+    }
+
+    /// Adds `row` (an object of its columns, `run_id` filled in here) to `table`, one of
+    /// `INSERT_TABLES` (a file `<table>.jsonl` without a database).
+    pub fn insert(&self, table: &'static str, row: Value) {
+        debug_assert!(INSERT_TABLES.contains(&table));
+        let _ = self.tx.send(Cmd::Insert(table, row));
     }
 
     pub fn status(&self, status: Value) {
@@ -144,6 +153,11 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         match cmd {
             Cmd::Event(ev) => {
                 let _ = writeln!(events, "{ev}");
+            }
+            Cmd::Insert(table, row) => {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{table}.jsonl"))) {
+                    let _ = writeln!(f, "{row}");
+                }
             }
             Cmd::Status(s) => {
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("status.jsonl")) {
@@ -229,6 +243,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 ";
 
+/// The tables `Store::insert` writes to.
+const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily"];
+
 /// One-off changes to what is in the database, by name, oldest first.
 const MIGRATIONS: &[(&str, &str)] = &[
     // The traders followed until now were picked by one month's ROI (see `stable`), and the
@@ -288,6 +305,64 @@ const MIGRATIONS: &[(&str, &str)] = &[
           '0x5f96906b85010f729e36d5a4141d027194a47b60',
           '0x2d23559bab0bbcb483056e77c9b2837438215cc2',
           '0xf29c6bc1147a841519b382459a6d7a373c6b9971')"),
+    // The liquidation research (`liq`), kept apart from the copies: the touches of liquidation
+    // clusters, the trades simulated on them, and each day's results per strategy.
+    ("2026-10-09-liq-tables",
+     "CREATE TABLE IF NOT EXISTS liq_touches (
+          id            bigserial   PRIMARY KEY,
+          run_id        text        NOT NULL,
+          touch         text        NOT NULL,
+          at            timestamptz NOT NULL,
+          coin          text        NOT NULL,
+          side          text        NOT NULL,
+          cluster_usd   float8      NOT NULL,
+          accounts      integer     NOT NULL,
+          bin_lo        float8      NOT NULL,
+          bin_hi        float8      NOT NULL,
+          touch_px      float8      NOT NULL,
+          oi_usd        float8,
+          bp_5m         float8,
+          bp_15m        float8,
+          bp_60m        float8,
+          best_bp       float8,
+          best_after_s  float8,
+          bounce_bp     float8,
+          worst_bp      float8,
+          through       boolean
+      );
+      CREATE INDEX IF NOT EXISTS liq_touches_at ON liq_touches (run_id, at);
+      CREATE TABLE IF NOT EXISTS liq_trades (
+          id            bigserial   PRIMARY KEY,
+          run_id        text        NOT NULL,
+          touch         text        NOT NULL,
+          strategy      text        NOT NULL,
+          coin          text        NOT NULL,
+          cluster_usd   float8      NOT NULL,
+          dir           integer     NOT NULL,
+          opened_at     timestamptz NOT NULL,
+          closed_at     timestamptz NOT NULL,
+          entry_px      float8      NOT NULL,
+          exit_px       float8      NOT NULL,
+          exit_why      text        NOT NULL,
+          notional      float8      NOT NULL,
+          fee           float8      NOT NULL,
+          pnl_usd       float8      NOT NULL,
+          pnl_bp        float8      NOT NULL,
+          equity_after  float8      NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS liq_trades_closed ON liq_trades (run_id, strategy, closed_at);
+      CREATE TABLE IF NOT EXISTS liq_daily (
+          id            bigserial   PRIMARY KEY,
+          run_id        text        NOT NULL,
+          day           date        NOT NULL,
+          strategy      text        NOT NULL,
+          cluster_size  text        NOT NULL,
+          trades        integer     NOT NULL,
+          win_pct       float8,
+          avg_pnl_bp    float8,
+          pnl_usd       float8      NOT NULL,
+          equity_end    float8
+      )"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -449,10 +524,11 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     let mut pending: HashMap<String, Row> = HashMap::new();
     let mut written: HashMap<String, u64> = HashMap::new();
     let mut statuses: Vec<Value> = Vec::new();
+    let mut inserts: Vec<(&'static str, Value)> = Vec::new();
     let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut open = true;
-    while open || !events.is_empty() || !pending.is_empty() || !statuses.is_empty() || !waiting.is_empty() {
+    while open || !events.is_empty() || !pending.is_empty() || !statuses.is_empty() || !inserts.is_empty() || !waiting.is_empty() {
         // Gather until the next tick (or a flush, a big batch, or the end), then write.
         let due = tokio::select! {
             cmd = rx.recv(), if open => match cmd {
@@ -472,6 +548,10 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     statuses.push(s);
                     false
                 }
+                Some(Cmd::Insert(table, row)) => {
+                    inserts.push((table, row));
+                    false
+                }
                 Some(Cmd::Flush(done)) => {
                     waiting.push(done);
                     true
@@ -483,7 +563,7 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             },
             _ = tick.tick() => true,
         };
-        if !due || (events.is_empty() && pending.is_empty() && statuses.is_empty() && waiting.is_empty()) {
+        if !due || (events.is_empty() && pending.is_empty() && statuses.is_empty() && inserts.is_empty() && waiting.is_empty()) {
             continue;
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
@@ -500,10 +580,11 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             };
         }
         let Some(c) = &client else { continue };
-        match write(c, &run, &events, &pending, &statuses).await {
+        match write(c, &run, &events, &pending, &statuses, &inserts).await {
             Ok(()) => {
                 events.clear();
                 statuses.clear();
+                inserts.clear();
                 for (a, r) in pending.drain() {
                     written.insert(a, hash(&r.state));
                 }
@@ -520,7 +601,17 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     }
 }
 
-async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value]) -> Result<()> {
+async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
+               inserts: &[(&'static str, Value)]) -> Result<()> {
+    for (table, row) in inserts {
+        // The columns are the row's keys (ours, not outside input), each converted by the
+        // table's own type for it.
+        let mut row = row.clone();
+        row["run_id"] = Value::String(run.to_string());
+        let cols = row.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        c.execute(&format!("INSERT INTO {table} ({cols}) SELECT {cols} FROM jsonb_populate_record(NULL::{table}, $1::text::jsonb)"),
+            &[&row.to_string()]).await.with_context(|| format!("inserting into {table}"))?;
+    }
     if !statuses.is_empty() {
         let rows = serde_json::to_string(statuses)?;
         c.execute(

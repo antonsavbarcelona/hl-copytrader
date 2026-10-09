@@ -6,8 +6,8 @@
 //!   - while it adds, we hold that size; as it reduces from its largest size in the position
 //!     we reduce in proportion, and we close when it is flat;
 //!   - at our stop we close and stay out of that position until it is flat;
-//!   - positions it held before we followed it are not entered, nor new ones while our copy
-//!     holds `max_positions` (50: at most 100% of equity at risk to the stops).
+//!   - positions it held before we followed it are not entered, nor new ones while all our
+//!     copies together hold `max_positions` (50).
 //!
 //! Only the venue's mechanics are modelled beyond that:
 //!   - fills are taker fills on the live L2 book, `exec_delay_ms` after the account's fill
@@ -77,7 +77,7 @@ pub struct Trader {
     pub base: Option<Base>,
     #[serde(default)]
     pub golden: bool,
-    /// Its entries not followed: our copy held `max_positions` already.
+    /// Its entries not followed: our copies held `max_positions` already.
     #[serde(default)]
     pub skipped: u64,
 }
@@ -485,14 +485,16 @@ impl Engine {
         };
         // Our size for a position it enters: the stop away, it loses `risk_pct` of our equity.
         let full = (self.cfg.risk_pct / self.cfg.stop_pct * equity_now.max(0.0) / mid).max(0.0);
+        let open: usize = self.traders.values().filter(|t| !t.acct.liquidated).map(|t| t.acct.positions.len()).sum();
         let Some(t) = self.traders.get_mut(user) else { return };
         let ours = t.acct.size(coin);
         let theirs = t.theirs.get(coin).copied().unwrap_or(0.0);
         // An entry: its fills opened the position (it was flat or the other way before them);
         // a copy without fills pending is the one its enrollment fill opened.
         let mut entry = why == "copy" && first.is_none_or(|p| (theirs - p.net) * theirs <= 1e-12);
-        // At `max_positions` open, a new position is not entered (a flip of one we hold is).
-        if entry && ours == 0.0 && t.acct.positions.len() >= self.cfg.max_positions && !t.legs.get(coin).is_some_and(|l| l.dir == theirs.signum()) {
+        // At `max_positions` open over all copies, a new position is not entered (a flip of
+        // one we hold is).
+        if entry && ours == 0.0 && open >= self.cfg.max_positions && !t.legs.get(coin).is_some_and(|l| l.dir == theirs.signum()) {
             entry = false;
             t.skipped += 1;
         }

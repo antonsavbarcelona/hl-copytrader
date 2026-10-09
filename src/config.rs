@@ -20,7 +20,7 @@ pub struct Config {
     pub risk_pct: f64,
     /// ... which is this far against our average entry (%).
     pub stop_pct: f64,
-    /// A copy account enters no new position while it holds this many.
+    /// No new position is entered while all copy accounts together hold this many.
     pub max_positions: usize,
     /// An active account's positions are read again this often (drift correction).
     pub reconcile_s: f64,

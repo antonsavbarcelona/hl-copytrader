@@ -12,7 +12,7 @@ target/release/hl-copytrader report --data data [--min-fills 10] [--top 30]
 ```
 
 `run` options: `--start 1000` (USD per copy account), `--risk 2` (% of equity each entry
-loses at our stop), `--stop 20` (% against our entry), `--max-positions 50` (per copy account),
+loses at our stop), `--stop 20` (% against our entry), `--max-positions 50` (over all copy accounts),
 `--delay-ms 1000` (our order lands this long after the trader's fill reaches us),
 `--weight 400` (info API weight per minute; 1200 per IP shared with anything else).
 Needs Rust 1.85+. The running copy uses `data/bin/hl-copytrader.exe` so rebuilds are not
@@ -74,8 +74,8 @@ minute) is per IP, and the image takes 800 of it.
     stop loses 2% of our equity: 2% / 20% = a position of 10% of equity.
   - While it adds, we hold that size. As it reduces from its largest size in the position we
     reduce in proportion, and we close when it is flat.
-  - At most 50 positions open per copy account: a new one beyond that is not entered
-    (`skipped` in the state).
+  - At most 50 positions open at once over all copy accounts: a new one beyond that is not
+    entered (`skipped` in the trader's state). Positions already open run their course.
   - Our stop: 20% against our average entry (checked every 5 s at the book's mid), closed at
     the book; we stay out of that position until it is flat (`legs` in the state).
 - **Enrollment**: on its first fill we read its positions; the one that fill opened is

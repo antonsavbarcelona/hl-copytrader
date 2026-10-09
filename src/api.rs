@@ -58,6 +58,9 @@ pub struct CoinCtx {
     /// Funding rate (hourly) and mark price.
     pub funding: f64,
     pub mark: f64,
+    /// Traded in the last 24 h (USD) and open interest (coins).
+    pub day_volume: f64,
+    pub open_interest: f64,
 }
 
 /// How a position of the account is set up on the exchange.
@@ -118,8 +121,12 @@ impl Api {
     /// Weight spent since the last call, and how far ahead the requests are booked (s): a
     /// backlog that keeps growing means the budget is too small for what is read.
     pub fn usage(&self) -> (u64, f64) {
-        let backlog = self.pacer.try_lock().map(|p| p.next.saturating_duration_since(Instant::now()).as_secs_f64()).unwrap_or(0.0);
-        (self.used.swap(0, Ordering::Relaxed), backlog)
+        (self.used.swap(0, Ordering::Relaxed), self.backlog())
+    }
+
+    /// How far behind the budget is (s): requests queued for that long.
+    pub fn backlog(&self) -> f64 {
+        self.pacer.try_lock().map(|p| p.next.saturating_duration_since(Instant::now()).as_secs_f64()).unwrap_or(0.0)
     }
 
     async fn pace(&self, weight: u32) {
@@ -161,7 +168,9 @@ impl Api {
         for (i, u) in universe.iter().enumerate() {
             let name = u["name"].as_str().unwrap_or("").to_string();
             if let Some(c) = ctxs.get(i) {
-                ctx.insert(name.clone(), CoinCtx { funding: num(&c["funding"]), mark: num(&c["markPx"]) });
+                ctx.insert(name.clone(), CoinCtx {
+                    funding: num(&c["funding"]), mark: num(&c["markPx"]), day_volume: num(&c["dayNtlVlm"]), open_interest: num(&c["openInterest"]),
+                });
             }
             if !u["isDelisted"].as_bool().unwrap_or(false) {
                 coins.push(CoinInfo { name, sz_decimals: u["szDecimals"].as_u64().unwrap_or(0) as u32 });

@@ -10,6 +10,7 @@ mod api;
 mod config;
 mod engine;
 mod exchange;
+mod liq;
 mod live;
 mod report;
 mod stable;
@@ -55,6 +56,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let selection = store::load_selection(&cfg).await?;
     let store = store::open(&cfg).await?;
     let live = live::start(&cfg, store.clone()).await?;
+    let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     if let Some(l) = live {
         engine.set_live(l);
@@ -85,11 +87,17 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             listed = s.addresses();
             let _ = tx.send(engine::Msg::Selected(s));
         }
+        // The liquidation research reads the larger accounts' positions (`liq`).
+        let (acc_tx, acc_rx) = tokio::sync::watch::channel(Vec::new());
+        liq::spawn(api.clone(), books.clone(), acc_rx, store_liq);
         tokio::spawn(async move {
             loop {
                 let wait = match api.leaders().await {
                     Ok(l) => {
                         let _ = tx.send(engine::Msg::Leaders(l.clone()));
+                        let mut big: Vec<&api::Leader> = l.iter().filter(|x| x.account_value >= liq::MIN_ACCOUNT).collect();
+                        big.sort_by(|a, b| b.account_value.total_cmp(&a.account_value));
+                        let _ = acc_tx.send(big.into_iter().map(|x| x.address.clone()).collect());
                         if api::now() - last >= stable::EVERY_S {
                             let pause = if last > 0.0 { stable::PAUSE_S } else { 0.0 };
                             let s = stable::select(&api, &l, &listed, pause).await;

@@ -116,6 +116,25 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
 - `hl-copytrader live-check [COIN]` makes one trade through the same path (entry with its
   stop, half out, out) to check the account and key.
 
+## Liquidation research
+
+Nothing traded (`src/liq.rs`): when the price reaches a dense level of liquidations, does it run
+on through it (a cascade) or bounce back?
+
+- The positions of the leaderboard's accounts of $250k+ (~7.7k) are read one after another,
+  each position's liquidation price kept; a pass takes ~30 min at ~300 weight a minute, and
+  waits while the API budget is over 5 s behind (the day's selection, the copies first).
+- Every 5 s, per coin trading $10M+ a day (~37): the notional to be liquidated summed by
+  liquidation price in 0.5% bins, longs below the price and shorts above; a bin of $250k+ is
+  a cluster. Logged every 10 min (`liq:` lines, the biggest within 10% of the price).
+- When the mid (mainnet's books) enters a cluster's bin, that touch is followed for an hour:
+  the move from it in the cascade's direction at 5 / 15 / 60 min, its furthest point and
+  when, the bounce from there, the worst against, whether it went through the bin. Each an
+  event `liq_touch`.
+- At midnight UTC, the day's touches summed up per cluster size (0.25-1M, 1-5M, 5M+):
+  `liq_daily`, with what a cascade trade (with the move, in at the touch) and a bounce trade
+  (against it) would net at 15 / 60 min after 12 bp of costs.
+
 ## What is measured
 
 Per copy account, kept in `state.json` (`stats`) and summed up by `report`:
@@ -157,7 +176,9 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   - `fill`: ours (`why`: seed / copy / reconcile / restart / stop), with lag, the trader's
     price and slippage vs it (`slip_bps`, of it `move_bps`);
   - `enroll`, `plan` (the trader's set-up for a position), `golden` (an account joins or
-    leaves the golden list), `liquidated`.
+    leaves the golden list), `liquidated`;
+  - `live` (the live account's orders), `liq_touch` and `liq_daily` (the liquidation
+    research).
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration

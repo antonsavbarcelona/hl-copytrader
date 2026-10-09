@@ -15,6 +15,10 @@
 //!
 //! Orders are IOC limits 5% through the mid (market orders, as the SDK places them). Prices are
 //! the live account's venue's: on testnet its own books, not mainnet's.
+//!
+//! At every start a health check runs first: a small market buy ($15) of BTC (else ETH,
+//! SOL: a coin we hold no position in), sold at once; its result goes to `live_checks`. A
+//! failed check is recorded and logged; the live trader runs on regardless.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,12 +35,18 @@ use crate::exchange::{Action, CancelWire, Exchange, MAINNET, OrderType, OrderWir
 use crate::log;
 use crate::store::Store;
 
-/// Our market orders cross the mid by this much at most.
-const SLIPPAGE: f64 = 0.05;
+/// Our market orders cross the mid by this much at most (the exchange's $10 minimum is
+/// checked at the order's limit price, so not much more).
+const SLIPPAGE: f64 = 0.02;
 /// The stop order fills up to this far past its trigger.
 const STOP_SLIPPAGE: f64 = 0.1;
 const MIN_ORDER_USD: f64 = 10.0;
+/// A reduce that would leave less than this (USD) closes the position: a smaller one could
+/// not be sold (under the minimum at the order's price).
+const MIN_LEFT_USD: f64 = 11.0;
 const DOC: &str = "live";
+/// The start's check trades this much (USD; the exchange's minimum is $10).
+const CHECK_USD: f64 = 15.0;
 
 /// A move of a followed account's position in a coin.
 #[derive(Debug)]
@@ -112,6 +122,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<Option<(mpsc::Unbounded
     let mut live = Live { ex, account, unified, coins, state, cfg: cfg.clone(), store, status: status.clone() };
     let (tx, mut rx) = mpsc::unbounded_channel::<Update>();
     tokio::spawn(async move {
+        live.health().await;
         live.reconcile().await;
         let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
@@ -169,6 +180,11 @@ impl Live {
 
     /// A market order (IOC through the mid): the size filled (signed) and its average price.
     async fn market(&mut self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64)> {
+        self.market_oid(coin, size, reduce).await.map(|(got, px, _)| (got, px))
+    }
+
+    /// `market`, with the order's id.
+    async fn market_oid(&mut self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
         let (asset, dec) = self.coins[coin];
         let mid = self.mid(coin).await?;
         let buy = size > 0.0;
@@ -183,7 +199,7 @@ impl Live {
         let st = &r["data"]["statuses"][0];
         if let Some(f) = st.get("filled") {
             let got = num(&f["totalSz"]);
-            return Ok((if buy { got } else { -got }, num(&f["avgPx"])));
+            return Ok((if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
         }
         bail!("{coin} order not filled: {st}");
     }
@@ -201,6 +217,47 @@ impl Live {
         let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
         let st = &r["data"]["statuses"][0];
         st["resting"]["oid"].as_u64().with_context(|| format!("{coin} stop not placed: {st}"))
+    }
+
+    /// The start's check (see the module): bought and sold at once, recorded either way.
+    async fn health(&mut self) {
+        let started = std::time::Instant::now();
+        let Some(coin) = ["BTC", "ETH", "SOL"].into_iter().find(|c| self.coins.contains_key(*c) && !self.state.legs.contains_key(*c)) else {
+            log!("live: health check skipped (BTC, ETH and SOL all held)");
+            return;
+        };
+        let mut rec = json!({"net": if self.ex.mainnet() { "mainnet" } else { "testnet" }, "account": self.account, "coin": coin});
+        let r: Result<()> = async {
+            let (equity, _) = self.equity().await?;
+            rec["equity"] = json!(equity);
+            let mid = self.mid(coin).await?;
+            let m = 10f64.powi(self.coins[coin].1 as i32);
+            let size = (CHECK_USD / mid * m).ceil() / m;
+            let (got, open_px, open_oid) = self.market_oid(coin, size, false).await?;
+            rec["size"] = json!(got);
+            rec["open_px"] = json!(open_px);
+            let close = match self.market_oid(coin, -got, true).await {
+                Ok(x) => x,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    self.market_oid(coin, -got, true).await.context("bought, not sold: the position is left open")?
+                }
+            };
+            rec["close_px"] = json!(close.1);
+            let fills = self.ex.info(json!({"type": "userFills", "user": self.account})).await?;
+            let fee: f64 = fills.as_array().into_iter().flatten()
+                .filter(|f| [open_oid, close.2].contains(&f["oid"].as_u64().unwrap_or(0))).map(|f| num(&f["fee"])).sum();
+            rec["fee"] = json!(fee);
+            rec["pnl"] = json!(got * (close.1 - open_px) - fee);
+            Ok(())
+        }.await;
+        rec["ok"] = json!(r.is_ok());
+        rec["error"] = json!(r.as_ref().err().map(|e| format!("{e:#}")));
+        rec["took_ms"] = json!(started.elapsed().as_millis() as u64);
+        log!("live: health check {}: {rec}", if r.is_ok() { "ok" } else { "FAILED" });
+        if let Err(e) = crate::store::save_live_check(&self.cfg, &rec).await {
+            log!("live: health check not saved: {e:#}");
+        }
     }
 
     async fn cancel(&mut self, coin: &str, oid: u64) {
@@ -272,9 +329,12 @@ impl Live {
     /// Moves our size to its share of `full` (reduces only on the exchange's side if smaller).
     async fn follow(&mut self, u: &Update) -> Result<()> {
         let l = self.state.legs[&u.coin].clone();
-        let target = l.dir * l.full * u.frac.min(1.0);
-        let delta = target - l.size;
         let mid = self.mid(&u.coin).await?;
+        let target = l.dir * l.full * u.frac.min(1.0);
+        if target.abs() * mid < MIN_LEFT_USD {
+            return self.close(&u.coin, "small").await;
+        }
+        let delta = target - l.size;
         if round_size(delta.abs(), self.coins[&u.coin].1) * mid < MIN_ORDER_USD {
             return Ok(());
         }

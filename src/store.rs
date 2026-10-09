@@ -241,6 +241,25 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("2026-10-09-golden",
      "ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS golden boolean NOT NULL DEFAULT false,
                                 ADD COLUMN IF NOT EXISTS measured_pnl float8 NOT NULL DEFAULT 0"),
+    // The live account's health check at every start (`live`): a smallest trade, in and out.
+    ("2026-10-09-live-checks",
+     "CREATE TABLE IF NOT EXISTS live_checks (
+          id        bigserial   PRIMARY KEY,
+          run_id    text        NOT NULL,
+          at        timestamptz NOT NULL DEFAULT now(),
+          net       text        NOT NULL,
+          account   text        NOT NULL,
+          ok        boolean     NOT NULL,
+          coin      text,
+          size      float8,
+          open_px   float8,
+          close_px  float8,
+          fee       float8,
+          pnl       float8,
+          equity    float8,
+          took_ms   integer,
+          error     text
+      )"),
     // The golden list starts with the copies at a profit on 2026-10-09 of the accounts that can
     // be copied (swing traders; not market makers, HFT or grids: see the README).
     ("2026-10-09-golden-seed",
@@ -351,6 +370,28 @@ pub async fn save_doc(cfg: &Config, name: &str, state: &Value) -> Result<()> {
             let (path, tmp) = (cfg.data_dir.join(format!("{name}.json")), cfg.data_dir.join(format!("{name}.tmp")));
             std::fs::write(&tmp, s)?;
             std::fs::rename(&tmp, &path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Records a live health check (`live_checks`; `live_checks.jsonl` without a database).
+pub async fn save_live_check(cfg: &Config, rec: &Value) -> Result<()> {
+    match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            client.execute(
+                "INSERT INTO live_checks (run_id, net, account, ok, coin, size, open_px, close_px, fee, pnl, equity, took_ms, error)
+                 SELECT $1, r.net, r.account, r.ok, r.coin, r.size, r.open_px, r.close_px, r.fee, r.pnl, r.equity, r.took_ms, r.error
+                 FROM jsonb_to_record($2::text::jsonb) AS r(net text, account text, ok boolean, coin text, size float8, open_px float8,
+                      close_px float8, fee float8, pnl float8, equity float8, took_ms int4, error text)",
+                &[&cfg.run_id, &rec.to_string()],
+            ).await?;
+        }
+        None => {
+            std::fs::create_dir_all(&cfg.data_dir)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(cfg.data_dir.join("live_checks.jsonl"))?;
+            writeln!(f, "{rec}")?;
         }
     }
     Ok(())

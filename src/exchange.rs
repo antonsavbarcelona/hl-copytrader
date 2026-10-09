@@ -127,6 +127,10 @@ impl Exchange {
         Ok(Self { http, base: base.trim_end_matches('/').to_string(), key, mainnet: base.contains("api.hyperliquid.xyz"), last_nonce: 0 })
     }
 
+    pub fn mainnet(&self) -> bool {
+        self.mainnet
+    }
+
     pub fn signer(&self) -> String {
         address(&self.key)
     }

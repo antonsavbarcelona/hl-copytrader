@@ -94,7 +94,9 @@ pub fn walk(levels: &[(f64, f64)], size: f64) -> (f64, f64) {
 /// Size rounded toward zero to the coin's size decimals.
 pub fn round_size(sz: f64, decimals: u32) -> f64 {
     let m = 10f64.powi(decimals as i32);
-    (sz * m).trunc() / m
+    // A hair up first: 0.00014 is 13.999... steps in binary, still 14 of them.
+    let steps = sz * m;
+    (steps + steps.signum() * 1e-9).trunc() / m
 }
 
 #[cfg(test)]
@@ -125,5 +127,7 @@ mod tests {
         assert_eq!(walk(&asks, 5.0).0, 2.0);
         assert_eq!(round_size(0.123456, 3), 0.123);
         assert_eq!(round_size(-0.123456, 3), -0.123);
+        assert_eq!(round_size(14.0 / 100_000.0, 5), 0.00014);
+        assert_eq!(round_size(0.0, 5), 0.0);
     }
 }

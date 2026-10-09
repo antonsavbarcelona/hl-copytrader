@@ -96,11 +96,16 @@ With `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key, or 
 wallet's approved for it) set, the golden list is also traded for real on that account:
 testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`).
 
-- A position a golden account enters is entered with a market order (IOC 5% through the mid)
+- Health check at every start: a $15 market buy of BTC (else ETH, SOL: one not held), sold at
+  once; the result (ok, prices, fee, PnL, time, error) is a row of `live_checks`
+  (`live_checks.jsonl` without a database). A failed one is logged; trading runs on regardless.
+- A position a golden account enters is entered with a market order (IOC 2% through the mid)
   at a size whose stop loses 2% of the account's equity (unified account: perp value plus the
   spot USDC not held as margin), and a reduce-only stop-market order rests on the exchange 20%
   against our fill. It is then followed to its end (reduced as the trader reduces from its
-  peak, closed when it is flat), golden or not by then.
+  peak, closed when it is flat, or closed whole when a reduce would leave under $11, which
+  could not be sold: the exchange checks its $10 minimum at the order's price), golden or not
+  by then.
 - One position per coin: another account's entry in a coin we hold is not followed; at 50 open
   none is (`skipped`). Every minute the exchange's positions are read: one gone there (the stop
   filled, or a liquidation) ends ours.
@@ -155,6 +160,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
     leaves the golden list), `liquidated`.
 - `selection`: the day's followed traders with their months' PnL and weeks up (one row per run).
 - `docs`: named state documents of a run (`live`: the live account's positions).
+- `live_checks`: the live account's health check at every start (migration
+  `2026-10-09-live-checks`).
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);
   `2026-10-07-reset` emptied every table above, for all runs, when the traders' pick changed,
   and dropped the tables of the signals the run used to trade (removed with them);

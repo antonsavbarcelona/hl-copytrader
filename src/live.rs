@@ -297,6 +297,12 @@ impl Live {
 
     async fn on_update(&mut self, u: Update) {
         if !self.coins.contains_key(&u.coin) {
+            // A golden account's entry in a coin the live venue does not list (testnet lists
+            // fewer coins than mainnet): recorded, so it is not taken for a missed one.
+            if u.entry && u.golden && u.frac > 0.0 {
+                self.skip(&u, "coin not listed on the live venue");
+                self.save().await;
+            }
             return;
         }
         let k = key(&u.coin, &u.user);

@@ -168,6 +168,22 @@ fn with_measures(mut row: serde_json::Value, st: &crate::stable::Steadiness) -> 
     row
 }
 
+/// On enrollment, its position in the coin of the fill that brought it (`size`, as read) and
+/// that fill (`d`, signed): whether the fill opened the position, and its size when the read
+/// does not hold it yet. The read can be a moment older than the fill: a position equal to the
+/// fill was opened by it (read after), and none at all was too (read before; the fill is then
+/// the position). Anything else is a position it held already, the fill adding to or
+/// reducing it (a flip at that moment is not followed: it cannot be told from a reduce by an
+/// older read).
+fn enrolled(size: f64, d: f64) -> (bool, Option<f64>) {
+    let eps = 1e-9 * d.abs().max(1.0);
+    if size.abs() <= eps {
+        (true, Some(d))
+    } else {
+        ((size - d).abs() <= eps, None)
+    }
+}
+
 /// Our side of one of its positions, from its entry until it is flat again.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Leg {
@@ -498,12 +514,16 @@ impl Engine {
         let mut coins_now: HashSet<String> = theirs.keys().cloned().collect();
         coins_now.extend(t.acct.positions.keys().cloned());
         t.theirs = theirs;
-        // On enrollment, the position its first fill opened (it was flat or the other way
-        // before it) is an entry like any later one; the rest it held before.
-        let entered = first.filter(|(c, d)| {
-            let size = t.theirs.get(c).copied().unwrap_or(0.0);
-            size.abs() > 1e-12 && size * (size - d) <= 1e-12
-        }).map(|(c, _)| c);
+        // On enrollment, the position its first fill opened (`enrolled`) is an entry like any
+        // later one; the rest it held before.
+        let entered = first.and_then(|(c, d)| {
+            let (entry, size) = enrolled(t.theirs.get(&c).copied().unwrap_or(0.0), d);
+            if let Some(size) = size {
+                t.theirs.insert(c.clone(), size);
+            }
+            entry.then_some(c)
+        });
+        coins_now.extend(entered.clone());
         self.dirty = true;
         if new {
             self.write(json!({"kind": "enroll", "user": user, "equity": r(equity, 2), "positions": coins_now.len()}));
@@ -956,6 +976,18 @@ fn mark(t: &mut Trader, marks: &dyn Fn(&str) -> Option<f64>, equity: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrollment_fill_opens_only_from_flat() {
+        // The read holds the fill: equal to it, an entry; more, an add.
+        assert_eq!(enrolled(-5.0, -5.0), (true, None));
+        assert_eq!(enrolled(-15.0, -5.0), (false, None));
+        // The read is older than the fill: no position, an entry of the fill's size; a short of
+        // 3 that a sell of 5 would make look like a flip is an add to it.
+        assert_eq!(enrolled(0.0, -5.0), (true, Some(-5.0)));
+        assert_eq!(enrolled(-3.0, -5.0), (false, None));
+        assert_eq!(enrolled(3.0, -5.0), (false, None));
+    }
 
     #[test]
     fn a_week_s_verdict() {

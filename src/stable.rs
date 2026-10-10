@@ -13,6 +13,13 @@
 //! September; the next month): 69%, 50%, 68% of the picks at a profit, against 54%, 57%, 51%
 //! of all accounts; no drawdown limit, so high-leverage accounts are in too (see the README).
 //!
+//! Then how it trades, from its latest fills (`userFills`, up to 2000: `Style`): it has to be
+//! one a copy can follow, not a market maker or a high-frequency trader (more than
+//! `MAX_ORDERS_PER_DAY` orders a day, or `MAKER_PCT`%+ of its volume resting orders on a thin
+//! edge under `MIN_EDGE_BP`: their edge is the spread and rebates, not the direction), and
+//! trading mostly liquid markets (`MIN_LIQUID_PCT`% of its volume in perps traded
+//! `LIQUID_VOLUME`+ a day; the HIP-3 dexes, not copied, count as not).
+//!
 //! An account on the day before's list stays unless it clearly got worse: its last month at
 //! a loss, a loss in over `KEEP_WEEKS_DOWN` weeks, or its perp account under `KEEP_EQUITY` (one
 //! week moving across the line, or money taken out for a while, does not drop it). It is
@@ -34,6 +41,11 @@ const WEEKS: u64 = 12;
 const MAX_WEEKS_DOWN: u32 = 4;
 const KEEP_WEEKS_DOWN: u32 = 6;
 const KEEP_EQUITY: f64 = 50_000.0;
+const MAX_ORDERS_PER_DAY: f64 = 300.0;
+const MAKER_PCT: f64 = 90.0;
+const MIN_EDGE_BP: f64 = 20.0;
+const MIN_LIQUID_PCT: f64 = 70.0;
+pub const LIQUID_VOLUME: f64 = 5_000_000.0;
 /// A period's capital under this (USD) does not count: the account was funded later.
 const MIN_BASE: f64 = 1000.0;
 /// The list is worked out again this often...
@@ -119,6 +131,53 @@ pub struct Pick {
     pub weeks_up: u32,
     #[serde(default)]
     pub weeks_down: u32,
+    #[serde(default)]
+    pub style: Option<Style>,
+}
+
+/// How an account trades, from its latest fills.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Style {
+    /// Orders (distinct order ids) a day over the fills' span.
+    pub orders_per_day: f64,
+    /// Share of its volume (%) from resting orders (maker), and in liquid perps.
+    pub maker_pct: f64,
+    pub liquid_pct: f64,
+    /// Closed PnL less fees over the fills, bp of their volume.
+    pub edge_bp: f64,
+}
+
+impl Style {
+    /// From `userFills` (spot fills left out); None without perp fills.
+    pub fn from_fills(fills: &[Value], liquid: &HashSet<String>) -> Option<Self> {
+        let perp: Vec<&Value> = fills.iter().filter(|f| !f["coin"].as_str().unwrap_or("@").starts_with('@')).collect();
+        let times: Vec<u64> = perp.iter().filter_map(|f| f["time"].as_u64()).collect();
+        let (first, last) = (*times.iter().min()?, *times.iter().max()?);
+        let days = ((last - first) as f64 / 86_400_000.0).max(1.0 / 24.0);
+        let ntl = |f: &&Value| num(&f["px"]) * num(&f["sz"]);
+        let vol: f64 = perp.iter().map(ntl).sum();
+        if vol <= 0.0 {
+            return None;
+        }
+        let orders: HashSet<u64> = perp.iter().filter_map(|f| f["oid"].as_u64()).collect();
+        let maker: f64 = perp.iter().filter(|f| f["crossed"] == false).map(ntl).sum();
+        let liq: f64 = perp.iter().filter(|f| f["coin"].as_str().is_some_and(|c| liquid.contains(c))).map(ntl).sum();
+        let edge: f64 = perp.iter().map(|f| num(&f["closedPnl"]) - num(&f["fee"])).sum();
+        Some(Self { orders_per_day: orders.len() as f64 / days, maker_pct: maker / vol * 100.0, liquid_pct: liq / vol * 100.0, edge_bp: edge / vol * 1e4 })
+    }
+
+    /// Why a copy could not follow it (None: it can).
+    pub fn not_copyable(&self) -> Option<&'static str> {
+        if self.orders_per_day > MAX_ORDERS_PER_DAY {
+            Some("high frequency")
+        } else if self.maker_pct >= MAKER_PCT && self.edge_bp < MIN_EDGE_BP {
+            Some("market maker")
+        } else if self.liquid_pct < MIN_LIQUID_PCT {
+            Some("illiquid markets")
+        } else {
+            None
+        }
+    }
 }
 
 /// The PnL from `a` to `b` and the capital it was made on: the value at `a`, or what was in by
@@ -165,7 +224,7 @@ pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64, kept:
     if weeks_down > if kept { KEEP_WEEKS_DOWN } else { MAX_WEEKS_DOWN } {
         return None;
     }
-    Some(Pick { address: address.to_string(), name, equity, pnl: months.iter().sum(), months, weeks_up, weeks_down })
+    Some(Pick { address: address.to_string(), name, equity, pnl: months.iter().sum(), months, weeks_up, weeks_down, style: None })
 }
 
 /// The picks of one day, kept so a restart does not work them out again.
@@ -192,12 +251,31 @@ pub async fn select(api: &Api, leaders: &[Leader], kept: &HashSet<String>, pause
     let names: std::collections::HashMap<&str, &Option<String>> = leaders.iter().map(|l| (l.address.as_str(), &l.name)).collect();
     cands.extend(kept.iter().filter(|a| !seen.contains(*a)).map(|a| (a.clone(), names.get(a.as_str()).cloned().cloned().flatten())));
     log!("selection: reading {} candidates' histories ({} on the list already)", cands.len(), kept.len());
+    let liquid: HashSet<String> = match api.meta().await {
+        Ok((_, ctx)) => ctx.into_iter().filter(|(_, c)| c.day_volume >= LIQUID_VOLUME).map(|(k, _)| k).collect(),
+        Err(e) => {
+            log!("selection: no coin volumes ({e}), every market counted liquid");
+            Default::default()
+        }
+    };
     let (mut picks, mut read) = (Vec::new(), 0);
+    let mut dropped: std::collections::HashMap<&str, usize> = Default::default();
     for (i, (address, name)) in cands.iter().enumerate() {
         match api.portfolio(address).await {
             Ok(h) => {
                 read += 1;
-                picks.extend(pick(address, name.clone(), &h, (exchange_now() * 1000.0) as u64, kept.contains(address)));
+                if let Some(mut p) = pick(address, name.clone(), &h, (exchange_now() * 1000.0) as u64, kept.contains(address)) {
+                    // How it trades: a copy has to be able to follow it.
+                    match api.fills(address).await.map(|f| Style::from_fills(&f, &liquid)) {
+                        Ok(Some(st)) if liquid.is_empty() || st.not_copyable().is_none() => {
+                            p.style = Some(st);
+                            picks.push(p);
+                        }
+                        Ok(Some(st)) => *dropped.entry(st.not_copyable().unwrap_or("")).or_default() += 1,
+                        Ok(None) => *dropped.entry("no perp fills").or_default() += 1,
+                        Err(e) => log!("selection: {} fills: {e}", &address[..10]),
+                    }
+                }
             }
             Err(e) => log!("selection: {}: {e}", &address[..10]),
         }
@@ -207,7 +285,7 @@ pub async fn select(api: &Api, leaders: &[Leader], kept: &HashSet<String>, pause
         tokio::time::sleep(std::time::Duration::from_secs_f64(pause_s)).await;
     }
     picks.sort_by(|a, b| b.pnl.total_cmp(&a.pnl));
-    log!("selection: {} of {read} picked", picks.len());
+    log!("selection: {} of {read} picked; dropped by how they trade: {dropped:?}", picks.len());
     Selection { at: crate::api::now(), read, picks }
 }
 
@@ -280,6 +358,26 @@ mod tests {
     }
 
     #[test]
+    fn style_from_fills() {
+        let f = |coin: &str, oid: u64, t: u64, crossed: bool, pnl: &str| json!({"coin": coin, "px": "100", "sz": "1", "oid": oid,
+            "time": t, "crossed": crossed, "closedPnl": pnl, "fee": "0.05"});
+        let liquid: HashSet<String> = ["BTC".to_string()].into();
+        // Over 2 days: 3 orders, one of them in 2 fills; $100 each fill, 1 of 4 resting; 3 of 4 in BTC; a spot fill.
+        let fills = vec![f("BTC", 1, 0, true, "0"), f("BTC", 1, 1, true, "0"), f("BTC", 2, DAY_MS, false, "3"),
+                         f("xyz:NVDA", 3, 2 * DAY_MS, true, "0"), f("@107", 9, 0, true, "100")];
+        let st = Style::from_fills(&fills, &liquid).unwrap();
+        assert!((st.orders_per_day - 1.5).abs() < 1e-9);
+        assert!((st.maker_pct - 25.0).abs() < 1e-9 && (st.liquid_pct - 75.0).abs() < 1e-9);
+        assert!((st.edge_bp - (3.0 - 0.2) / 400.0 * 1e4).abs() < 1e-9);
+        assert_eq!(st.not_copyable(), None);
+        assert_eq!(Style { orders_per_day: 500.0, ..st.clone() }.not_copyable(), Some("high frequency"));
+        assert_eq!(Style { maker_pct: 95.0, edge_bp: 5.0, ..st.clone() }.not_copyable(), Some("market maker"));
+        assert_eq!(Style { maker_pct: 95.0, edge_bp: 50.0, ..st.clone() }.not_copyable(), None);
+        assert_eq!(Style { liquid_pct: 50.0, ..st.clone() }.not_copyable(), Some("illiquid markets"));
+        assert!(Style::from_fills(&[f("@107", 9, 0, true, "0")], &liquid).is_none());
+    }
+
+    #[test]
     fn deposits_count_as_capital() {
         // $500 in until day 100, then $200k deposited: early weeks had under $1000 of capital.
         let mut h = history(|_| 1.0, 500.0);
@@ -304,7 +402,7 @@ mod tests {
     #[test]
     fn candidates_by_leaderboard() {
         let l = |av: f64, vlm: f64, month: f64, all: f64| Leader {
-            address: "x".into(), account_value: av, month_volume: vlm, month_pnl: month, all_pnl: all, name: None,
+            address: "x".into(), account_value: av, month_volume: vlm, month_pnl: month, all_pnl: all, week_pnl: 0.0, name: None,
         };
         let ls = [l(2e5, 1e6, 1.0, 1.0), l(5e4, 1e6, 1.0, 1.0), l(2e5, 1e6, -1.0, 1.0), l(2e5, 1e6, 1.0, -1.0), l(2e5, 1e4, 1.0, 1.0),
                   l(2e5, 1e8, 1.0, 1.0)];

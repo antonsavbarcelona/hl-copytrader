@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ";
 
 /// The tables `Store::insert` writes to.
-const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily"];
+const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks"];
 
 /// One-off changes to what is in the database, by name, oldest first.
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -363,6 +363,23 @@ const MIGRATIONS: &[(&str, &str)] = &[
           pnl_usd       float8      NOT NULL,
           equity_end    float8
       )"),
+    // Round 2: each account's trial week by week (`engine::verdict`).
+    ("2026-10-10-trader-weeks",
+     "CREATE TABLE IF NOT EXISTS trader_weeks (
+          id            bigserial   PRIMARY KEY,
+          run_id        text        NOT NULL,
+          address       text        NOT NULL,
+          week          integer     NOT NULL,
+          started_at    timestamptz NOT NULL,
+          ended_at      timestamptz NOT NULL,
+          their_pnl     float8,
+          our_pnl       float8      NOT NULL,
+          verdict       text        NOT NULL,
+          why           text        NOT NULL,
+          golden        boolean     NOT NULL,
+          losing_weeks  integer     NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

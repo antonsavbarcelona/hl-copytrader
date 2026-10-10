@@ -41,8 +41,9 @@ pub struct Leader {
     pub account_value: f64,
     pub month_volume: f64,
     pub month_pnl: f64,
-    /// PnL over its whole life.
+    /// PnL over its whole life, and over the last 7 days.
     pub all_pnl: f64,
+    pub week_pnl: f64,
     pub name: Option<String>,
 }
 
@@ -205,6 +206,12 @@ impl Api {
         })
     }
 
+    /// Its latest fills (up to 2000), perp and spot, raw.
+    pub async fn fills(&self, user: &str) -> Result<Vec<Value>> {
+        let v = self.info(json!({"type": "userFills", "user": user}), 20).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     /// Its PnL and account value histories (see `stable::History`).
     pub async fn portfolio(&self, user: &str) -> Result<crate::stable::History> {
         let v = self.info(json!({"type": "portfolio", "user": user}), 20).await?;
@@ -252,12 +259,14 @@ impl Api {
         let v: Value = self.http.get(LEADERBOARD).send().await?.json().await?;
         let mut out = Vec::new();
         for r in v["leaderboardRows"].as_array().cloned().unwrap_or_default() {
-            let (mut month, mut all_pnl) = ((0.0, 0.0), 0.0);
+            let (mut month, mut all_pnl, mut week_pnl) = ((0.0, 0.0), 0.0, 0.0);
             for w in r["windowPerformances"].as_array().cloned().unwrap_or_default() {
                 if w[0] == "month" {
                     month = (num(&w[1]["vlm"]), num(&w[1]["pnl"]));
                 } else if w[0] == "allTime" {
                     all_pnl = num(&w[1]["pnl"]);
+                } else if w[0] == "week" {
+                    week_pnl = num(&w[1]["pnl"]);
                 }
             }
             out.push(Leader {
@@ -266,6 +275,7 @@ impl Api {
                 month_volume: month.0,
                 month_pnl: month.1,
                 all_pnl,
+                week_pnl,
                 name: r["displayName"].as_str().map(str::to_string),
             });
         }

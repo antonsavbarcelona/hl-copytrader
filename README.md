@@ -12,7 +12,7 @@ target/release/hl-copytrader report --data data [--min-fills 10] [--top 30]
 ```
 
 `run` options: `--start 1000` (USD per copy account), `--risk 2` (% of equity each entry
-loses at our stop), `--stop 20` (% against our entry), `--max-positions 50` (over all copy accounts),
+loses at our stop), `--stop 20` (% against our entry), `--max-positions 50` (legs the live account holds at once),
 `--delay-ms 1000` (our order lands this long after the trader's fill reaches us),
 `--weight 400` (info API weight per minute; 1200 per IP shared with anything else).
 Needs Rust 1.85+. The running copy uses `data/bin/hl-copytrader.exe` so rebuilds are not
@@ -61,13 +61,21 @@ minute) is per IP, and the image takes 800 of it.
   stays on it unless it clearly got worse: its last month at a loss, a loss in over 6 weeks,
   or its perp account under $50k (read even if the leaderboard no longer makes it a
   candidate). An account that drops out stays followed while our copy holds positions.
-- **Golden list** (`src/engine.rs`): the accounts whose copy makes money. Each copy is measured
-  from its enrollment (copies from before the list: from the 2026-10-09 start); after 3 days
-  and 5 closed trips, it is golden while its PnL since is above zero; until then an account
-  keeps its place. The list started (migrations `2026-10-09-golden-seed`, `-seed-all`) with the
-  19 accounts that can be copied (swing traders on liquid coins, not market makers, HFT or
-  grids), 13 of them with copies at a profit on 2026-10-09. Worked out every 10 min; golden accounts are followed
-  even after they drop off the day's list.
+- **Round 1, how they trade**: of those, only the ones a copy can follow, from their latest
+  fills (up to 2000): not more than 300 orders a day, not a market maker (90%+ resting orders on
+  an edge under 20 bp), and 70%+ of their volume in perps traded $5M+ a day (the HIP-3 dexes,
+  not copied, count as not). On 2026-10-10: 78 of the 180 on the list (66 trade HIP-3 for 30%+).
+- **Round 2, the trial** (`src/engine.rs`, `verdict`): every account is copied on paper week by
+  week from its enrollment. At each week's end its PnL over the week (the leaderboard's) is set
+  against our copy's: both at a profit puts it on the golden list; it at a profit and us not
+  means it cannot be copied: rotated out (not followed for 30 days); both at a loss gives it
+  another week, a second one in a row a third only if it is still listed, else out. Golden
+  accounts are tried every week the same way. Each week is a row of `trader_weeks`.
+- **Golden list**: traded for real (see Live). It started (migrations `2026-10-09-golden-seed`,
+  `-seed-all`) with 19 accounts put on it by hand (swing traders on liquid coins whose copies
+  were followed for a day); from then on round 2 decides. Golden accounts are followed even
+  after they drop off the day's list. The paper copies have no cap on positions held (each is
+  its own account); the live account has (50 legs).
   Why: picked by one month's ROI (50%+, as before) the accounts did worse the next month than
   all accounts in 2 of 3 months checked (July-September 2026); picked this way, 69% / 50% / 68%
   were at a profit the next month against 54% / 57% / 51% of all. With a drawdown limit too
@@ -78,8 +86,7 @@ minute) is per IP, and the image takes 800 of it.
     stop loses 2% of our equity: 2% / 20% = a position of 10% of equity.
   - While it adds, we hold that size. As it reduces from its largest size in the position we
     reduce in proportion, and we close when it is flat.
-  - At most 50 positions open at once over all copy accounts: a new one beyond that is not
-    entered (`skipped` in the trader's state). Positions already open run their course.
+  - A rotated-out account's positions (round 2) are followed out, not into.
   - Our stop: 20% against our average entry (checked every 5 s at the book's mid), closed at
     the book; we stay out of that position until it is flat (`legs` in the state).
 - **Enrollment**: on its first fill we read its positions; the one that fill opened is
@@ -192,6 +199,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
+- `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /
+  again / out) and why (migration `2026-10-10-trader-weeks`).
 - `liq_touches`, `liq_trades`, `liq_daily`: the liquidation research (see above; migration
   `2026-10-09-liq-tables`).
 - `schema_migrations`: the one-off migrations applied (`MIGRATIONS` in `src/store.rs`);

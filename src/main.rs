@@ -83,7 +83,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         let (mut last, mut listed) = (0.0, std::collections::HashSet::new());
         if let Some(s) = selection {
             log!("selection: saved one of {:.1} h ago, {} traders", (api::now() - s.at) / 3600.0, s.picks.len());
-            last = s.at;
+            // A list from before round 1's look at how they trade is worked out again now.
+            last = if s.picks.iter().any(|p| p.style.is_some()) { s.at } else { s.at.min(api::now() - stable::EVERY_S) };
             listed = s.addresses();
             let _ = tx.send(engine::Msg::Selected(s));
         }

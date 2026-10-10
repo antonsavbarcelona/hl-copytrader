@@ -227,7 +227,7 @@ struct Sim {
 }
 
 /// `ts` (unix s) as an ISO 8601 UTC time, e.g. "2026-10-09T11:19:57.250Z".
-fn iso(ts: f64) -> String {
+pub fn iso(ts: f64) -> String {
     let secs = ts.floor() as i64;
     let ms = ((ts - secs as f64) * 1000.0).round() as i64;
     let (days, sod) = (secs.div_euclid(86400), secs.rem_euclid(86400));

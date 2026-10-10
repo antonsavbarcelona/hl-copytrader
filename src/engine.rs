@@ -6,8 +6,7 @@
 //!   - while it adds, we hold that size; as it reduces from its largest size in the position
 //!     we reduce in proportion, and we close when it is flat;
 //!   - at our stop we close and stay out of that position until it is flat;
-//!   - positions it held before we followed it are not entered, nor new ones while all our
-//!     copies together hold `max_positions` (50).
+//!   - positions it held before we followed it are not entered.
 //!
 //! Only the venue's mechanics are modelled beyond that:
 //!   - fills are taker fills on the live L2 book, `exec_delay_ms` after the account's fill
@@ -21,12 +20,17 @@
 //! each of its fills moves our copy. Its positions are read again every `reconcile_s` while it
 //! is active, to correct drift.
 //!
-//! Followed: the day's list (`stable`), the golden list, and any account our copy still holds
-//! a position of. The golden list is the accounts whose copy makes money: measured from its
-//! enrollment (or, for copies from before the list, from its first start), after
-//! `GOLDEN_MIN_DAYS` and `GOLDEN_MIN_TRIPS` closed trips, its copy's PnL above zero; until then
-//! an account keeps its place (the list started with the accounts put on it by hand, see the
-//! migrations). A golden account is followed even after it drops off the day's list.
+//! Followed: the day's list (`stable`: round 1, accounts that make money steadily and trade a
+//! way a copy can follow), the golden list, and any account our copy still holds a position of.
+//!
+//! Round 2, the trial: every account is copied on paper week by week from its enrollment, and
+//! at the end of each week its own PnL over it (the leaderboard's week) is set against our
+//! copy's (`verdict`): both at a profit puts it on the golden list (traded for real, `live`);
+//! it at a profit and us not means it cannot be copied: rotated out; both at a loss gives it
+//! another week, and a second one in a row a third only if it is still on the day's list, else
+//! it is rotated out. A golden account is tried on every week the same way. A rotated-out
+//! account is not followed (nor entered) for `REJECT_S`; each week's result is a row of
+//! `trader_weeks`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -73,36 +77,52 @@ pub struct Trader {
     /// Its positions we follow (coin -> leg).
     #[serde(default)]
     pub legs: HashMap<String, Leg>,
-    /// Where the golden list measures our copy from.
+    /// Its trial, week by week, and the golden list it is on when it passes.
     #[serde(default)]
-    pub base: Option<Base>,
+    pub trial: Trial,
     #[serde(default)]
     pub golden: bool,
-    /// Its entries not followed: our copies held `max_positions` already.
-    #[serde(default)]
-    pub skipped: u64,
 }
 
-/// Our copy when its measuring for the golden list began.
+/// An account's trial (round 2).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Base {
-    pub at: f64,
-    pub equity: f64,
-    /// Closed trips then.
-    pub trips: u64,
+pub struct Trial {
+    /// The week being tried: since when (0: not started), and our copy's equity then.
+    pub week_at: f64,
+    pub week_equity: f64,
+    /// Weeks tried, and the latest ones in a row with it and us both at a loss.
+    pub weeks: u32,
+    pub losing: u32,
+    /// Rotated out until then: not followed, its entries not copied.
+    pub rejected_until: f64,
 }
 
-/// The golden list: a copy measured this long, with this many trips closed since...
-const GOLDEN_MIN_DAYS: f64 = 3.0;
-const GOLDEN_MIN_TRIPS: u64 = 5;
+const WEEK_S: f64 = 7.0 * 86400.0;
+/// A rotated-out account is left alone this long, then tried again if it is listed.
+const REJECT_S: f64 = 30.0 * 86400.0;
 
-/// ... and at a profit since: its PnL since, and whether it is golden (until it is measured
-/// that long, it stays as it is: on the list if it was put there).
-fn measured(t: &Trader, equity: f64, at: f64) -> (f64, bool) {
-    let Some(b) = &t.base else { return (0.0, t.golden && !t.acct.liquidated) };
-    let pnl = equity - b.equity;
-    let long = at - b.at >= GOLDEN_MIN_DAYS * 86400.0 && t.stats.trips.saturating_sub(b.trips) >= GOLDEN_MIN_TRIPS;
-    (pnl, !t.acct.liquidated && if long { pnl > 0.0 } else { t.golden })
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Verdict {
+    Golden,
+    Again,
+    Out(&'static str),
+}
+
+/// A week's result: its PnL over the week (None: not on the leaderboard) and our copy's, the
+/// losing weeks in a row before it, and whether it is on the day's list. The verdict and the
+/// losing weeks in a row after it.
+fn verdict(theirs: Option<f64>, ours: f64, losing: u32, listed: bool) -> (Verdict, u32) {
+    match theirs {
+        None => (Verdict::Again, losing),
+        Some(t) if t > 0.0 && ours > 0.0 => (Verdict::Golden, 0),
+        Some(t) if t > 0.0 => (Verdict::Out("it made money, our copy did not"), 0),
+        Some(_) if ours > 0.0 => (Verdict::Again, 0),
+        Some(_) => match losing + 1 {
+            1 => (Verdict::Again, 1),
+            2 if listed => (Verdict::Again, 2),
+            n => (Verdict::Out("at a loss with our copy, week after week"), n),
+        },
+    }
 }
 
 /// Our side of one of its positions, from its entry until it is flat again.
@@ -267,7 +287,7 @@ impl Engine {
                 open_positions: t.acct.positions.len() as i32,
                 liquidated: t.acct.liquidated,
                 golden: t.golden,
-                measured_pnl: t.base.as_ref().map(|b| equity - b.equity).unwrap_or(0.0),
+                measured_pnl: if t.trial.week_at > 0.0 { equity - t.trial.week_equity } else { 0.0 },
                 state: serde_json::to_string(t).ok()?,
             })
         }).collect();
@@ -313,9 +333,12 @@ impl Engine {
         log!("selection: {n} traders followed ({} picked of {} read, the rest golden or holding our copies)", sel.picks.len(), sel.read);
     }
 
-    /// Follows the day's list, the golden list and the accounts our copy holds positions of.
+    /// Follows the day's list (less the rotated-out), the golden list and the accounts our copy
+    /// holds positions of.
     fn refollow(&mut self) -> usize {
-        let mut set = self.listed.clone();
+        let at = now();
+        let out = |a: &String| self.traders.get(a).is_some_and(|t| t.trial.rejected_until > at);
+        let mut set: HashSet<String> = self.listed.iter().filter(|a| !out(a)).cloned().collect();
         set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
         let n = set.len();
         *self.followed.write().unwrap() = set;
@@ -397,7 +420,7 @@ impl Engine {
             name: lb.as_ref().and_then(|l| l.name.clone()),
             enrolled_at: now(),
             acct: Account::new(start),
-            base: Some(Base { at: now(), equity: start, trips: 0 }),
+            trial: Trial { week_at: now(), week_equity: start, ..Default::default() },
             ..Default::default()
         });
         if equity <= 0.0 {
@@ -494,7 +517,6 @@ impl Engine {
         };
         // Our size for a position it enters: the stop away, it loses `risk_pct` of our equity.
         let full = (self.cfg.risk_pct / self.cfg.stop_pct * equity_now.max(0.0) / mid).max(0.0);
-        let open: usize = self.traders.values().filter(|t| !t.acct.liquidated).map(|t| t.acct.positions.len()).sum();
         let Some(t) = self.traders.get_mut(user) else { return };
         let ours = t.acct.size(coin);
         let theirs = t.theirs.get(coin).copied().unwrap_or(0.0);
@@ -502,11 +524,9 @@ impl Engine {
         // a copy without fills pending is the one its enrollment fill opened.
         let mut entry = why == "copy" && first.is_none_or(|p| (theirs - p.net) * theirs <= 1e-12);
         let opened = entry;
-        // At `max_positions` open over all copies, a new position is not entered (a flip of
-        // one we hold is).
-        if entry && ours == 0.0 && open >= self.cfg.max_positions && !t.legs.get(coin).is_some_and(|l| l.dir == theirs.signum()) {
+        // A rotated-out account: its positions are followed out, not into.
+        if t.trial.rejected_until > now() {
             entry = false;
-            t.skipped += 1;
         }
         let target = target(&mut t.legs, coin, theirs, ours, entry, full);
         // The live account follows its position on its own (golden accounts' entries).
@@ -611,10 +631,10 @@ impl Engine {
             }
             let equity = t.acct.equity(&marks);
             mark(t, &marks, equity);
-            // Copies from before the golden list are measured from now on (once every position
-            // has a price).
-            if t.base.is_none() && t.acct.positions.keys().all(|c| marks(c).is_some()) {
-                t.base = Some(Base { at: n, equity, trips: t.stats.trips });
+            // Copies from before the trials start theirs now (once every position has a price).
+            if t.trial.week_at == 0.0 && t.acct.positions.keys().all(|c| marks(c).is_some()) {
+                t.trial.week_at = n;
+                t.trial.week_equity = equity;
             }
             if !t.acct.positions.is_empty() && equity <= 0.0 {
                 liquidate.push(a.clone());
@@ -655,7 +675,7 @@ impl Engine {
     /// Every 10 min (120 ticks): the bot's health to `bot_status` — what it follows and holds,
     /// the API budget, and how long its ticks take (they run on the one loop the copies use).
     fn status(&mut self) {
-        let (golden, golden_pnl) = self.golden();
+        let (golden, golden_pnl, trying, rotated) = self.weeks();
         let l = std::mem::take(&mut self.load);
         let n = l.ticks.max(1) as f64;
         let (weight, backlog) = self.api.usage();
@@ -668,6 +688,8 @@ impl Engine {
             "selected": self.listed.len(),
             "golden": golden,
             "golden_pnl": r(golden_pnl, 2),
+            "in_trial": trying,
+            "rotated_out": rotated,
             "live": self.live.as_ref().map(|(_, s)| s.lock().unwrap().clone()),
             "open_positions": live.iter().map(|t| t.acct.positions.len()).sum::<usize>(),
             "copy_fills": self.traders.values().map(|t| t.copy_fills).sum::<u64>(),
@@ -681,33 +703,67 @@ impl Engine {
         self.store.status(st);
     }
 
-    /// Works out the golden list again (an event for each account that joins or leaves it) and
-    /// follows it: how many are on it and their copies' PnL since measured.
-    fn golden(&mut self) -> (usize, f64) {
+    /// Ends the weeks that are over (round 2, `verdict`: a row of `trader_weeks` and an event
+    /// each), starts a new trial for a rotated-out account whose time is up, and follows the
+    /// lists. Golden accounts and their copies' PnL this week; accounts in trial; rotated out.
+    fn weeks(&mut self) -> (usize, f64, usize, usize) {
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
         let at = now();
-        let (mut evs, mut n, mut sum) = (Vec::new(), 0, 0.0);
+        let (mut rows, mut golden, mut pnl, mut trying, mut rotated) = (Vec::new(), 0, 0.0, 0, 0);
         for (a, t) in self.traders.iter_mut() {
-            let (pnl, golden) = measured(t, t.acct.equity(&marks), at);
-            if golden != t.golden {
-                t.golden = golden;
-                let days = t.base.as_ref().map(|b| (at - b.at) / 86400.0).unwrap_or(0.0);
-                log!("golden: {} {} (PnL ${pnl:.2} over {days:.1} d)", &a[..10], if golden { "joins" } else { "leaves" });
-                evs.push(json!({"kind": "golden", "user": a, "golden": golden, "pnl": r(pnl, 4), "days": r(days, 2),
-                    "trips": t.stats.trips.saturating_sub(t.base.as_ref().map(|b| b.trips).unwrap_or(0))}));
+            if t.acct.liquidated {
+                t.golden = false;
+                continue;
             }
-            if golden {
-                n += 1;
-                sum += pnl;
+            let equity = t.acct.equity(&marks);
+            if t.trial.rejected_until > 0.0 && t.trial.rejected_until <= at {
+                t.trial = Trial { week_at: at, week_equity: equity, ..Default::default() };
+            }
+            if t.trial.rejected_until == 0.0 && t.trial.week_at > 0.0 && at - t.trial.week_at >= WEEK_S {
+                let theirs = self.leaders.get(a).map(|l| l.week_pnl);
+                let ours = equity - t.trial.week_equity;
+                let (v, losing) = verdict(theirs, ours, t.trial.losing, self.listed.contains(a));
+                t.trial.weeks += 1;
+                t.trial.losing = losing;
+                let why = match v {
+                    Verdict::Golden => {
+                        t.golden = true;
+                        "both at a profit"
+                    }
+                    Verdict::Again => "another week",
+                    Verdict::Out(why) => {
+                        t.golden = false;
+                        t.trial.rejected_until = at + REJECT_S;
+                        why
+                    }
+                };
+                log!("trial: {} week {} ({}): it ${:.0}, us ${ours:.2}: {why}", &a[..10], t.trial.weeks,
+                    match v { Verdict::Golden => "golden", Verdict::Again => "again", Verdict::Out(_) => "rotated out" }, theirs.unwrap_or(f64::NAN));
+                rows.push(json!({"address": a, "week": t.trial.weeks, "started_at": crate::liq::iso(t.trial.week_at), "ended_at": crate::liq::iso(at),
+                    "their_pnl": theirs, "our_pnl": ours, "verdict": match v { Verdict::Golden => "golden", Verdict::Again => "again", Verdict::Out(_) => "out" },
+                    "why": why, "golden": t.golden, "losing_weeks": losing}));
+                t.trial.week_at = at;
+                t.trial.week_equity = equity;
+            }
+            if t.trial.rejected_until > at {
+                rotated += 1;
+            } else if t.golden {
+                golden += 1;
+                pnl += equity - t.trial.week_equity;
+            } else {
+                trying += 1;
             }
         }
         drop(b);
-        for ev in evs {
+        for row in rows {
+            self.store.insert("trader_weeks", row.clone());
+            let mut ev = row;
+            ev["kind"] = json!("trial");
             self.write(ev);
         }
         self.refollow();
-        (n, sum)
+        (golden, pnl, trying, rotated)
     }
 
     /// Our stop: closes our position in `coin` at the book and stays out of its position.
@@ -804,25 +860,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn golden_after_days_and_trips_at_a_profit() {
-        let mut t = Trader { acct: Account::new(1000.0), base: Some(Base { at: 0.0, equity: 900.0, trips: 2 }), ..Default::default() };
-        t.stats.trips = 7;
-        let day = 86400.0;
-        assert_eq!(measured(&t, 950.0, 3.0 * day), (50.0, true));
-        // Too soon or too few trips: as it is (not golden, or golden if put on the list).
-        assert!(!measured(&t, 950.0, 2.9 * day).1);
-        t.stats.trips = 6;
-        assert!(!measured(&t, 950.0, 3.0 * day).1);
-        t.golden = true;
-        assert!(measured(&t, 850.0, 3.0 * day).1);
-        // Measured long enough: at a loss since, off; liquidated, off.
-        t.stats.trips = 7;
-        assert_eq!(measured(&t, 890.0, 3.0 * day), (-10.0, false));
-        t.acct.liquidated = true;
-        assert!(!measured(&t, 950.0, 3.0 * day).1);
-        t.acct.liquidated = false;
-        t.base = None;
-        assert_eq!(measured(&t, 950.0, 3.0 * day), (0.0, true));
+    fn a_week_s_verdict() {
+        use Verdict::*;
+        // Both at a profit: golden. It at a profit, us not: out.
+        assert_eq!(verdict(Some(100.0), 5.0, 1, false), (Golden, 0));
+        assert!(matches!(verdict(Some(100.0), -5.0, 0, true).0, Out(_)));
+        // Both at a loss: another week; a second in a row only if listed; a third, out.
+        assert_eq!(verdict(Some(-100.0), -5.0, 0, false), (Again, 1));
+        assert_eq!(verdict(Some(-100.0), -5.0, 1, true), (Again, 2));
+        assert!(matches!(verdict(Some(-100.0), -5.0, 1, false), (Out(_), 2)));
+        assert!(matches!(verdict(Some(-100.0), -5.0, 2, true), (Out(_), 3)));
+        // It at a loss, us not; or no week known: another week.
+        assert_eq!(verdict(Some(-100.0), 5.0, 1, false), (Again, 0));
+        assert_eq!(verdict(None, -5.0, 1, false), (Again, 1));
     }
 
     #[test]

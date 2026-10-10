@@ -363,7 +363,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
           pnl_usd       float8      NOT NULL,
           equity_end    float8
       )"),
-    // Round 2: each account's trial week by week (`engine::verdict`).
+    // Round 2: each account's trial week by week (`engine::verdict`), with its steadiness
+    // measures and how it trades when its copy made money.
     ("2026-10-10-trader-weeks",
      "CREATE TABLE IF NOT EXISTS trader_weeks (
           id            bigserial   PRIMARY KEY,
@@ -377,7 +378,17 @@ const MIGRATIONS: &[(&str, &str)] = &[
           verdict       text        NOT NULL,
           why           text        NOT NULL,
           golden        boolean     NOT NULL,
-          losing_weeks  integer     NOT NULL
+          losing_weeks  integer     NOT NULL,
+          steady        boolean,
+          perp_equity   float8,
+          months_pnl    jsonb,
+          weeks_up      integer,
+          weeks_down    integer,
+          orders_per_day float8,
+          maker_pct     float8,
+          liquid_pct    float8,
+          edge_bp       float8,
+          not_copyable  text
       );
       CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
 ];

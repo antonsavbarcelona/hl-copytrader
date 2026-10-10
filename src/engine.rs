@@ -20,17 +20,21 @@
 //! each of its fills moves our copy. Its positions are read again every `reconcile_s` while it
 //! is active, to correct drift.
 //!
-//! Followed: the day's list (`stable`: round 1, accounts that make money steadily and trade a
-//! way a copy can follow), the golden list, and any account our copy still holds a position of.
+//! Followed: round 1's list (`stable`: the large accounts that trade), the golden list, and any
+//! account our copy still holds a position of.
 //!
 //! Round 2, the trial: every account is copied on paper week by week from its enrollment, and
 //! at the end of each week its own PnL over it (the leaderboard's week) is set against our
-//! copy's (`verdict`): both at a profit puts it on the golden list (traded for real, `live`);
-//! it at a profit and us not means it cannot be copied: rotated out; both at a loss gives it
-//! another week, and a second one in a row a third only if it is still on the day's list, else
-//! it is rotated out. A golden account is tried on every week the same way. A rotated-out
-//! account is not followed (nor entered) for `REJECT_S`; each week's result is a row of
-//! `trader_weeks`.
+//! copy's (`verdict`). Our copy at a profit: its steadiness is measured (`stable::steadiness`,
+//! rule B): steady puts it on the golden list (traded for real, `live`), a lucky week rotates
+//! it out. It at a profit and our copy not: it cannot be copied, rotated out. Both at a loss:
+//! another week, and a second one in a row a third only if it is still on round 1's list,
+//! else it is rotated out. A golden account is tried on every week the same way (a profitable
+//! week keeps it on). A rotated-out account is not followed (nor entered) for `REJECT_S`; each
+//! week's result, with the measures, is a row of `trader_weeks`.
+//!
+//! Its fills (`their_fill`) and its set-up reads (`plan`) are kept for golden accounts only:
+//! for the thousands on trial they would be most of the database.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -103,26 +107,65 @@ const REJECT_S: f64 = 30.0 * 86400.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Verdict {
-    Golden,
+    /// Our copy made money: is it steady (`stable::steadiness`)?
+    Check,
     Again,
     Out(&'static str),
 }
 
 /// A week's result: its PnL over the week (None: not on the leaderboard) and our copy's, the
-/// losing weeks in a row before it, and whether it is on the day's list. The verdict and the
+/// losing weeks in a row before it, and whether it is on round 1's list. The verdict and the
 /// losing weeks in a row after it.
 fn verdict(theirs: Option<f64>, ours: f64, losing: u32, listed: bool) -> (Verdict, u32) {
     match theirs {
+        _ if ours > 0.0 => (Verdict::Check, 0),
         None => (Verdict::Again, losing),
-        Some(t) if t > 0.0 && ours > 0.0 => (Verdict::Golden, 0),
         Some(t) if t > 0.0 => (Verdict::Out("it made money, our copy did not"), 0),
-        Some(_) if ours > 0.0 => (Verdict::Again, 0),
         Some(_) => match losing + 1 {
             1 => (Verdict::Again, 1),
             2 if listed => (Verdict::Again, 2),
             n => (Verdict::Out("at a loss with our copy, week after week"), n),
         },
     }
+}
+
+/// All of the copies are saved this often (one is at once when something happens to it).
+const FULL_SAVE_S: f64 = 600.0;
+
+/// What changes when something happens to a copy (not its marks).
+fn fingerprint(t: &Trader) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (t.acct.fills, t.their_fills, t.read_ms, t.plan_read.to_bits(), t.golden, t.trial.weeks, t.trial.week_at.to_bits(),
+     t.trial.rejected_until.to_bits(), t.legs.len(), t.acct.liquidated, t.acct.funding.to_bits()).hash(&mut h);
+    h.finish()
+}
+
+/// A `trader_weeks` row with its verdict.
+fn week_row(mut row: serde_json::Value, verdict: &str, why: &str, golden: bool) -> serde_json::Value {
+    row["verdict"] = json!(verdict);
+    row["why"] = json!(why);
+    row["golden"] = json!(golden);
+    row
+}
+
+/// A `trader_weeks` row with the account's steadiness measures and how it trades.
+fn with_measures(mut row: serde_json::Value, st: &crate::stable::Steadiness) -> serde_json::Value {
+    row["steady"] = json!(st.steady);
+    if let Some(m) = &st.measure {
+        row["perp_equity"] = json!(m.equity);
+        row["months_pnl"] = json!(m.months);
+        row["weeks_up"] = json!(m.weeks_up);
+        row["weeks_down"] = json!(m.weeks_down);
+    }
+    if let Some(s) = &st.style {
+        row["orders_per_day"] = json!(s.orders_per_day);
+        row["maker_pct"] = json!(s.maker_pct);
+        row["liquid_pct"] = json!(s.liquid_pct);
+        row["edge_bp"] = json!(s.edge_bp);
+        row["not_copyable"] = json!(s.not_copyable());
+    }
+    row
 }
 
 /// Our side of one of its positions, from its entry until it is flat again.
@@ -176,8 +219,10 @@ pub enum Msg {
     /// Its positions' set-up and its stop / take-profit orders.
     Plan { user: String, state: anyhow::Result<(AccountState, Vec<Trigger>)> },
     Leaders(Vec<Leader>),
-    /// The day's list of traders to follow (`stable`).
+    /// Round 1's list of traders to follow (`stable`).
     Selected(crate::stable::Selection),
+    /// A week that ended with our copy at a profit, and the account's steadiness then.
+    Steady { user: String, row: serde_json::Value, result: anyhow::Result<crate::stable::Steadiness> },
     Funding(HashMap<String, CoinCtx>),
     Tick,
     /// Save and stop.
@@ -207,6 +252,9 @@ pub struct Engine {
     store: Store,
     read_limit: Arc<Semaphore>,
     dirty: bool,
+    /// Each copy's `fingerprint` when last saved, and when all were.
+    saved: HashMap<String, u64>,
+    full_saved: f64,
     /// Traders on the day's list (`stable`).
     listed: HashSet<String>,
     /// Time spent per tick since the last status line: ticks, total and longest (ms).
@@ -255,6 +303,8 @@ impl Engine {
             store,
             read_limit: Arc::new(Semaphore::new(4)),
             dirty: false,
+            saved: HashMap::new(),
+            full_saved: 0.0,
             listed: HashSet::new(),
             load: Load::default(),
             live: None,
@@ -273,10 +323,23 @@ impl Engine {
     }
 
     /// Hands every copy account (marked at the books' mids) to the store.
+    /// A copy is saved when something happened to it (a fill of its or ours, a read, a week's
+    /// end); all of them, marked at the books, every `FULL_SAVE_S` (thousands of copies: their
+    /// marks alone would be most of the database's writes).
     fn save(&mut self) {
+        let full = now() - self.full_saved >= FULL_SAVE_S;
+        if full {
+            self.full_saved = now();
+        }
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
+        let saved = &mut self.saved;
         let rows = self.traders.iter().filter_map(|(a, t)| {
+            let print = fingerprint(t);
+            if !full && saved.get(a) == Some(&print) {
+                return None;
+            }
+            saved.insert(a.clone(), print);
             let equity = t.acct.equity(&marks);
             Some(Row {
                 address: a.clone(),
@@ -306,9 +369,11 @@ impl Engine {
                 Msg::Plan { user, state } => self.on_plan(user, state),
                 Msg::Leaders(l) => self.on_leaders(l),
                 Msg::Selected(s) => self.on_selected(s),
+                Msg::Steady { user, row, result } => self.on_steady(user, row, result),
                 Msg::Funding(ctx) => self.on_funding(ctx),
                 Msg::Tick => self.on_tick(),
                 Msg::Shutdown => {
+                    self.full_saved = 0.0;
                     self.save();
                     self.store.flush().await;
                     log!("stopped, state saved");
@@ -361,11 +426,12 @@ impl Engine {
         if !self.coins.contains_key(&f.coin) {
             return;
         }
-        // Every fill of a followed account, as it reached us: its own activity.
-        let applied = self.traders.get(&f.user).is_some_and(|t| !t.acct.liquidated && f.time_ms > t.read_ms);
-        let pos_after = self.traders.get(&f.user).filter(|_| applied).map(|t| t.theirs.get(&f.coin).copied().unwrap_or(0.0) + f.delta);
-        self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
-            "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
+        // A golden account's every fill, as it reached us: its own activity.
+        if let Some(t) = self.traders.get(&f.user).filter(|t| t.golden && !t.acct.liquidated && f.time_ms > t.read_ms) {
+            let pos_after = t.theirs.get(&f.coin).copied().unwrap_or(0.0) + f.delta;
+            self.write(json!({"kind": "their_fill", "user": f.user, "coin": f.coin, "size": f.delta, "px": f.px,
+                "time_ms": f.time_ms, "tid": f.tid, "feed_s": r(f.recv - f.time_ms as f64 / 1000.0, 3), "pos_after": pos_after}));
+        }
         let Some(t) = self.traders.get_mut(&f.user) else {
             // First sight: read its positions; the position this fill opened is followed.
             self.enrolling.entry(f.user.clone()).or_insert((f.coin.clone(), f.delta));
@@ -453,7 +519,7 @@ impl Engine {
     /// after it enters (stops usually follow the entry), at most once a minute.
     fn read_plan(&mut self, user: &str) {
         let Some(t) = self.traders.get(user) else { return };
-        if t.trips.is_empty() || !self.planning.insert(user.to_string()) {
+        if !t.golden || t.trips.is_empty() || !self.planning.insert(user.to_string()) {
             return;
         }
         let at = (now() + PLAN_AFTER_S).max(t.plan_read + PLAN_EVERY_S);
@@ -710,7 +776,7 @@ impl Engine {
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
         let at = now();
-        let (mut rows, mut golden, mut pnl, mut trying, mut rotated) = (Vec::new(), 0, 0.0, 0, 0);
+        let (mut rows, mut checks, mut golden, mut pnl, mut trying, mut rotated) = (Vec::new(), Vec::new(), 0, 0.0, 0, 0);
         for (a, t) in self.traders.iter_mut() {
             if t.acct.liquidated {
                 t.golden = false;
@@ -726,23 +792,19 @@ impl Engine {
                 let (v, losing) = verdict(theirs, ours, t.trial.losing, self.listed.contains(a));
                 t.trial.weeks += 1;
                 t.trial.losing = losing;
-                let why = match v {
-                    Verdict::Golden => {
-                        t.golden = true;
-                        "both at a profit"
-                    }
-                    Verdict::Again => "another week",
+                let row = json!({"address": a, "week": t.trial.weeks, "started_at": crate::liq::iso(t.trial.week_at),
+                    "ended_at": crate::liq::iso(at), "their_pnl": theirs, "our_pnl": ours, "losing_weeks": losing});
+                match v {
+                    // Golden already: a profitable week keeps it on.
+                    Verdict::Check if t.golden => rows.push(week_row(row, "golden", "a profitable week on the golden list", true)),
+                    Verdict::Check => checks.push((a.clone(), row)),
+                    Verdict::Again => rows.push(week_row(row, "again", "another week", t.golden)),
                     Verdict::Out(why) => {
                         t.golden = false;
                         t.trial.rejected_until = at + REJECT_S;
-                        why
+                        rows.push(week_row(row, "out", why, false));
                     }
-                };
-                log!("trial: {} week {} ({}): it ${:.0}, us ${ours:.2}: {why}", &a[..10], t.trial.weeks,
-                    match v { Verdict::Golden => "golden", Verdict::Again => "again", Verdict::Out(_) => "rotated out" }, theirs.unwrap_or(f64::NAN));
-                rows.push(json!({"address": a, "week": t.trial.weeks, "started_at": crate::liq::iso(t.trial.week_at), "ended_at": crate::liq::iso(at),
-                    "their_pnl": theirs, "our_pnl": ours, "verdict": match v { Verdict::Golden => "golden", Verdict::Again => "again", Verdict::Out(_) => "out" },
-                    "why": why, "golden": t.golden, "losing_weeks": losing}));
+                }
                 t.trial.week_at = at;
                 t.trial.week_equity = equity;
             }
@@ -757,13 +819,49 @@ impl Engine {
         }
         drop(b);
         for row in rows {
-            self.store.insert("trader_weeks", row.clone());
-            let mut ev = row;
-            ev["kind"] = json!("trial");
-            self.write(ev);
+            self.week_done(row);
+        }
+        for (user, row) in checks {
+            let (api, tx) = (self.api.clone(), self.tx.clone());
+            tokio::spawn(async move {
+                let result = crate::stable::steadiness(&api, &user).await;
+                let _ = tx.send(Msg::Steady { user, row, result });
+            });
         }
         self.refollow();
         (golden, pnl, trying, rotated)
+    }
+
+    /// A week's result: a row of `trader_weeks`, an event, a log line.
+    fn week_done(&mut self, row: serde_json::Value) {
+        log!("trial: {} week {}: it {}, us {:.2}: {} ({})", &row["address"].as_str().unwrap_or("")[..10.min(row["address"].as_str().unwrap_or("").len())],
+            row["week"], row["their_pnl"], row["our_pnl"].as_f64().unwrap_or(0.0), row["verdict"], row["why"]);
+        self.store.insert("trader_weeks", row.clone());
+        let mut ev = row;
+        ev["kind"] = json!("trial");
+        self.write(ev);
+    }
+
+    /// A profitable week's steadiness check: steady puts it on the golden list, a lucky week
+    /// rotates it out; not read, it is tried another week.
+    fn on_steady(&mut self, user: String, row: serde_json::Value, result: anyhow::Result<crate::stable::Steadiness>) {
+        let Some(t) = self.traders.get_mut(&user) else { return };
+        let row = match result {
+            Ok(st) => {
+                let row = with_measures(row, &st);
+                if st.steady {
+                    t.golden = true;
+                    week_row(row, "golden", "our copy at a profit, and it is steady (rule B)", true)
+                } else {
+                    t.golden = false;
+                    t.trial.rejected_until = now() + REJECT_S;
+                    week_row(row, "out", "our copy at a profit, but not steady (rule B): a lucky week", false)
+                }
+            }
+            Err(e) => week_row(row, "again", &format!("steadiness not read ({e}): another week"), t.golden),
+        };
+        self.week_done(row);
+        self.refollow();
     }
 
     /// Our stop: closes our position in `coin` at the book and stays out of its position.
@@ -862,16 +960,17 @@ mod tests {
     #[test]
     fn a_week_s_verdict() {
         use Verdict::*;
-        // Both at a profit: golden. It at a profit, us not: out.
-        assert_eq!(verdict(Some(100.0), 5.0, 1, false), (Golden, 0));
+        // Our copy at a profit: check its steadiness (whatever it made). It at a profit, us not: out.
+        assert_eq!(verdict(Some(100.0), 5.0, 1, false), (Check, 0));
+        assert_eq!(verdict(Some(-100.0), 5.0, 1, false), (Check, 0));
+        assert_eq!(verdict(None, 5.0, 1, false), (Check, 0));
         assert!(matches!(verdict(Some(100.0), -5.0, 0, true).0, Out(_)));
         // Both at a loss: another week; a second in a row only if listed; a third, out.
         assert_eq!(verdict(Some(-100.0), -5.0, 0, false), (Again, 1));
         assert_eq!(verdict(Some(-100.0), -5.0, 1, true), (Again, 2));
         assert!(matches!(verdict(Some(-100.0), -5.0, 1, false), (Out(_), 2)));
         assert!(matches!(verdict(Some(-100.0), -5.0, 2, true), (Out(_), 3)));
-        // It at a loss, us not; or no week known: another week.
-        assert_eq!(verdict(Some(-100.0), 5.0, 1, false), (Again, 0));
+        // No week known for it, our copy not at a profit: another week.
         assert_eq!(verdict(None, -5.0, 1, false), (Again, 1));
     }
 

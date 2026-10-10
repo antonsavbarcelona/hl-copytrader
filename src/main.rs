@@ -76,19 +76,14 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             }
         });
     }
-    // Leaderboard now and every 6 h; from it, once a day, the traders to follow (the saved
-    // list until it is a day old).
+    // Leaderboard now and every 6 h: round 1 from it (the saved list until then), and the
+    // larger accounts for the liquidation research.
     {
         let (api, tx, cfg) = (api.clone(), tx.clone(), cfg.clone());
-        let (mut last, mut listed) = (0.0, std::collections::HashSet::new());
         if let Some(s) = selection {
             log!("selection: saved one of {:.1} h ago, {} traders", (api::now() - s.at) / 3600.0, s.picks.len());
-            // A list from before round 1's look at how they trade is worked out again now.
-            last = if s.picks.iter().any(|p| p.style.is_some()) { s.at } else { s.at.min(api::now() - stable::EVERY_S) };
-            listed = s.addresses();
             let _ = tx.send(engine::Msg::Selected(s));
         }
-        // The liquidation research reads the larger accounts' positions (`liq`).
         let (acc_tx, acc_rx) = tokio::sync::watch::channel(Vec::new());
         liq::spawn(api.clone(), books.clone(), acc_rx, store_liq, cfg.clone());
         tokio::spawn(async move {
@@ -99,16 +94,13 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
                         let mut big: Vec<&api::Leader> = l.iter().filter(|x| x.account_value >= liq::MIN_ACCOUNT).collect();
                         big.sort_by(|a, b| b.account_value.total_cmp(&a.account_value));
                         let _ = acc_tx.send(big.into_iter().map(|x| x.address.clone()).collect());
-                        if api::now() - last >= stable::EVERY_S {
-                            let pause = if last > 0.0 { stable::PAUSE_S } else { 0.0 };
-                            let s = stable::select(&api, &l, &listed, pause).await;
-                            (last, listed) = (s.at, s.addresses());
-                            if let Err(e) = store::save_selection(&cfg, &s).await {
-                                log!("selection: not saved: {e:#}");
-                            }
-                            let _ = tx.send(engine::Msg::Selected(s));
+                        let s = stable::round1(&l);
+                        log!("selection: round 1, {} of {} leaderboard accounts", s.picks.len(), s.read);
+                        if let Err(e) = store::save_selection(&cfg, &s).await {
+                            log!("selection: not saved: {e:#}");
                         }
-                        (6.0 * 3600.0f64).min(last + stable::EVERY_S - api::now()).max(60.0)
+                        let _ = tx.send(engine::Msg::Selected(s));
+                        6.0 * 3600.0
                     }
                     Err(e) => {
                         log!("leaderboard read failed: {e}");

@@ -1,29 +1,16 @@
-//! Who is followed: traders who make money steadily, picked once a day.
+//! Who is followed, and how an account's steadiness is measured.
 //!
-//! Candidates come from the leaderboard: an account of `MIN_EQUITY`+ (spot and vaults counted),
-//! at a profit this month and over all time, trading `MIN_TURNOVER`..`MAX_TURNOVER` times its
-//! equity a month (not idle; not a market maker, whose edge is the spread and rebates a copy
-//! cannot get). Each one's perp PnL history (`portfolio`) then has to show, over the last 90
-//! days:
-//!   - a profit in each of the 3 months (30 days each), and
-//!   - a loss in at most `MAX_WEEKS_DOWN` of the last 12 weeks (a week without a trade is
-//!     neither),
+//! Round 1 (`round1`, from the leaderboard at every read of it): the large accounts that trade:
+//! `ROUND1_EQUITY`+ (spot and vaults counted) and `MIN_TURNOVER`..`MAX_TURNOVER` times it traded
+//! in the last month (not idle; not a pure market maker). No more than that: whether a copy of
+//! it makes money is round 2's question (`engine`, a week on paper each).
 //!
-//! with its perp account still `MIN_EQUITY`+. On the history (picked this way in July, August,
-//! September; the next month): 69%, 50%, 68% of the picks at a profit, against 54%, 57%, 51%
-//! of all accounts; no drawdown limit, so high-leverage accounts are in too (see the README).
-//!
-//! Then how it trades, from its latest fills (`userFills`, up to 2000: `Style`): it has to be
-//! one a copy can follow, not a market maker or a high-frequency trader (more than
-//! `MAX_ORDERS_PER_DAY` orders a day, or `MAKER_PCT`%+ of its volume resting orders on a thin
-//! edge under `MIN_EDGE_BP`: their edge is the spread and rebates, not the direction), and
-//! trading mostly liquid markets (`MIN_LIQUID_PCT`% of its volume in perps traded
-//! `LIQUID_VOLUME`+ a day; the HIP-3 dexes, not copied, count as not).
-//!
-//! An account on the day before's list stays unless it clearly got worse: its last month at
-//! a loss, a loss in over `KEEP_WEEKS_DOWN` weeks, or its perp account under `KEEP_EQUITY` (one
-//! week moving across the line, or money taken out for a while, does not drop it). It is
-//! read even when the leaderboard no longer makes it a candidate.
+//! Steadiness (`steadiness`), measured when a week of round 2 ends with our copy at a profit, to
+//! tell a steady trader from a lucky week: rule B on its perp PnL history (`portfolio`) over the
+//! last 90 days: a profit in each of the 3 months (30 days each), a loss in at most
+//! `MAX_WEEKS_DOWN` of the last 12 weeks (a week without a trade is neither), its perp account
+//! still `STEADY_EQUITY`+. Kept with it, for the analysis: how it trades, from its latest fills
+//! (`Style`: orders a day, resting share, liquid share, edge).
 
 use std::collections::HashSet;
 
@@ -31,16 +18,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::{Api, Leader, exchange_now, num};
-use crate::log;
 
-pub const MIN_EQUITY: f64 = 100_000.0;
+
+/// Round 1: accounts of this much (USD) and more...
+pub const ROUND1_EQUITY: f64 = 250_000.0;
+/// ... that traded this many times it in the last month.
 const MIN_TURNOVER: f64 = 0.5;
 const MAX_TURNOVER: f64 = 200.0;
 const MONTHS: u64 = 3;
 const WEEKS: u64 = 12;
 const MAX_WEEKS_DOWN: u32 = 4;
-const KEEP_WEEKS_DOWN: u32 = 6;
-const KEEP_EQUITY: f64 = 50_000.0;
+const STEADY_EQUITY: f64 = 100_000.0;
 const MAX_ORDERS_PER_DAY: f64 = 300.0;
 const MAKER_PCT: f64 = 90.0;
 const MIN_EDGE_BP: f64 = 20.0;
@@ -48,21 +36,19 @@ const MIN_LIQUID_PCT: f64 = 70.0;
 pub const LIQUID_VOLUME: f64 = 5_000_000.0;
 /// A period's capital under this (USD) does not count: the account was funded later.
 const MIN_BASE: f64 = 1000.0;
-/// The list is worked out again this often...
-pub const EVERY_S: f64 = 24.0 * 3600.0;
-/// ... one history read at a time with this pause between (s), so the copies' own reads keep
-/// most of the API budget (thousands of candidates: a few hours). None when there is no list
-/// yet: nothing is copied, so nothing to leave the budget to.
-pub const PAUSE_S: f64 = 1.5;
-
 const DAY_MS: u64 = 86_400_000;
 
-/// The leaderboard accounts worth reading the history of.
-pub fn candidates(leaders: &[Leader]) -> Vec<&Leader> {
-    leaders.iter().filter(|l| {
+/// Round 1: the leaderboard's large accounts that trade, largest first.
+pub fn round1(leaders: &[Leader]) -> Selection {
+    let mut picks: Vec<Pick> = leaders.iter().filter(|l| {
         let turnover = if l.account_value > 0.0 { l.month_volume / l.account_value } else { 0.0 };
-        l.account_value >= MIN_EQUITY && l.month_pnl > 0.0 && l.all_pnl > 0.0 && (MIN_TURNOVER..=MAX_TURNOVER).contains(&turnover)
-    }).collect()
+        l.account_value >= ROUND1_EQUITY && (MIN_TURNOVER..=MAX_TURNOVER).contains(&turnover)
+    }).map(|l| Pick {
+        address: l.address.clone(), name: l.name.clone(), equity: l.account_value, months: Vec::new(), pnl: l.month_pnl,
+        weeks_up: 0, weeks_down: 0, style: None,
+    }).collect();
+    picks.sort_by(|a, b| b.equity.total_cmp(&a.equity));
+    Selection { at: crate::api::now(), read: leaders.len(), picks }
 }
 
 /// (unix ms, USD) points.
@@ -187,9 +173,18 @@ fn period(h: &History, a: u64, b: u64) -> Option<(f64, f64)> {
     Some((p, at(&h.value, a)?.max(at(&h.value, b)? - p)))
 }
 
-/// `h` as of `now_ms` by the rule (see the module; `kept`: it is on the list already): its
-/// pick, or None.
-pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64, kept: bool) -> Option<Pick> {
+/// Its PnL history measured as of `now_ms`: perp account value, each month's PnL (oldest
+/// first), weeks up and down of the last 12. None if the history does not cover 90 days, has
+/// stopped, or a week had under `MIN_BASE` in.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Measure {
+    pub equity: f64,
+    pub months: Vec<f64>,
+    pub weeks_up: u32,
+    pub weeks_down: u32,
+}
+
+pub fn measure(h: &History, now_ms: u64) -> Option<Measure> {
     let last = h.pnl.last()?.0.min(h.value.last()?.0);
     if last + 2 * DAY_MS < now_ms {
         return None;
@@ -200,17 +195,9 @@ pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64, kept:
         return None;
     }
     let equity = at(&h.value, now)?;
-    if equity < if kept { KEEP_EQUITY } else { MIN_EQUITY } {
-        return None;
-    }
     let mut months = Vec::new();
     for k in (1..=MONTHS).rev() {
-        let (p, _) = period(h, now - k * 30 * DAY_MS, now - (k - 1) * 30 * DAY_MS)?;
-        // Kept: only the last month has to be at a profit.
-        if p <= 0.0 && (!kept || k == 1) {
-            return None;
-        }
-        months.push(p);
+        months.push(period(h, now - k * 30 * DAY_MS, now - (k - 1) * 30 * DAY_MS)?.0);
     }
     let (mut weeks_up, mut weeks_down) = (0, 0);
     for k in (1..=WEEKS).rev() {
@@ -221,10 +208,14 @@ pub fn pick(address: &str, name: Option<String>, h: &History, now_ms: u64, kept:
         weeks_up += u32::from(p > 0.0);
         weeks_down += u32::from(p < 0.0);
     }
-    if weeks_down > if kept { KEEP_WEEKS_DOWN } else { MAX_WEEKS_DOWN } {
-        return None;
+    Some(Measure { equity, months, weeks_up, weeks_down })
+}
+
+impl Measure {
+    /// Rule B: steady, not a lucky stretch.
+    pub fn steady(&self) -> bool {
+        self.equity >= STEADY_EQUITY && self.months.iter().all(|&m| m > 0.0) && self.weeks_down <= MAX_WEEKS_DOWN
     }
-    Some(Pick { address: address.to_string(), name, equity, pnl: months.iter().sum(), months, weeks_up, weeks_down, style: None })
 }
 
 /// The picks of one day, kept so a restart does not work them out again.
@@ -243,50 +234,20 @@ impl Selection {
     }
 }
 
-/// Reads every candidate's history (and that of each one on the list already, `kept`),
-/// `pause_s` apart, and picks by the rule.
-pub async fn select(api: &Api, leaders: &[Leader], kept: &HashSet<String>, pause_s: f64) -> Selection {
-    let mut cands: Vec<(String, Option<String>)> = candidates(leaders).into_iter().map(|l| (l.address.clone(), l.name.clone())).collect();
-    let seen: HashSet<String> = cands.iter().map(|c| c.0.clone()).collect();
-    let names: std::collections::HashMap<&str, &Option<String>> = leaders.iter().map(|l| (l.address.as_str(), &l.name)).collect();
-    cands.extend(kept.iter().filter(|a| !seen.contains(*a)).map(|a| (a.clone(), names.get(a.as_str()).cloned().cloned().flatten())));
-    log!("selection: reading {} candidates' histories ({} on the list already)", cands.len(), kept.len());
-    let liquid: HashSet<String> = match api.meta().await {
-        Ok((_, ctx)) => ctx.into_iter().filter(|(_, c)| c.day_volume >= LIQUID_VOLUME).map(|(k, _)| k).collect(),
-        Err(e) => {
-            log!("selection: no coin volumes ({e}), every market counted liquid");
-            Default::default()
-        }
-    };
-    let (mut picks, mut read) = (Vec::new(), 0);
-    let mut dropped: std::collections::HashMap<&str, usize> = Default::default();
-    for (i, (address, name)) in cands.iter().enumerate() {
-        match api.portfolio(address).await {
-            Ok(h) => {
-                read += 1;
-                if let Some(mut p) = pick(address, name.clone(), &h, (exchange_now() * 1000.0) as u64, kept.contains(address)) {
-                    // How it trades: a copy has to be able to follow it.
-                    match api.fills(address).await.map(|f| Style::from_fills(&f, &liquid)) {
-                        Ok(Some(st)) if liquid.is_empty() || st.not_copyable().is_none() => {
-                            p.style = Some(st);
-                            picks.push(p);
-                        }
-                        Ok(Some(st)) => *dropped.entry(st.not_copyable().unwrap_or("")).or_default() += 1,
-                        Ok(None) => *dropped.entry("no perp fills").or_default() += 1,
-                        Err(e) => log!("selection: {} fills: {e}", &address[..10]),
-                    }
-                }
-            }
-            Err(e) => log!("selection: {}: {e}", &address[..10]),
-        }
-        if (i + 1) % 500 == 0 {
-            log!("selection: {} of {} read, {} picked so far", i + 1, cands.len(), picks.len());
-        }
-        tokio::time::sleep(std::time::Duration::from_secs_f64(pause_s)).await;
-    }
-    picks.sort_by(|a, b| b.pnl.total_cmp(&a.pnl));
-    log!("selection: {} of {read} picked; dropped by how they trade: {dropped:?}", picks.len());
-    Selection { at: crate::api::now(), read, picks }
+/// An account's steadiness now (see the module): rule B on its history (`measure` None: the
+/// history does not cover it, so not steady), and how it trades.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Steadiness {
+    pub steady: bool,
+    pub measure: Option<Measure>,
+    pub style: Option<Style>,
+}
+
+pub async fn steadiness(api: &Api, address: &str) -> anyhow::Result<Steadiness> {
+    let m = measure(&api.portfolio(address).await?, (exchange_now() * 1000.0) as u64);
+    let liquid: HashSet<String> = api.meta().await?.1.into_iter().filter(|(_, c)| c.day_volume >= LIQUID_VOLUME).map(|(k, _)| k).collect();
+    let style = Style::from_fills(&api.fills(address).await?, &liquid);
+    Ok(Steadiness { steady: m.as_ref().is_some_and(Measure::steady), measure: m, style })
 }
 
 #[cfg(test)]
@@ -307,74 +268,40 @@ mod tests {
     #[test]
     fn steady_profit_is_picked() {
         let now = 120 * DAY_MS;
-        let p = pick("a", None, &history(|_| 100.0, 200_000.0), now, false).unwrap();
+        let p = measure(&history(|_| 100.0, 200_000.0), now).filter(Measure::steady).unwrap();
         assert_eq!(p.weeks_up, 12);
         assert_eq!(p.months.len(), 3);
-        assert!((p.pnl - 9000.0).abs() < 1e-6 && p.months.iter().all(|m| (m - 3000.0).abs() < 1e-6));
+        assert!((p.months.iter().sum::<f64>() - 9000.0).abs() < 1e-6 && p.months.iter().all(|m| (m - 3000.0).abs() < 1e-6));
         // Too small an account.
-        assert!(pick("a", None, &history(|_| 100.0, 50_000.0), now, false).is_none());
+        assert!(measure(&history(|_| 100.0, 50_000.0), now).filter(Measure::steady).is_none());
         // Not 90 days of history.
         let mut h = history(|_| 100.0, 200_000.0);
         h.pnl.retain(|x| x.0 >= 40 * DAY_MS);
-        assert!(pick("a", None, &h, now, false).is_none());
+        assert!(measure(&h, now).filter(Measure::steady).is_none());
         // A history that stopped a week ago.
-        assert!(pick("a", None, &history(|_| 100.0, 200_000.0), now + 7 * DAY_MS, false).is_none());
+        assert!(measure(&history(|_| 100.0, 200_000.0), now + 7 * DAY_MS).filter(Measure::steady).is_none());
     }
 
     #[test]
     fn a_losing_month_or_too_few_good_weeks() {
         let now = 120 * DAY_MS;
         // The middle month (days 60-90) at a loss.
-        assert!(pick("a", None, &history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5), now, false).is_none());
+        assert!(measure(&history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5), now).filter(Measure::steady).is_none());
         // Every month up, but only every other week (counted back from now, day 120): 6 of 12.
         let h = history(|d| if ((120 - d) / 7) % 2 == 0 { 300.0 } else { -100.0 }, 2e5);
         let weeks: u32 = (1..=12).map(|k| u32::from(period(&h, now - k * 7 * DAY_MS, now - (k - 1) * 7 * DAY_MS).unwrap().0 > 0.0)).sum();
         assert_eq!(weeks, 6);
         let months: Vec<f64> = (1..=3).map(|k| period(&h, now - k * 30 * DAY_MS, now - (k - 1) * 30 * DAY_MS).unwrap().0).collect();
         assert!(months.iter().all(|&m| m > 0.0));
-        assert!(pick("a", None, &h, now, false).is_none());
+        assert!(measure(&h, now).filter(Measure::steady).is_none());
     }
 
     #[test]
     fn idle_weeks_are_no_loss() {
         // Three weeks without a trade (counted back from day 120: days 79-99).
         let h = history(|d| if (79..=99).contains(&d) { 0.0 } else { 100.0 }, 2e5);
-        let p = pick("a", None, &h, 120 * DAY_MS, false).unwrap();
+        let p = measure(&h, 120 * DAY_MS).filter(Measure::steady).unwrap();
         assert_eq!((p.weeks_up, p.weeks_down), (9, 0));
-    }
-
-    #[test]
-    fn kept_until_clearly_worse() {
-        let now = 120 * DAY_MS;
-        // A losing middle month, $50k left, 6 losing weeks: dropped if new, kept if on the list.
-        let mid = history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5);
-        assert!(pick("a", None, &mid, now, true).is_some());
-        assert!(pick("a", None, &history(|_| 100.0, 50_000.0), now, true).is_some());
-        let alt = history(|d| if ((120 - d) / 7) % 2 == 0 { 300.0 } else { -100.0 }, 2e5);
-        assert!(pick("a", None, &alt, now, true).is_some());
-        // The last month at a loss drops it; so does a smaller account.
-        assert!(pick("a", None, &history(|d| if d > 90 { -50.0 } else { 100.0 }, 2e5), now, true).is_none());
-        assert!(pick("a", None, &history(|_| 100.0, 40_000.0), now, true).is_none());
-    }
-
-    #[test]
-    fn style_from_fills() {
-        let f = |coin: &str, oid: u64, t: u64, crossed: bool, pnl: &str| json!({"coin": coin, "px": "100", "sz": "1", "oid": oid,
-            "time": t, "crossed": crossed, "closedPnl": pnl, "fee": "0.05"});
-        let liquid: HashSet<String> = ["BTC".to_string()].into();
-        // Over 2 days: 3 orders, one of them in 2 fills; $100 each fill, 1 of 4 resting; 3 of 4 in BTC; a spot fill.
-        let fills = vec![f("BTC", 1, 0, true, "0"), f("BTC", 1, 1, true, "0"), f("BTC", 2, DAY_MS, false, "3"),
-                         f("xyz:NVDA", 3, 2 * DAY_MS, true, "0"), f("@107", 9, 0, true, "100")];
-        let st = Style::from_fills(&fills, &liquid).unwrap();
-        assert!((st.orders_per_day - 1.5).abs() < 1e-9);
-        assert!((st.maker_pct - 25.0).abs() < 1e-9 && (st.liquid_pct - 75.0).abs() < 1e-9);
-        assert!((st.edge_bp - (3.0 - 0.2) / 400.0 * 1e4).abs() < 1e-9);
-        assert_eq!(st.not_copyable(), None);
-        assert_eq!(Style { orders_per_day: 500.0, ..st.clone() }.not_copyable(), Some("high frequency"));
-        assert_eq!(Style { maker_pct: 95.0, edge_bp: 5.0, ..st.clone() }.not_copyable(), Some("market maker"));
-        assert_eq!(Style { maker_pct: 95.0, edge_bp: 50.0, ..st.clone() }.not_copyable(), None);
-        assert_eq!(Style { liquid_pct: 50.0, ..st.clone() }.not_copyable(), Some("illiquid markets"));
-        assert!(Style::from_fills(&[f("@107", 9, 0, true, "0")], &liquid).is_none());
     }
 
     #[test]
@@ -384,7 +311,7 @@ mod tests {
         for x in h.value.iter_mut().filter(|x| x.0 >= 100 * DAY_MS) {
             x.1 = 200_000.0;
         }
-        assert!(pick("a", None, &h, 120 * DAY_MS, false).is_none());
+        assert!(measure(&h, 120 * DAY_MS).filter(Measure::steady).is_none());
     }
 
     #[test]
@@ -400,12 +327,25 @@ mod tests {
     }
 
     #[test]
-    fn candidates_by_leaderboard() {
-        let l = |av: f64, vlm: f64, month: f64, all: f64| Leader {
-            address: "x".into(), account_value: av, month_volume: vlm, month_pnl: month, all_pnl: all, week_pnl: 0.0, name: None,
+    fn round1_by_leaderboard() {
+        let l = |av: f64, vlm: f64| Leader {
+            address: format!("{av}"), account_value: av, month_volume: vlm, month_pnl: -1.0, week_pnl: 0.0, name: None,
         };
-        let ls = [l(2e5, 1e6, 1.0, 1.0), l(5e4, 1e6, 1.0, 1.0), l(2e5, 1e6, -1.0, 1.0), l(2e5, 1e6, 1.0, -1.0), l(2e5, 1e4, 1.0, 1.0),
-                  l(2e5, 1e8, 1.0, 1.0)];
-        assert_eq!(candidates(&ls).len(), 1);
+        // Large and trading (at a loss too): in; small, idle, or churning 300x: out.
+        let ls = [l(3e5, 1e6), l(1e6, 6e5), l(2e5, 1e6), l(3e5, 1e4), l(3e5, 1e8)];
+        let s = round1(&ls);
+        assert_eq!(s.picks.iter().map(|p| p.address.as_str()).collect::<Vec<_>>(), vec!["1000000", "300000"]);
+        assert_eq!(s.read, 5);
+    }
+
+    #[test]
+    fn steady_by_rule_b() {
+        let now = 120 * DAY_MS;
+        let m = measure(&history(|_| 100.0, 200_000.0), now).unwrap();
+        assert!(m.steady() && m.months.len() == 3 && m.weeks_up == 12);
+        // A losing month, or too small an account: measured, not steady.
+        let m = measure(&history(|d| if (61..=90).contains(&d) { -50.0 } else { 100.0 }, 2e5), now).unwrap();
+        assert!(!m.steady() && m.months[1] < 0.0);
+        assert!(!measure(&history(|_| 100.0, 50_000.0), now).unwrap().steady());
     }
 }

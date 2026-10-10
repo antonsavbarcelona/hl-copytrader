@@ -51,35 +51,33 @@ minute) is per IP, and the image takes 800 of it.
 
 ## What is copied
 
-- **Who** (`src/stable.rs`): once a day, from the official leaderboard
-  (`stats-data.hyperliquid.xyz/Mainnet/leaderboard`), the accounts of $100k+ at a profit this
-  month and over all time that trade 0.5-200x their equity a month (~3.7k on 2026-10-07); of
-  those, the ones whose perp PnL history (`portfolio`) shows a profit in each of the last 3
-  months (30 days each) and a loss in at most 4 of the last 12 weeks (a week without a trade
-  counts as neither; 139 on 2026-10-07). Read one at a time with pauses (a few hours); the
-  list is saved (`selection`) so a restart within the day keeps it. An account on the list
-  stays on it unless it clearly got worse: its last month at a loss, a loss in over 6 weeks,
-  or its perp account under $50k (read even if the leaderboard no longer makes it a
-  candidate). An account that drops out stays followed while our copy holds positions.
-- **Round 1, how they trade**: of those, only the ones a copy can follow, from their latest
-  fills (up to 2000): not more than 300 orders a day, not a market maker (90%+ resting orders on
-  an edge under 20 bp), and 70%+ of their volume in perps traded $5M+ a day (the HIP-3 dexes,
-  not copied, count as not). On 2026-10-10: 78 of the 180 on the list (66 trade HIP-3 for 30%+).
+- **Round 1, who** (`src/stable.rs`, at every read of the official leaderboard,
+  `stats-data.hyperliquid.xyz/Mainnet/leaderboard`, every 6 h): the large accounts that trade:
+  $250k+ (spot and vaults counted) and 0.5-200x that traded in the last month (~3k on
+  2026-10-10). Nothing more: whether a copy of it makes money is round 2's question. Saved
+  (`selection`) so a restart keeps it until the next read.
 - **Round 2, the trial** (`src/engine.rs`, `verdict`): every account is copied on paper week by
-  week from its enrollment. At each week's end its PnL over the week (the leaderboard's) is set
-  against our copy's: both at a profit puts it on the golden list; it at a profit and us not
-  means it cannot be copied: rotated out (not followed for 30 days); both at a loss gives it
-  another week, a second one in a row a third only if it is still listed, else out. Golden
-  accounts are tried every week the same way. Each week is a row of `trader_weeks`.
+  week from its enrollment, and at each week's end its PnL over the week (the leaderboard's)
+  is set against our copy's:
+  - our copy at a profit: its steadiness is measured (`stable::steadiness`), rule B on its perp
+    PnL history: a profit in each of the last 3 months, a loss in at most 4 of the last 12
+    weeks, $100k+ in perps. Steady: on the golden list. Not: a lucky week, rotated out;
+  - it at a profit and our copy not: it cannot be copied, rotated out;
+  - both at a loss: another week; a second in a row a third only if it is still on round 1's
+    list, else rotated out.
+
+  Rotated out: not followed nor entered for 30 days. Golden accounts are tried every week the
+  same way (a profitable week keeps them on). Each week is a row of `trader_weeks`, with rule
+  B's measures and how it trades (orders a day, resting share, liquid share, edge) when the
+  copy made money: for the analysis.
+  Why not rule B up front: on July-September 2026 picking by it (3 months up, 60%+ weeks up)
+  did no better the next month than looser rules, nor clearly better than all large accounts;
+  whether we can copy an account at a profit is what decides.
 - **Golden list**: traded for real (see Live). It started (migrations `2026-10-09-golden-seed`,
-  `-seed-all`) with 19 accounts put on it by hand (swing traders on liquid coins whose copies
-  were followed for a day); from then on round 2 decides. Golden accounts are followed even
-  after they drop off the day's list. The paper copies have no cap on positions held (each is
-  its own account); the live account has (50 legs).
-  Why: picked by one month's ROI (50%+, as before) the accounts did worse the next month than
-  all accounts in 2 of 3 months checked (July-September 2026); picked this way, 69% / 50% / 68%
-  were at a profit the next month against 54% / 57% / 51% of all. With a drawdown limit too
-  (20%) it was 71% / 83% / 80%, but the list is a third as long.
+  `-seed-all`) with 19 accounts put on it by hand; from then on round 2 decides. Golden accounts
+  are followed even off round 1's list. The paper copies have no cap on positions held (each
+  is its own account); the live account has (50 legs). Their fills (`their_fill`) and set-up
+  reads (`plan`) are kept for golden accounts only.
 - **How**: its fills are picked out of the public trades stream (every trade names buyer and
   seller), our order is a taker fill on the live L2 book 1 s later.
   - When it opens a position (from flat, or flips), we open in its direction at a size whose
@@ -187,7 +185,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   golden list), and `state` (jsonb: cash, positions, the trader's tracked
   positions, all the measures above, open trips), upserted every 30 s when changed.
 - `events`: `at`, `kind`, `address`, `coin`, `data` (jsonb):
-  - `their_fill`: every fill of a followed account as it reached us (size signed, price,
+  - `their_fill`: every fill of a golden account as it reached us (size signed, price,
     exchange time, the exchange's trade id `tid`, feed delay, its position after) — what the
     traders did;
   - `fill`: ours (`why`: seed / copy / reconcile / restart / stop), with lag, the trader's

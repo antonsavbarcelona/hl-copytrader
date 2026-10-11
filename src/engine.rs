@@ -9,8 +9,9 @@
 //!   - positions it held before we followed it are not entered.
 //!
 //! Only the venue's mechanics are modelled beyond that:
-//!   - fills are taker fills on the live L2 book, `exec_delay_ms` after the account's fill
-//!     reaches us (the order would land then), at the taker fee;
+//!   - fills are taker fills on the live L2 book as soon as the account's fill reaches us (no
+//!     delay added: `exec_delay_ms` 0; our latency is the feed's and our own), at the taker
+//!     fee;
 //!   - an order under $10 is not placed (exchange minimum) unless it closes the position: the
 //!     difference waits for the next change;
 //!   - funding is paid/received every hour on open positions at the coin's rate;
@@ -488,10 +489,15 @@ impl Engine {
             self.scheduled.insert(key, p);
             let (tx, delay) = (self.tx.clone(), self.cfg.exec_delay_ms);
             let (user, coin) = (f.user, f.coin);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            if delay == 0 {
+                // At once: behind the fills already queued (the rest of its order's), no more.
                 let _ = tx.send(Msg::Exec { user, coin, why: "copy" });
-            });
+            } else {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    let _ = tx.send(Msg::Exec { user, coin, why: "copy" });
+                });
+            }
         }
     }
 

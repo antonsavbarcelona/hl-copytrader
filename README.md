@@ -13,7 +13,8 @@ target/release/hl-copytrader report --data data [--min-fills 10] [--top 30]
 
 `run` options: `--start 1000` (USD per copy account), `--risk 2` (% of equity each entry
 loses at our stop), `--stop 20` (% against our entry), `--max-positions 50` (legs the live account holds at once),
-`--delay-ms 1000` (our order lands this long after the trader's fill reaches us),
+`--delay-ms 0` (a delay added before our order, after the trader's fill reaches us; none by
+default: our latency is the feed's and our own),
 `--weight 400` (info API weight per minute; 1200 per IP shared with anything else).
 Needs Rust 1.85+. The running copy uses `data/bin/hl-copytrader.exe` so rebuilds are not
 blocked by a locked exe.
@@ -86,7 +87,8 @@ minute) is per IP, and the image takes 800 of it.
   is its own account); the live account has (50 legs). Their fills (`their_fill`) and set-up
   reads (`plan`) are kept for golden accounts only.
 - **How**: its fills are picked out of the public trades stream (every trade names buyer and
-  seller), our order is a taker fill on the live L2 book 1 s later.
+  seller), our order is a taker fill on the live L2 book as soon as it reaches us (no delay
+  added).
   - When it opens a position (from flat, or flips), we open in its direction at a size whose
     stop loses 2% of our equity: 2% / 20% = a position of 10% of equity.
   - While it adds, we hold that size. As it reduces from its largest size in the position we
@@ -104,8 +106,10 @@ minute) is per IP, and the image takes 800 of it.
 
 ## Live
 
-With `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key, or an API
-wallet's approved for it) set, the golden list is also traded for real on that account:
+With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,
+or an API wallet's approved for it) set, the golden list is also traded for real on that account
+(off by default; it was on the testnet 2026-10-09..11, switched off: testnet's books are nothing
+like mainnet's, so it showed the mechanics only):
 testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`).
 
 - Health check at every start: a $15 market buy of BTC (else ETH, SOL: one not held), sold at

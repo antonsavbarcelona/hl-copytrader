@@ -38,7 +38,7 @@ impl Default for Config {
         Self {
             data_dir: PathBuf::from("data"),
             start_usd: 1000.0,
-            exec_delay_ms: 1000,
+            exec_delay_ms: 0,
             taker_fee: TAKER_FEE,
             min_order_usd: 10.0,
             risk_pct: 2.0,

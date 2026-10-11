@@ -2,7 +2,7 @@
 //! `stable`), $1000 copy account each, following their trades against the live books with a
 //! 2% risk per entry to a 20% stop (see `engine`).
 //!
-//!     hl-copytrader run    [--data DIR] [--start 1000] [--risk 2] [--stop 20] [--delay-ms 1000] [--weight 400]
+//!     hl-copytrader run    [--data DIR] [--start 1000] [--risk 2] [--stop 20] [--delay-ms 0] [--weight 400]
 //!     hl-copytrader report [--data DIR] [--min-fills 10] [--top 30]
 
 mod account;
@@ -56,7 +56,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let selection = store::load_selection(&cfg).await?;
     let picks = store::load_picks(&cfg).await?;
     let store = store::open(&cfg).await?;
-    let live = live::start(&cfg, store.clone()).await?;
+    let live = live::start(&cfg, store.clone(), false).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     if let Some(l) = live {

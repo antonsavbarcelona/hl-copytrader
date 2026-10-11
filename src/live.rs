@@ -1,6 +1,7 @@
 //! Real orders for the golden list on one Hyperliquid account (testnet unless `LIVE_NET` is
-//! "mainnet"), set by env: `LIVE_KEY` (its private key, or an API wallet's approved for it)
-//! and `LIVE_ACCOUNT` (the account's address). Without them nothing is sent.
+//! "mainnet"), set by env: `LIVE_ENABLED=1` (off without it), `LIVE_KEY` (its private key, or an
+//! API wallet's approved for it) and `LIVE_ACCOUNT` (the account's address). Without them nothing
+//! is sent.
 //!
 //! The engine passes on every move of a followed account's position (`Update`); here:
 //!   - a position a golden account enters is entered on our account at a size whose stop,
@@ -127,9 +128,12 @@ pub struct Live {
     status: Arc<Mutex<Value>>,
 }
 
-/// Starts the live trader if `LIVE_KEY` and `LIVE_ACCOUNT` are set: its sender, and its status
-/// (for `bot_status`).
-pub async fn start(cfg: &Config, store: Store) -> Result<Option<(mpsc::UnboundedSender<Update>, Arc<Mutex<Value>>)>> {
+/// Starts the live trader if `LIVE_ENABLED` is "1" (or `force`, for `live-check`) and
+/// `LIVE_KEY` and `LIVE_ACCOUNT` are set: its sender, and its status (for `bot_status`).
+pub async fn start(cfg: &Config, store: Store, force: bool) -> Result<Option<(mpsc::UnboundedSender<Update>, Arc<Mutex<Value>>)>> {
+    if !force && std::env::var("LIVE_ENABLED").unwrap_or_default().trim() != "1" {
+        return Ok(None);
+    }
     let (Ok(key), Ok(account)) = (std::env::var("LIVE_KEY"), std::env::var("LIVE_ACCOUNT")) else { return Ok(None) };
     if key.trim().is_empty() || account.trim().is_empty() {
         return Ok(None);
@@ -505,7 +509,7 @@ impl Live {
 /// other way is skipped.
 pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
     let store = crate::store::open(cfg).await?;
-    let (tx, _) = start(cfg, store.clone()).await?.context("LIVE_KEY and LIVE_ACCOUNT are not set")?;
+    let (tx, _) = start(cfg, store.clone(), true).await?.context("LIVE_KEY and LIVE_ACCOUNT are not set")?;
     let account = std::env::var("LIVE_ACCOUNT")?.trim().to_lowercase();
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let info = Exchange::new(base, &std::env::var("LIVE_KEY")?)?;

@@ -42,6 +42,9 @@ use crate::store::Store;
 /// Our market orders cross the mid by this much at most (the exchange's $10 minimum is
 /// checked at the order's limit price, so not much more).
 const SLIPPAGE: f64 = 0.02;
+/// An order that found nothing to match within `SLIPPAGE` (a thin book: testnet's spreads run
+/// to several %) is sent once more this far through the mid.
+const SLIPPAGE_RETRY: f64 = 0.08;
 /// The stop order fills up to this far past its trigger.
 const STOP_SLIPPAGE: f64 = 0.1;
 const MIN_ORDER_USD: f64 = 10.0;
@@ -216,20 +219,29 @@ impl Live {
         let (asset, dec) = self.coins[coin];
         let mid = self.mid(coin).await?;
         let buy = size > 0.0;
-        let px = round_px(mid * if buy { 1.0 + SLIPPAGE } else { 1.0 - SLIPPAGE }, dec);
         let sz = round_size(size.abs(), dec);
         if sz <= 0.0 {
             bail!("{coin}: size {size} rounds to 0");
         }
-        let order = OrderWire { a: asset, b: buy, p: wire(px), s: wire(sz), r: reduce, t: OrderType::Limit { tif: "Ioc".into() } };
-        self.state.orders += 1;
-        let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
-        let st = &r["data"]["statuses"][0];
-        if let Some(f) = st.get("filled") {
-            let got = num(&f["totalSz"]);
-            return Ok((if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
+        let mut last = Value::Null;
+        for slip in [SLIPPAGE, SLIPPAGE_RETRY] {
+            let px = round_px(mid * if buy { 1.0 + slip } else { 1.0 - slip }, dec);
+            let order = OrderWire { a: asset, b: buy, p: wire(px), s: wire(sz), r: reduce, t: OrderType::Limit { tif: "Ioc".into() } };
+            self.state.orders += 1;
+            let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
+            let st = r["data"]["statuses"][0].clone();
+            if let Some(f) = st.get("filled") {
+                let got = num(&f["totalSz"]);
+                return Ok((if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
+            }
+            // Nothing within reach: once more, further through the mid; any other error is final.
+            let nothing = st["error"].as_str().is_some_and(|e| e.contains("could not immediately match"));
+            last = st;
+            if !nothing {
+                break;
+            }
         }
-        bail!("{coin} order not filled: {st}");
+        bail!("{coin} order not filled: {last}");
     }
 
     /// Our stop: a reduce-only stop-market order for `size` at `trigger`; its order id.

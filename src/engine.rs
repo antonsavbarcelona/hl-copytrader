@@ -33,6 +33,9 @@
 //! week keeps it on). A rotated-out account is not followed (nor entered) for `REJECT_S`; each
 //! week's result, with the measures, is a row of `trader_weeks`.
 //!
+//! The backtest's picks (`backtest_picks`, research of 2026-10-11) are followed and copied on
+//! paper always and not tried week by week: their paper copies are set against the backtest.
+//!
 //! Its fills (`their_fill`) and its set-up reads (`plan`) are kept for golden accounts only:
 //! for the thousands on trial they would be most of the database.
 
@@ -273,6 +276,9 @@ pub struct Engine {
     full_saved: f64,
     /// Traders on the day's list (`stable`).
     listed: HashSet<String>,
+    /// The backtest's picks (`backtest_picks`): followed and copied on paper always, not tried
+    /// week by week (the paper copies are what checks them).
+    picks: HashSet<String>,
     /// Time spent per tick since the last status line: ticks, total and longest (ms).
     load: Load,
     /// Real orders for the golden list (`live`): its updates and its status.
@@ -322,10 +328,17 @@ impl Engine {
             saved: HashMap::new(),
             full_saved: 0.0,
             listed: HashSet::new(),
+            picks: HashSet::new(),
             load: Load::default(),
             live: None,
             cfg,
         })
+    }
+
+    pub fn set_picks(&mut self, picks: HashSet<String>) {
+        log!("backtest picks: {} traders copied on paper", picks.len());
+        self.picks = picks;
+        self.refollow();
     }
 
     pub fn set_live(&mut self, live: (mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)) {
@@ -420,6 +433,7 @@ impl Engine {
         let at = now();
         let out = |a: &String| self.traders.get(a).is_some_and(|t| t.trial.rejected_until > at);
         let mut set: HashSet<String> = self.listed.iter().filter(|a| !out(a)).cloned().collect();
+        set.extend(self.picks.iter().cloned());
         set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
         let n = set.len();
         *self.followed.write().unwrap() = set;
@@ -772,6 +786,8 @@ impl Engine {
             "liquidated": self.traders.len() - live.len(),
             "followed": self.followed.read().unwrap().len(),
             "selected": self.listed.len(),
+            "picks": self.picks.len(),
+            "picks_copied": self.picks.iter().filter(|a| self.traders.get(*a).is_some_and(|t| t.copy_fills > 0)).count(),
             "golden": golden,
             "golden_pnl": r(golden_pnl, 2),
             "in_trial": trying,
@@ -806,7 +822,7 @@ impl Engine {
             if t.trial.rejected_until > 0.0 && t.trial.rejected_until <= at {
                 t.trial = Trial { week_at: at, week_equity: equity, ..Default::default() };
             }
-            if t.trial.rejected_until == 0.0 && t.trial.week_at > 0.0 && at - t.trial.week_at >= WEEK_S {
+            if !self.picks.contains(a) && t.trial.rejected_until == 0.0 && t.trial.week_at > 0.0 && at - t.trial.week_at >= WEEK_S {
                 let theirs = self.leaders.get(a).map(|l| l.week_pnl);
                 let ours = equity - t.trial.week_equity;
                 let (v, losing) = verdict(theirs, ours, t.trial.losing, self.listed.contains(a));

@@ -73,6 +73,13 @@ minute) is per IP, and the image takes 800 of it.
   Why not rule B up front: on July-September 2026 picking by it (3 months up, 60%+ weeks up)
   did no better the next month than looser rules, nor clearly better than all large accounts;
   whether we can copy an account at a profit is what decides.
+- **Backtest picks** (migration `2026-10-11-backtest-picks`, table `backtest_picks`): the 975
+  traders our copy of made over 2.5% a month in a backtest of all 9 342 accounts at a profit
+  over the month before (their last up to 90 days, our ~1 s latency, slippage measured on our
+  copies, taker fees, funding, the 20% stop). Followed and copied on paper always, not tried
+  week by week: their paper copies check the backtest (latency, slippage, fees, PnL against
+  its expectation). `python tools/paper_vs_backtest.py` (needs `RAILWAY_DATABASE_URL` in `.env`,
+  `psycopg2`) prints the comparison.
 - **Golden list**: traded for real (see Live). It started (migrations `2026-10-09-golden-seed`,
   `-seed-all`) with 19 accounts put on it by hand; from then on round 2 decides. Golden accounts
   are followed even off round 1's list. The paper copies have no cap on positions held (each
@@ -197,6 +204,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
+- `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /
   again / out) and why (migration `2026-10-10-trader-weeks`).
 - `liq_touches`, `liq_trades`, `liq_daily`: the liquidation research (see above; migration

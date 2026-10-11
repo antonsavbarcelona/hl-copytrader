@@ -391,6 +391,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
           not_copyable  text
       );
       CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
+    // The traders the backtest found worth copying, copied on paper to check it (`engine`).
+    ("2026-10-11-backtest-picks", include_str!("backtest_picks.sql")),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -416,6 +418,20 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The backtest's picks (`backtest_picks`; `backtest_picks.json`, a list of addresses, without a
+/// database): copied on paper whatever the lists say.
+pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String>> {
+    Ok(match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            migrate(&client).await?;
+            client.query("SELECT address FROM backtest_picks", &[]).await?.into_iter().map(|r| r.get::<_, String>(0).to_lowercase()).collect()
+        }
+        None => std::fs::read_to_string(cfg.data_dir.join("backtest_picks.json")).ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default().into_iter().map(|a| a.to_lowercase()).collect(),
+    })
 }
 
 /// The day's list of followed traders saved by this run, if any.

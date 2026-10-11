@@ -54,6 +54,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let traders = store::load(&cfg).await?;
     let selection = store::load_selection(&cfg).await?;
+    let picks = store::load_picks(&cfg).await?;
     let store = store::open(&cfg).await?;
     let live = live::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
@@ -61,6 +62,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     if let Some(l) = live {
         engine.set_live(l);
     }
+    engine.set_picks(picks);
     let followed = engine.followed.clone();
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

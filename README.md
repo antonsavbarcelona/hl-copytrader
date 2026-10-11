@@ -57,7 +57,9 @@ minute) is per IP, and the image takes 800 of it.
   $250k+ (spot and vaults counted) and 0.5-200x that traded in the last month (~3k on
   2026-10-10). Nothing more: whether a copy of it makes money is round 2's question. Saved
   (`selection`) so a restart keeps it until the next read.
-- **Round 2, the trial** (`src/engine.rs`, `verdict`): every account is copied on paper week by
+- **Round 2, the trial** (`src/engine.rs`, `verdict`; **off since 2026-10-11**, `TRIALS`: all of round 1 and
+  the backtest's picks are copied on paper for a week, none rotated out, to set the paper copies
+  against the backtest): every account is copied on paper week by
   week from its enrollment, and at each week's end its PnL over the week (the leaderboard's)
   is set against our copy's:
   - our copy at a profit: its steadiness is measured (`stable::steadiness`), rule B on its perp

@@ -24,7 +24,8 @@
 //! Followed: round 1's list (`stable`: the large accounts that trade), the golden list, and any
 //! account our copy still holds a position of.
 //!
-//! Round 2, the trial: every account is copied on paper week by week from its enrollment, and
+//! Round 2, the trial (off: `TRIALS`; every account is copied on paper, none rotated out, to set
+//! the paper copies against the backtest): every account is copied on paper week by week from its enrollment, and
 //! at the end of each week its own PnL over it (the leaderboard's week) is set against our
 //! copy's (`verdict`). Our copy at a profit: its steadiness is measured (`stable::steadiness`,
 //! rule B): steady puts it on the golden list (traded for real, `live`), a lucky week rotates
@@ -106,6 +107,9 @@ pub struct Trial {
 }
 
 const WEEK_S: f64 = 7.0 * 86400.0;
+/// Round 2's weekly trial is off (2026-10-11): every account is copied on paper for the week
+/// against the backtest, none rotated out (a rotation would leave only the lucky ones).
+const TRIALS: bool = false;
 /// A rotated-out account is left alone this long, then tried again if it is listed.
 const REJECT_S: f64 = 30.0 * 86400.0;
 
@@ -828,7 +832,7 @@ impl Engine {
             if t.trial.rejected_until > 0.0 && t.trial.rejected_until <= at {
                 t.trial = Trial { week_at: at, week_equity: equity, ..Default::default() };
             }
-            if !self.picks.contains(a) && t.trial.rejected_until == 0.0 && t.trial.week_at > 0.0 && at - t.trial.week_at >= WEEK_S {
+            if TRIALS && !self.picks.contains(a) && t.trial.rejected_until == 0.0 && t.trial.week_at > 0.0 && at - t.trial.week_at >= WEEK_S {
                 let theirs = self.leaders.get(a).map(|l| l.week_pnl);
                 let ours = equity - t.trial.week_equity;
                 let (v, losing) = verdict(theirs, ours, t.trial.losing, self.listed.contains(a));

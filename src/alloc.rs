@@ -12,8 +12,8 @@
 //!     `MIN_TRADES` closed trips (a copy in profit on a trip or two is a coin's toss, and the
 //!     backtest walked forward had no such). Beyond that a portfolio's filter is
 //!     its score's own (`Score::min_trades`): a score over the trips' risk (their spread, the
-//!     losses, the drawdown) needs `RISK_TRADES` trips for that to be measured at all; a sum
-//!     of the PnL needs none. Nothing the score itself weighs is filtered again.
+//!     losses, the drawdown) or their number needs `RISK_TRADES` trips for it to be measured
+//!     at all; the PnL alone needs none. Nothing the score itself weighs is filtered again.
 //!   - Scores: expectancy / drawdown, PnL, t-statistic of the trips, profit factor, expectancy
 //!     x sqrt(trips). Re-ranked once a day (`RANK_EVERY_S`).
 //!   - A picked trader's entry gets `RISK` (its stop `STOP` away loses that much of the
@@ -49,7 +49,7 @@ pub const MIN_TRADES: u64 = 20;
 /// Closed trips a score over their risk needs (`Score::min_trades`).
 const RISK_TRADES: u64 = 20;
 /// The portfolios' generation: a saved state of another is not restored (started again).
-const GENERATION: u32 = 2;
+const GENERATION: u32 = 3;
 const MIN_ORDER_USD: f64 = 10.0;
 
 /// The portfolios: name, score (None: at random among the eligible), how many traders.
@@ -81,11 +81,12 @@ pub enum Score {
 impl Score {
     /// The closed trips a trader needs for the score to mean anything: over their risk
     /// (t-statistic: their spread; profit factor: the losses; expectancy / drawdown: the
-    /// drawdown) `RISK_TRADES`, a sum of their PnL (PnL, expectancy x sqrt(trips)) one.
+    /// drawdown) or their number (expectancy x sqrt(trips) is the PnL / sqrt(trips): the
+    /// fewer, the higher, a trader of one lucky trip on top) `RISK_TRADES`; the PnL one.
     pub fn min_trades(self) -> u64 {
         match self {
-            Score::TStat | Score::Pf | Score::ExpDd => RISK_TRADES,
-            Score::Pnl | Score::PnlSqrtN => 1,
+            Score::TStat | Score::Pf | Score::ExpDd | Score::PnlSqrtN => RISK_TRADES,
+            Score::Pnl => 1,
         }
     }
 }
@@ -466,8 +467,10 @@ mod tests {
         assert_eq!(a.portfolios.len(), MODES.len());
         a.rerank(&s, 0.0);
         assert_eq!(port(&a, "EXPDD_10").picked["b"].0, 1);
-        // A score over the trips' risk: not on 10 trips; a sum of their PnL: on any.
-        assert!(!port(&a, "EXPDD_10").picked.contains_key("c") && !port(&a, "TSTAT_30").picked.contains_key("c"));
+        // A score over the trips' risk or number: not on 10 trips; the PnL: on any.
+        for n in ["EXPDD_10", "TSTAT_30", "PF_30", "PNLSQRTN_10"] {
+            assert!(!port(&a, n).picked.contains_key("c"), "{n}");
+        }
         assert_eq!(port(&a, "PNL_10").picked["c"].0, 1);
         assert!(!port(&a, "PNL_10").picked.contains_key("d"));
         assert_eq!(port(&a, "RANDOM_10").picked.len(), 3);

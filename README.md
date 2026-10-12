@@ -133,12 +133,14 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   closed trades (a copy with no backtest in profit on a trade or two is a coin's toss, and the
   backtest walked forward had no such). Beyond that each portfolio filters by its
   score only (`Score::min_trades`): a score over the trades' risk (t-statistic: their spread;
-  profit factor: the losses; expectancy / drawdown: the drawdown) needs 20 closed trades for
-  it to be measured; a sum of the PnL (PnL, expectancy x sqrt(trades)) needs one; at random
-  draws from all the eligible. Nothing the score itself weighs is filtered again (slippage is
-  in the PnL already). Re-ranked once a day. From 2026-10-12 evening (generation 2: the
-  portfolios started again at $10 000); before, all had 20+ trades, profit factor above 1.1,
-  drawdown under 15%, slippage under 30 bp.
+  profit factor: the losses; expectancy / drawdown: the drawdown) or their number
+  (expectancy x sqrt(trades) is the PnL / sqrt(trades): the fewer, the higher) needs 20
+  closed trades for it to be measured; the PnL alone needs one; at random draws from all the
+  eligible. Nothing the score itself weighs is filtered again (slippage is in the PnL
+  already). Re-ranked once a day. Generation 3 from 2026-10-12 21:00 UTC (the portfolios
+  started again at $10 000); generation 2 (20:00-21:00) had PNLSQRTN on any number of trades,
+  its top traders of 1-5; before that, all had 20+ trades, profit factor above 1.1, drawdown
+  under 15%, slippage under 30 bp.
 - An entry gets 2% risk (the 20% stop loses that much of the portfolio), cut to the limits:
   total open risk 100% (50 positions at 2%), per trader 20%, at most 2 positions in a coin (no
   cap per direction); under 0.25% it is refused. A position is followed to its end (reduced as
@@ -165,7 +167,8 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   drawdown 15%), PNLSQRTN_30 +99% (19%), PF_50 +69% (22%), EXPDD_10 +55% (13%), against
   +3% / +24% / +23% for 10 / 30 / 50 at random (30 draws; drawdown 22-35%); PNL_10 -1% (41%),
   TSTAT_30 +5% (33%). At up to 5x on a portfolio, in two months good for longs: the paper
-  decides. With each score's own filter (generation 2, same walk): PNLSQRTN_30 +164% (21%),
+  decides. With each score's own filter (generation 2, same walk; PNLSQRTN on 1+ trades, 20+
+  from generation 3: +145% / +40% for 30 / 10): PNLSQRTN_30 +164% (21%),
   PNL_30 +129% (28%), EXPDD_30 +111% (22%), PNLSQRTN_10 +74% (18%), EXPDD_50 +73% (25%), PF_50
   +61% (24%), EXPDD_10 +55% (11%), PF_30 +51% (18%), TSTAT_30 +36% (28%), PNL_10 +34% (36%),
   against +1% / +29% / +41% at random from all the eligible (median of 10 draws).

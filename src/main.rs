@@ -6,6 +6,7 @@
 //!     hl-copytrader report [--data DIR] [--min-fills 10] [--top 30]
 
 mod account;
+mod alloc;
 mod api;
 mod config;
 mod engine;
@@ -63,6 +64,10 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         engine.set_live(l);
     }
     engine.set_picks(picks);
+    if let Some(a) = store::load_doc(&cfg, "allocator").await?.and_then(|v| serde_json::from_value::<alloc::Allocators>(v).ok()) {
+        log!("allocator: {} portfolios restored", a.portfolios.len());
+        engine.set_alloc(a);
+    }
     let followed = engine.followed.clone();
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

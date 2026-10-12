@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ";
 
 /// The tables `Store::insert` writes to.
-const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks"];
+const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions"];
 
 /// One-off changes to what is in the database, by name, oldest first.
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -393,6 +393,25 @@ const MIGRATIONS: &[(&str, &str)] = &[
       CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
     // The traders the backtest found worth copying, copied on paper to check it (`engine`).
     ("2026-10-11-backtest-picks", include_str!("backtest_picks.sql")),
+    // The allocator portfolios' decisions on each entry (`alloc`).
+    ("2026-10-12-allocator",
+     "CREATE TABLE IF NOT EXISTS allocator_decisions (
+          id              bigserial   PRIMARY KEY,
+          run_id          text        NOT NULL,
+          at              timestamptz NOT NULL,
+          portfolio       text        NOT NULL,
+          trader          text        NOT NULL,
+          coin            text        NOT NULL,
+          side            text        NOT NULL,
+          action          text        NOT NULL,
+          eligible        boolean     NOT NULL,
+          rank            integer,
+          score           float8,
+          requested_risk  float8      NOT NULL,
+          granted_risk    float8      NOT NULL,
+          reject_reason   text
+      );
+      CREATE INDEX IF NOT EXISTS allocator_decisions_at ON allocator_decisions (run_id, portfolio, at)"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

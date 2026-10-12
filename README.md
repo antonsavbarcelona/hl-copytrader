@@ -106,6 +106,33 @@ minute) is per IP, and the image takes 800 of it.
   a copy account at zero equity is liquidated and stops. Main perp dex only (no HIP-3
   dexes).
 
+## Allocator
+
+A second layer over the paper copies (`src/alloc.rs`), apart from them: four paper portfolios of
+$10 000 that get the same signals as the copies (each followed account's position moves) but
+decide whom to let in. The copies per account go on as they were; this answers whether choosing
+among them adds anything.
+
+- Each copy's statistics (its paper copy): closed trips, PnL, expectancy, profit factor, win
+  rate, drawdown, holding time, slippage, PnL over 7 / 30 days (daily equity kept in the
+  state), open risk, coins entered.
+- Eligible: 20+ closed trips, PnL above 0, profit factor above 1.1, drawdown under 15%,
+  slippage under 30 bp. Ranked by expectancy / drawdown. Re-ranked once a day.
+- Portfolios: `EQUAL` the top 10 at 2% risk each; `RANK_WEIGHTED` the top 10 from 2% down to
+  0.5% by rank; `DIVERSIFIED` the top ones but none trading much the same coins (Jaccard of the
+  coins entered under 0.5) and no two of its traders the same way in a coin;
+  `RANDOM_ELIGIBLE_10` 10 eligible at random each day: the benchmark of the ranking.
+- An entry is sized so the 20% stop loses its risk, cut to the portfolio's caps: total open risk
+  10%, per coin 4%, per trader 2%, per direction 6%; under 0.25% it is refused. A position is
+  followed to its end (reduced as the trader reduces, closed when it is flat) or the stop: a
+  trader dropping off the list stops new entries only.
+- `allocator_decisions` (migration `2026-10-12-allocator`): each entry per portfolio, with rank,
+  score, requested and granted risk and why it was cut or refused (`NOT_ELIGIBLE`,
+  `NOT_PICKED`, `TOTAL_RISK_CAP`, `ASSET_RISK_CAP`, `TRADER_RISK_CAP`, `DIRECTION_RISK_CAP`,
+  `DUPLICATE_EXPOSURE`, `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their
+  equity, return, open risk in `bot_status.data.allocators`; each ranking an event
+  `allocator_rank`.
+
 ## Live
 
 With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,
@@ -210,6 +237,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
+- `allocator_decisions`: the allocator portfolios' decisions (above).
 - `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /
   again / out) and why (migration `2026-10-10-trader-weeks`).

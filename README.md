@@ -146,14 +146,15 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   cap per direction); under 0.25% it is refused. A position is followed to its end (reduced as
   the trader reduces, closed when it is flat) or the stop: a trader dropping off the list stops
   new entries only.
-- `allocator_decisions` (migration `2026-10-12-allocator`): each entry per portfolio, with rank,
-  score, requested and granted risk and why it was cut or refused (`NOT_PICKED`,
-  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
+- `allocator_decisions` (migration `2026-10-12-allocator`): each entry of a picked trader per
+  portfolio, with rank, score, requested and granted risk and why it was cut or refused
+  (`COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
   (migration `2026-10-12-allocator-trades`, from generation 2): each position closed, with its
   own entry and exit price (not the coin's legs' average), PnL net of its fees, R (PnL / the
   risk granted in USD), hours held and why (`TRADER_CLOSED`, `TRADER_FLIPPED`, `STOP`). Both
   carry the `generation`. The portfolios' state in `docs` (`allocator`), their equity, return,
-  open risk in `bot_status.data.allocators`; each ranking an event `allocator_rank`. No
+  open risk, entries of traders not picked (`not_picked`: counted only; until generation 3 a
+  `NOT_PICKED` row each, 99% of the rows) in `bot_status.data.allocators`; each ranking an event `allocator_rank`. No
   funding on the portfolios (the copies have it).
 - Report: `python tools/alloc_report.py [--generation N] [--traders PORTFOLIO]` (read-only,
   `RAILWAY_DATABASE_URL` in `.env`): each portfolio's return, drawdown, trades, R against its

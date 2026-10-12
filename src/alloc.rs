@@ -225,6 +225,10 @@ pub struct Portfolio {
     pub entries: u64,
     pub refused: u64,
     pub stops: u64,
+    /// Entries of traders it has not picked (counted, not written: 13 rows an entry of anyone
+    /// followed swamped the database's writer).
+    #[serde(default)]
+    pub not_picked: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -326,16 +330,15 @@ impl Allocators {
             if !(s.entry && s.frac > 0.0) {
                 continue;
             }
-            let picked = p.picked.get(&s.user).copied();
+            let Some(picked) = p.picked.get(&s.user).copied() else {
+                p.not_picked += 1;
+                continue;
+            };
+            let picked = Some(picked);
             let mut row = json!({"portfolio": p.name, "generation": generation, "trader": s.user, "coin": s.coin, "side": if s.dir > 0.0 { "long" } else { "short" },
                 "action": "open", "eligible": picked.is_some(), "rank": picked.map(|r| r.0), "score": picked.map(|r| r.1),
                 "requested_risk": if picked.is_some() { RISK } else { 0.0 }, "granted_risk": 0.0, "reject_reason": null, "at": crate::liq::iso(at)});
             let mut decide = |row: Value| rows.push(("allocator_decisions", row));
-            if picked.is_none() {
-                row["reject_reason"] = json!("NOT_PICKED");
-                decide(row);
-                continue;
-            }
             if p.legs.values().filter(|l| l.coin == s.coin).count() >= MAX_PER_COIN {
                 row["reject_reason"] = json!("COIN_POSITIONS_CAP");
                 p.refused += 1;
@@ -402,7 +405,7 @@ impl Allocators {
             let eq = p.acct.equity(marks);
             json!({"name": p.name, "generation": self.generation, "equity": (eq * 100.0).round() / 100.0, "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0,
                 "open_risk_pct": (p.legs.values().map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0, "legs": p.legs.len(),
-                "picked": p.picked.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "fees": p.acct.fees})
+                "picked": p.picked.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "not_picked": p.not_picked, "fees": p.acct.fees})
         }).collect())
     }
 }
@@ -499,7 +502,7 @@ mod tests {
         assert!((p.legs["t0|BTC"].full * 100.0 - RISK / STOP * START_USD).abs() < 1.0);
         // Not picked.
         let rows = a.on_signal(&sig("zz", "ETH"), &b, &marks, 0.0);
-        assert!(rows.iter().all(|r| r.0 == "allocator_decisions" && r.1["reject_reason"] == "NOT_PICKED"));
+        assert!(rows.is_empty() && port(&a, "EXPDD_10").not_picked == 1);
         // The trader halves: the leg too; flat: closed.
         a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.5, entry: false }, &b, &marks, 1.0);
         let l = &port(&a, "EXPDD_10").legs["t0|BTC"];

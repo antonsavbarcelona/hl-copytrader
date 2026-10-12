@@ -12,7 +12,7 @@
 //! changed since the last save) and, on Postgres, reconnects and retries when the database
 //! is away, keeping what it has not written yet.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
@@ -720,14 +720,20 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
 
 async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
                inserts: &[(&'static str, Value)]) -> Result<()> {
+    // One statement a table (a row a round trip fell behind a burst of entries).
+    let mut tables: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for (table, row) in inserts {
-        // The columns are the row's keys (ours, not outside input), each converted by the
-        // table's own type for it.
         let mut row = row.clone();
         row["run_id"] = Value::String(run.to_string());
-        let cols = row.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
-        c.execute(&format!("INSERT INTO {table} ({cols}) SELECT {cols} FROM jsonb_populate_record(NULL::{table}, $1::text::jsonb)"),
-            &[&row.to_string()]).await.with_context(|| format!("inserting into {table}"))?;
+        tables.entry(table).or_default().push(row);
+    }
+    for (table, rows) in tables {
+        // The columns are the rows' keys (ours, not outside input), each converted by the
+        // table's own type for it; a key a row lacks is null in it.
+        let cols: BTreeSet<&String> = rows.iter().filter_map(Value::as_object).flat_map(|o| o.keys()).collect();
+        let cols = cols.into_iter().map(String::as_str).collect::<Vec<_>>().join(", ");
+        c.execute(&format!("INSERT INTO {table} ({cols}) SELECT {cols} FROM jsonb_populate_recordset(NULL::{table}, $1::text::jsonb)"),
+            &[&Value::Array(rows).to_string()]).await.with_context(|| format!("inserting into {table}"))?;
     }
     if !statuses.is_empty() {
         let rows = serde_json::to_string(statuses)?;

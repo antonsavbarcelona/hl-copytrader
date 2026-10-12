@@ -130,19 +130,20 @@ traders by and how many of the top it takes, or as many at random (the benchmark
 - Eligible: 20+ closed trades, PnL above 0, profit factor above 1.1, drawdown under 15%,
   slippage under 30 bp. Re-ranked once a day.
 - An entry gets 2% risk (the 20% stop loses that much of the portfolio), cut to the limits:
-  total open risk 100% (50 positions at 2%), per trader 10%, per direction 70%, at most 2
-  positions in a coin; under 0.25% it is refused. A position is followed to its end (reduced as
+  total open risk 100% (50 positions at 2%), per trader 20%, at most 2 positions in a coin (no
+  cap per direction); under 0.25% it is refused. A position is followed to its end (reduced as
   the trader reduces, closed when it is flat) or the stop: a trader dropping off the list stops
   new entries only.
 - `allocator_decisions` (migration `2026-10-12-allocator`): each entry per portfolio, with rank,
   score, requested and granted risk and why it was cut or refused (`NOT_PICKED`,
-  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `DIRECTION_RISK_CAP`,
-  `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their equity, return, open risk
+  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their equity, return, open risk
   in `bot_status.data.allocators`; each ranking an event `allocator_rank`.
-- Out of sample on the backtest (ranked on the first 60 of 90 days, traded the last 30):
-  PNL_10 +108%, PNLSQRTN_10 +81%, EXPDD_30 +107%, EXPDD_50 +113%, against +39% / +73% / +73%
-  for 10 / 30 / 50 at random; the rest about as random. One month, at up to 5x on the
-  portfolio, a good month for longs: the paper decides.
+- Walked forward on the backtest (research 2026-10-12: all 6 887 wallets with copy trades,
+  ranked every day on the trips closed before it, days 30-90 traded): EXPDD_30 +109% (max
+  drawdown 15%), PNLSQRTN_30 +99% (19%), PF_50 +69% (22%), EXPDD_10 +55% (13%), against
+  +3% / +24% / +23% for 10 / 30 / 50 at random (30 draws; drawdown 22-35%); PNL_10 -1% (41%),
+  TSTAT_30 +5% (33%). At up to 5x on a portfolio, in two months good for longs: the paper
+  decides.
 
 ## Live
 

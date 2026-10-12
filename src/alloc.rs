@@ -14,8 +14,9 @@
 //!     x sqrt(trips). Re-ranked once a day (`RANK_EVERY_S`).
 //!   - A picked trader's entry gets `RISK` (its stop `STOP` away loses that much of the
 //!     portfolio's equity), less as the caps require: total open risk `CAP_TOTAL`, per trader
-//!     `CAP_TRADER`, per direction `CAP_DIRECTION`; at most `MAX_PER_COIN` positions in a coin;
-//!     under `MIN_GRANT` it is refused. Each entry's decision is a row of `allocator_decisions`.
+//!     `CAP_TRADER`; at most `MAX_PER_COIN` positions in a coin (no cap per direction: on 90
+//!     days walked forward it cut more good entries than it saved); under `MIN_GRANT` it is
+//!     refused. Each entry's decision is a row of `allocator_decisions`.
 //!   - A position is followed to its end (reduced in proportion as the trader reduces from its
 //!     peak, closed when it is flat), or closed at the stop: a trader dropping off the list
 //!     stops new entries only.
@@ -37,8 +38,7 @@ const RISK: f64 = 0.02;
 const STOP: f64 = 0.20;
 const MIN_GRANT: f64 = 0.0025;
 const CAP_TOTAL: f64 = 1.00;
-const CAP_TRADER: f64 = 0.10;
-const CAP_DIRECTION: f64 = 0.70;
+const CAP_TRADER: f64 = 0.20;
 const MAX_PER_COIN: usize = 2;
 pub const MIN_TRADES: u64 = 20;
 const MIN_PF: f64 = 1.1;
@@ -289,7 +289,6 @@ impl Allocators {
             let rooms = [
                 (CAP_TOTAL - sum(&|_| true), "TOTAL_RISK_CAP"),
                 (CAP_TRADER - sum(&|l| l.user == s.user), "TRADER_RISK_CAP"),
-                (CAP_DIRECTION - sum(&|l| l.dir == s.dir), "DIRECTION_RISK_CAP"),
             ];
             let (room, binding) = rooms.iter().fold((RISK, None), |(g, why), &(r, n)| if r < g { (r.max(0.0), Some(n)) } else { (g, why) });
             if room < MIN_GRANT {
@@ -425,13 +424,13 @@ mod tests {
         assert!((l.size - l.full / 2.0).abs() < 1e-6);
         a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.0, entry: false }, &b, &marks, 2.0);
         assert!(!port(&a, "EXPDD_10").legs.contains_key("t0|BTC"));
-        // Per trader: 10% = five 2% entries, the sixth refused.
+        // Per trader: 20% = ten 2% entries, the eleventh refused.
         let mut a = Allocators::new(None);
         a.rerank(&s, 0.0);
-        for c in ["A", "B", "C", "D", "E"] {
+        for c in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
             a.on_signal(&sig("t0", c), &b, &marks, 0.0);
         }
-        let rows = a.on_signal(&sig("t0", "F"), &b, &marks, 0.0);
+        let rows = a.on_signal(&sig("t0", "K"), &b, &marks, 0.0);
         assert_eq!(rows.iter().find(|r| r["portfolio"] == "EXPDD_10").unwrap()["reject_reason"], "TRADER_RISK_CAP");
     }
 

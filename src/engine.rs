@@ -707,8 +707,8 @@ impl Engine {
             let marks = |c: &str| b.get(c).and_then(Book::mid);
             self.alloc.on_signal(&signal, &book, &marks, now())
         };
-        for row in rows {
-            self.store.insert("allocator_decisions", row);
+        for (table, row) in rows {
+            self.store.insert(table, row);
         }
         let closing = target.abs() < 1e-12;
         let mut delta = round_size(target - ours, info.sz_decimals);
@@ -831,8 +831,10 @@ impl Engine {
             self.stop_out(&a, &c);
         }
         {
-            let b = self.books.read().unwrap();
-            self.alloc.check_stops(&b);
+            let rows = self.alloc.check_stops(&self.books.read().unwrap(), now());
+            for row in rows {
+                self.store.insert("allocator_trades", row);
+            }
         }
         // The allocator's first ranking at once (the books in after a few ticks), not with the
         // first status 10 min on: its portfolios would refuse every entry till then.

@@ -8,7 +8,9 @@
 //!
 //!   - Each trader's statistics (`TraderStats`): its paper copy's once that has `MIN_TRADES`
 //!     closed trips, until then the backtest's (`backtest_stats`) if it has them.
-//!   - Eligible for all: a closed trip and PnL above 0. Beyond that a portfolio's filter is
+//!   - Eligible for all: PnL above 0 on history enough: the backtest's, or a paper copy's of
+//!     `MIN_TRADES` closed trips (a copy in profit on a trip or two is a coin's toss, and the
+//!     backtest walked forward had no such). Beyond that a portfolio's filter is
 //!     its score's own (`Score::min_trades`): a score over the trips' risk (their spread, the
 //!     losses, the drawdown) needs `RISK_TRADES` trips for that to be measured at all; a sum
 //!     of the PnL needs none. Nothing the score itself weighs is filtered again.
@@ -18,7 +20,8 @@
 //!     portfolio's equity), less as the caps require: total open risk `CAP_TOTAL`, per trader
 //!     `CAP_TRADER`; at most `MAX_PER_COIN` positions in a coin (no cap per direction: on 90
 //!     days walked forward it cut more good entries than it saved); under `MIN_GRANT` it is
-//!     refused. Each entry's decision is a row of `allocator_decisions`.
+//!     refused. Each entry's decision is a row of `allocator_decisions`, each position closed
+//!     a row of `allocator_trades` (its own entry, exit, PnL net of its fees, and why).
 //!   - A position is followed to its end (reduced in proportion as the trader reduces from its
 //!     peak, closed when it is flat), or closed at the stop: a trader dropping off the list
 //!     stops new entries only.
@@ -130,8 +133,8 @@ impl TraderStats {
 
     /// Why it is not eligible for any portfolio (None: it is).
     pub fn ineligible(&self) -> Option<&'static str> {
-        if self.closed_trades == 0 {
-            Some("no closed trades")
+        if self.closed_trades == 0 || (self.source != "backtest" && self.closed_trades < MIN_TRADES) {
+            Some("too little history")
         } else if self.pnl_net <= 0.0 {
             Some("at a loss")
         } else {
@@ -174,12 +177,39 @@ pub struct Leg {
     pub entry_px: f64,
     pub risk: f64,
     pub opened: f64,
+    /// The risk in USD at entry (the portfolio's equity x `risk`), its PnL realized net of its
+    /// fees, its fees, and the size and notional it has closed (its exit price).
+    #[serde(default)]
+    pub risk_usd: f64,
+    #[serde(default)]
+    pub pnl: f64,
+    #[serde(default)]
+    pub fees: f64,
+    #[serde(default)]
+    pub closed_sz: f64,
+    #[serde(default)]
+    pub closed_ntl: f64,
 }
 
 impl Leg {
     /// Its risk now: as granted, less what has been reduced.
     fn risk_now(&self) -> f64 {
         if self.full > 0.0 { self.risk * self.size.abs() / self.full } else { 0.0 }
+    }
+
+    /// A fill of the leg's own: adding averages its entry, reducing realizes against it.
+    fn fill(&mut self, got: f64, px: f64, fee: f64) {
+        if got * self.dir > 0.0 {
+            let (a, b) = (self.size.abs(), got.abs());
+            self.entry_px = if a + b > 0.0 { (self.entry_px * a + px * b) / (a + b) } else { px };
+        } else {
+            self.pnl += got.abs() * (px - self.entry_px) * self.dir;
+            self.closed_sz += got.abs();
+            self.closed_ntl += got.abs() * px;
+        }
+        self.size += got;
+        self.pnl -= fee;
+        self.fees += fee;
     }
 }
 
@@ -267,23 +297,25 @@ impl Allocators {
         json!({"eligible": elig.len(), "of": stats.len(), "from_paper": elig.iter().filter(|s| s.source == "paper").count(), "top": out})
     }
 
-    /// A signal: each portfolio follows its legs and decides on entries. Rows for
-    /// `allocator_decisions` (entries only).
-    pub fn on_signal(&mut self, s: &Signal, book: &Book, marks: &dyn Fn(&str) -> Option<f64>, at: f64) -> Vec<Value> {
+    /// A signal: each portfolio follows its legs and decides on entries. Rows: (table, row),
+    /// `allocator_decisions` for each entry, `allocator_trades` for each position closed.
+    pub fn on_signal(&mut self, s: &Signal, book: &Book, marks: &dyn Fn(&str) -> Option<f64>, at: f64) -> Vec<(&'static str, Value)> {
         let mut rows = Vec::new();
+        let generation = self.generation;
         for p in self.portfolios.iter_mut() {
             let k = key(&s.user, &s.coin);
             if let Some(l) = p.legs.get(&k).cloned() {
                 if s.frac <= 0.0 || s.dir != l.dir {
-                    close(p, &k, book);
+                    let why = if s.frac <= 0.0 { "TRADER_CLOSED" } else { "TRADER_FLIPPED" };
+                    rows.extend(close(p, &k, book, why, at, generation).map(|r| ("allocator_trades", r)));
                 } else {
                     let target = l.dir * l.full * s.frac.min(1.0);
                     let delta = target - l.size;
                     let mid = book.mid().unwrap_or(l.entry_px);
                     if delta.abs() * mid >= MIN_ORDER_USD {
-                        if let Some(got) = trade(&mut p.acct, &s.coin, delta, book) {
+                        if let Some((got, px, fee)) = trade(&mut p.acct, &s.coin, delta, book) {
                             if let Some(leg) = p.legs.get_mut(&k) {
-                                leg.size += got;
+                                leg.fill(got, px, fee);
                             }
                         }
                     }
@@ -294,18 +326,19 @@ impl Allocators {
                 continue;
             }
             let picked = p.picked.get(&s.user).copied();
-            let mut row = json!({"portfolio": p.name, "trader": s.user, "coin": s.coin, "side": if s.dir > 0.0 { "long" } else { "short" },
+            let mut row = json!({"portfolio": p.name, "generation": generation, "trader": s.user, "coin": s.coin, "side": if s.dir > 0.0 { "long" } else { "short" },
                 "action": "open", "eligible": picked.is_some(), "rank": picked.map(|r| r.0), "score": picked.map(|r| r.1),
                 "requested_risk": if picked.is_some() { RISK } else { 0.0 }, "granted_risk": 0.0, "reject_reason": null, "at": crate::liq::iso(at)});
+            let mut decide = |row: Value| rows.push(("allocator_decisions", row));
             if picked.is_none() {
                 row["reject_reason"] = json!("NOT_PICKED");
-                rows.push(row);
+                decide(row);
                 continue;
             }
             if p.legs.values().filter(|l| l.coin == s.coin).count() >= MAX_PER_COIN {
                 row["reject_reason"] = json!("COIN_POSITIONS_CAP");
                 p.refused += 1;
-                rows.push(row);
+                decide(row);
                 continue;
             }
             let sum = |f: &dyn Fn(&Leg) -> bool| p.legs.values().filter(|l| f(l)).map(Leg::risk_now).sum::<f64>();
@@ -317,7 +350,7 @@ impl Allocators {
             if room < MIN_GRANT {
                 row["reject_reason"] = json!(binding.unwrap_or("TOTAL_RISK_CAP"));
                 p.refused += 1;
-                rows.push(row);
+                decide(row);
                 continue;
             }
             let equity = p.acct.equity(marks).max(0.0);
@@ -325,24 +358,29 @@ impl Allocators {
             let full = room / STOP * equity / mid;
             if full * mid < MIN_ORDER_USD {
                 row["reject_reason"] = json!("TOO_SMALL");
-                rows.push(row);
+                decide(row);
                 continue;
             }
-            let Some(got) = trade(&mut p.acct, &s.coin, s.dir * full * s.frac.min(1.0), book) else { continue };
-            let px = p.acct.positions.get(&s.coin).map(|x| x.entry).unwrap_or(mid);
-            p.legs.insert(k, Leg { user: s.user.clone(), coin: s.coin.clone(), dir: s.dir, full, size: got, entry_px: px, risk: room, opened: at });
+            let Some((got, px, fee)) = trade(&mut p.acct, &s.coin, s.dir * full * s.frac.min(1.0), book) else { continue };
+            // Its own fill's price: the account's entry is the coin's legs' average.
+            let mut leg = Leg { user: s.user.clone(), coin: s.coin.clone(), dir: s.dir, full, size: 0.0, entry_px: px, risk: room, opened: at,
+                risk_usd: room * equity, ..Default::default() };
+            leg.fill(got, px, fee);
+            p.legs.insert(k, leg);
             p.entries += 1;
             row["granted_risk"] = json!(room);
             if room < RISK {
                 row["reject_reason"] = json!(binding);
             }
-            rows.push(row);
+            decide(row);
         }
         rows
     }
 
-    /// Stops: a leg `STOP` against its entry is closed at the book.
-    pub fn check_stops(&mut self, books: &HashMap<String, Book>) {
+    /// Stops: a leg `STOP` against its entry is closed at the book. Rows for
+    /// `allocator_trades`.
+    pub fn check_stops(&mut self, books: &HashMap<String, Book>, at: f64) -> Vec<Value> {
+        let mut rows = Vec::new();
         for p in self.portfolios.iter_mut() {
             let hit: Vec<String> = p.legs.iter().filter(|(_, l)| {
                 books.get(&l.coin).and_then(Book::mid).is_some_and(|m| (m / l.entry_px - 1.0) * l.dir <= -STOP)
@@ -350,41 +388,49 @@ impl Allocators {
             for k in hit {
                 let coin = p.legs[&k].coin.clone();
                 if let Some(b) = books.get(&coin) {
-                    close(p, &k, b);
+                    rows.extend(close(p, &k, b, "STOP", at, self.generation));
                     p.stops += 1;
                 }
             }
         }
+        rows
     }
 
     pub fn status(&self, marks: &dyn Fn(&str) -> Option<f64>) -> Value {
         Value::Array(self.portfolios.iter().map(|p| {
             let eq = p.acct.equity(marks);
-            json!({"name": p.name, "equity": (eq * 100.0).round() / 100.0, "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0,
+            json!({"name": p.name, "generation": self.generation, "equity": (eq * 100.0).round() / 100.0, "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0,
                 "open_risk_pct": (p.legs.values().map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0, "legs": p.legs.len(),
                 "picked": p.picked.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "fees": p.acct.fees})
         }).collect())
     }
 }
 
-/// A taker fill of `delta` on the book: the size filled (signed).
-fn trade(acct: &mut Account, coin: &str, delta: f64, book: &Book) -> Option<f64> {
+/// A taker fill of `delta` on the book: the size filled (signed), its price and fee.
+fn trade(acct: &mut Account, coin: &str, delta: f64, book: &Book) -> Option<(f64, f64, f64)> {
     let side = if delta > 0.0 { &book.asks } else { &book.bids };
     let (got, px) = walk(side, delta.abs());
     if got <= 0.0 {
         return None;
     }
-    let filled = got * delta.signum();
-    acct.fill(coin, filled, px, got * px * TAKER_FEE);
-    Some(filled)
+    let (filled, fee) = (got * delta.signum(), got * px * TAKER_FEE);
+    acct.fill(coin, filled, px, fee);
+    Some((filled, px, fee))
 }
 
-fn close(p: &mut Portfolio, k: &str, book: &Book) {
-    if let Some(l) = p.legs.remove(k) {
-        if l.size != 0.0 {
-            trade(&mut p.acct, &l.coin, -l.size, book);
+/// Closes a leg at the book: its `allocator_trades` row.
+fn close(p: &mut Portfolio, k: &str, book: &Book, why: &str, at: f64, generation: u32) -> Option<Value> {
+    let mut l = p.legs.remove(k)?;
+    if l.size != 0.0 {
+        if let Some((got, px, fee)) = trade(&mut p.acct, &l.coin, -l.size, book) {
+            l.fill(got, px, fee);
         }
     }
+    Some(json!({"portfolio": p.name, "generation": generation, "trader": l.user, "coin": l.coin,
+        "side": if l.dir > 0.0 { "long" } else { "short" }, "opened_at": crate::liq::iso(l.opened), "closed_at": crate::liq::iso(at),
+        "held_h": (at - l.opened) / 3600.0, "entry_px": l.entry_px, "exit_px": if l.closed_sz > 0.0 { l.closed_ntl / l.closed_sz } else { l.entry_px },
+        "risk": l.risk, "risk_usd": l.risk_usd, "notional": l.full * l.entry_px, "pnl": l.pnl, "fees": l.fees,
+        "r": if l.risk_usd > 0.0 { l.pnl / l.risk_usd } else { 0.0 }, "reason": why}))
 }
 
 #[cfg(test)]
@@ -408,9 +454,14 @@ mod tests {
     #[test]
     fn modes_rank_on_their_own() {
         // b: the better expectancy / drawdown; a: the bigger PnL.
-        // c: few trips, the biggest PnL; d: at a loss.
-        let s = [stats("a", 100, 5.0, 10.0), stats("b", 30, 5.0, 1.0), stats("c", 10, 60.0, 1.0), stats("d", 50, -1.0, 1.0)];
+        // c: few trips (the backtest's), the biggest PnL; d: at a loss.
+        let mut s = [stats("a", 100, 5.0, 10.0), stats("b", 30, 5.0, 1.0), stats("c", 10, 60.0, 1.0), stats("d", 50, -1.0, 1.0)];
+        s[2].source = "backtest";
         assert_eq!(s[3].ineligible(), Some("at a loss"));
+        let mut few = stats("e", 5, 10.0, 1.0);
+        assert_eq!(few.ineligible(), Some("too little history"));
+        few.source = "backtest";
+        assert_eq!(few.ineligible(), None);
         let mut a = Allocators::new(None);
         assert_eq!(a.portfolios.len(), MODES.len());
         a.rerank(&s, 0.0);
@@ -438,20 +489,24 @@ mod tests {
         a.on_signal(&sig("t0", "BTC"), &b, &marks, 0.0);
         a.on_signal(&sig("t1", "BTC"), &b, &marks, 0.0);
         let rows = a.on_signal(&sig("t2", "BTC"), &b, &marks, 0.0);
-        let r = rows.iter().find(|r| r["portfolio"] == "EXPDD_10").unwrap();
+        let r = &rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10").unwrap().1;
         assert_eq!(r["reject_reason"], "COIN_POSITIONS_CAP");
         let p = port(&a, "EXPDD_10");
         assert_eq!(p.legs.len(), 2);
         assert!((p.legs["t0|BTC"].full * 100.0 - RISK / STOP * START_USD).abs() < 1.0);
         // Not picked.
         let rows = a.on_signal(&sig("zz", "ETH"), &b, &marks, 0.0);
-        assert!(rows.iter().all(|r| r["reject_reason"] == "NOT_PICKED"));
+        assert!(rows.iter().all(|r| r.0 == "allocator_decisions" && r.1["reject_reason"] == "NOT_PICKED"));
         // The trader halves: the leg too; flat: closed.
         a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.5, entry: false }, &b, &marks, 1.0);
         let l = &port(&a, "EXPDD_10").legs["t0|BTC"];
         assert!((l.size - l.full / 2.0).abs() < 1e-6);
-        a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.0, entry: false }, &b, &marks, 2.0);
+        let rows = a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.0, entry: false }, &b, &marks, 7200.0);
         assert!(!port(&a, "EXPDD_10").legs.contains_key("t0|BTC"));
+        let t = &rows.iter().find(|r| r.0 == "allocator_trades" && r.1["portfolio"] == "EXPDD_10").unwrap().1;
+        assert_eq!((t["reason"].as_str(), t["held_h"].as_f64()), (Some("TRADER_CLOSED"), Some(2.0)));
+        // At the same price: a loss of its fees only (and the spread).
+        assert!(t["pnl"].as_f64().unwrap() < 0.0 && t["pnl"].as_f64().unwrap() > -2.0 * t["fees"].as_f64().unwrap());
         // Per trader: 20% = ten 2% entries, the eleventh refused.
         let mut a = Allocators::new(None);
         a.rerank(&s, 0.0);
@@ -459,7 +514,7 @@ mod tests {
             a.on_signal(&sig("t0", c), &b, &marks, 0.0);
         }
         let rows = a.on_signal(&sig("t0", "K"), &b, &marks, 0.0);
-        assert_eq!(rows.iter().find(|r| r["portfolio"] == "EXPDD_10").unwrap()["reject_reason"], "TRADER_RISK_CAP");
+        assert_eq!(rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10").unwrap().1["reject_reason"], "TRADER_RISK_CAP");
     }
 
     #[test]
@@ -470,9 +525,14 @@ mod tests {
         let marks = |_: &str| Some(100.0);
         a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 1.0, entry: true }, &book(100.0), &marks, 0.0);
         let books: HashMap<String, Book> = [("BTC".to_string(), book(79.0))].into();
-        a.check_stops(&books);
+        let rows = a.check_stops(&books, 1.0);
         let p = port(&a, "EXPDD_10");
         assert!(p.legs.is_empty() && p.stops == 1);
         assert!(p.acct.equity(&|_| Some(79.0)) < START_USD);
+        let t = rows.iter().find(|r| r["portfolio"] == "EXPDD_10").unwrap();
+        assert_eq!(t["reason"], "STOP");
+        // 2% of the portfolio at the stop, a hair more with the fees and the spread.
+        let r = t["r"].as_f64().unwrap();
+        assert!(r < -1.0 && r > -1.1, "{r}");
     }
 }

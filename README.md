@@ -129,7 +129,9 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   all of them followed, for their signals): closed
   trades, PnL, expectancy and its spread, profit factor, drawdown, holding time, slippage,
   PnL over 7 / 30 days (daily equity kept in the state), open risk, coins entered.
-- Eligible for all: a closed trade and PnL above 0. Beyond that each portfolio filters by its
+- Eligible for all: PnL above 0 on history enough: the backtest's, or a paper copy's of 20+
+  closed trades (a copy with no backtest in profit on a trade or two is a coin's toss, and the
+  backtest walked forward had no such). Beyond that each portfolio filters by its
   score only (`Score::min_trades`): a score over the trades' risk (t-statistic: their spread;
   profit factor: the losses; expectancy / drawdown: the drawdown) needs 20 closed trades for
   it to be measured; a sum of the PnL (PnL, expectancy x sqrt(trades)) needs one; at random
@@ -144,8 +146,20 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   new entries only.
 - `allocator_decisions` (migration `2026-10-12-allocator`): each entry per portfolio, with rank,
   score, requested and granted risk and why it was cut or refused (`NOT_PICKED`,
-  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their equity, return, open risk
-  in `bot_status.data.allocators`; each ranking an event `allocator_rank`.
+  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
+  (migration `2026-10-12-allocator-trades`, from generation 2): each position closed, with its
+  own entry and exit price (not the coin's legs' average), PnL net of its fees, R (PnL / the
+  risk granted in USD), hours held and why (`TRADER_CLOSED`, `TRADER_FLIPPED`, `STOP`). Both
+  carry the `generation`. The portfolios' state in `docs` (`allocator`), their equity, return,
+  open risk in `bot_status.data.allocators`; each ranking an event `allocator_rank`. No
+  funding on the portfolios (the copies have it).
+- Report: `python tools/alloc_report.py [--generation N] [--traders PORTFOLIO]` (read-only,
+  `RAILWAY_DATABASE_URL` in `.env`): each portfolio's return, drawdown, trades, R against its
+  `RANDOM_<N>`, and PnL by trader.
+- The criterion, fixed before the paper: after 21 days of a generation, a portfolio works if
+  its return is above its `RANDOM_<N>`'s and its closed trades' mean R is above the random's
+  in 80%+ of bootstrap draws, with 30+ closed trades each; else it is no better than picking
+  at random (before: too early).
 - Walked forward on the backtest (research 2026-10-12: all 6 887 wallets with copy trades,
   ranked every day on the trips closed before it, days 30-90 traded): EXPDD_30 +109% (max
   drawdown 15%), PNLSQRTN_30 +99% (19%), PF_50 +69% (22%), EXPDD_10 +55% (13%), against
@@ -260,7 +274,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
-- `allocator_decisions`: the allocator portfolios' decisions (above).
+- `allocator_decisions`, `allocator_trades`: the allocator portfolios' decisions and closed
+  positions (above).
 - `backtest_stats`: the backtest's statistics of its picks (the allocator's start).
 - `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /

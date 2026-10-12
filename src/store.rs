@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ";
 
 /// The tables `Store::insert` writes to.
-const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions"];
+const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions", "allocator_trades"];
 
 /// One-off changes to what is in the database, by name, oldest first.
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -416,6 +416,32 @@ const MIGRATIONS: &[(&str, &str)] = &[
           reject_reason   text
       );
       CREATE INDEX IF NOT EXISTS allocator_decisions_at ON allocator_decisions (run_id, portfolio, at)"),
+    // The allocator portfolios' positions closed, and their generation (`alloc::GENERATION`:
+    // the portfolios started again) on both.
+    ("2026-10-12-allocator-trades",
+     "ALTER TABLE allocator_decisions ADD COLUMN IF NOT EXISTS generation integer;
+      CREATE TABLE IF NOT EXISTS allocator_trades (
+          id          bigserial   PRIMARY KEY,
+          run_id      text        NOT NULL,
+          generation  integer     NOT NULL,
+          portfolio   text        NOT NULL,
+          trader      text        NOT NULL,
+          coin        text        NOT NULL,
+          side        text        NOT NULL,
+          opened_at   timestamptz NOT NULL,
+          closed_at   timestamptz NOT NULL,
+          held_h      float8      NOT NULL,
+          entry_px    float8      NOT NULL,
+          exit_px     float8      NOT NULL,
+          risk        float8      NOT NULL,
+          risk_usd    float8      NOT NULL,
+          notional    float8      NOT NULL,
+          pnl         float8      NOT NULL,
+          fees        float8      NOT NULL,
+          r           float8      NOT NULL,
+          reason      text        NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS allocator_trades_closed ON allocator_trades (generation, portfolio, closed_at)"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

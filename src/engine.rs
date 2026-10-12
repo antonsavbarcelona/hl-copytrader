@@ -158,26 +158,20 @@ fn fingerprint(t: &Trader) -> u64 {
 }
 
 /// A copy's statistics for the allocator (`alloc::TraderStats`).
+/// A copy's statistics for the allocator from its paper copy (`alloc::TraderStats`).
 fn trader_stats(a: &str, t: &Trader, equity: f64, at: f64, marks: &dyn Fn(&str) -> Option<f64>) -> crate::alloc::TraderStats {
     let s = &t.stats;
     let pnl_since = |days: f64| t.days.iter().find(|d| d.0 >= at - days * 86_400.0 - 43_200.0).map(|d| equity - d.1);
     let open_risk: f64 = t.acct.positions.iter().filter_map(|(c, p)| Some(p.size.abs() * marks(c)? * 0.2)).sum();
-    crate::alloc::TraderStats {
-        trader: a.to_string(),
-        closed_trades: s.trips,
-        pnl_net: equity - t.acct.start,
-        return_pct: (equity / t.acct.start - 1.0) * 100.0,
-        expectancy: if s.trips > 0 { (s.win_usd - s.loss_usd) / s.trips as f64 } else { 0.0 },
-        profit_factor: if s.loss_usd > 0.0 { s.win_usd / s.loss_usd } else if s.win_usd > 0.0 { f64::INFINITY } else { 0.0 },
-        win_rate: if s.trips > 0 { s.wins as f64 / s.trips as f64 } else { 0.0 },
-        max_drawdown_pct: s.max_dd_pct,
-        avg_holding_h: if s.trips > 0 { s.hold_s / s.trips as f64 / 3600.0 } else { 0.0 },
-        avg_slippage_bps: if s.slip_notional > 0.0 { s.slip_usd / s.slip_notional * 1e4 } else { 0.0 },
-        pnl_7d: pnl_since(7.0),
-        pnl_30d: pnl_since(30.0),
-        current_open_risk: if equity > 0.0 { open_risk / equity * 100.0 } else { 0.0 },
-        coins: t.coins.clone(),
-    }
+    let slip = if s.slip_notional > 0.0 { s.slip_usd / s.slip_notional * 1e4 } else { 0.0 };
+    let mut st = crate::alloc::TraderStats::from_trips(a, "paper", s.trips, s.wins, s.win_usd, s.loss_usd, s.pnl_sq, s.max_dd_pct, slip);
+    st.pnl_net = equity - t.acct.start;
+    st.avg_holding_h = if s.trips > 0 { s.hold_s / s.trips as f64 / 3600.0 } else { 0.0 };
+    st.pnl_7d = pnl_since(7.0);
+    st.pnl_30d = pnl_since(30.0);
+    st.current_open_risk = if equity > 0.0 { open_risk / equity * 100.0 } else { 0.0 };
+    st.coins = t.coins.clone();
+    st
 }
 
 /// A `trader_weeks` row with its verdict.
@@ -314,6 +308,9 @@ pub struct Engine {
     listed: HashSet<String>,
     /// The allocator portfolios over the copies (`alloc`).
     alloc: crate::alloc::Allocators,
+    /// The backtest's statistics of its picks (`backtest_stats`): the allocator's until a
+    /// copy's paper has `alloc::MIN_TRADES` closed trades.
+    seed: HashMap<String, crate::alloc::TraderStats>,
     /// The backtest's picks (`backtest_picks`): followed and copied on paper always, not tried
     /// week by week (the paper copies are what checks them).
     picks: HashSet<String>,
@@ -367,15 +364,18 @@ impl Engine {
             full_saved: 0.0,
             listed: HashSet::new(),
             picks: HashSet::new(),
-            alloc: crate::alloc::Allocators::new(),
+            alloc: crate::alloc::Allocators::new(None),
+            seed: HashMap::new(),
             load: Load::default(),
             live: None,
             cfg,
         })
     }
 
-    pub fn set_alloc(&mut self, alloc: crate::alloc::Allocators) {
+    pub fn set_alloc(&mut self, alloc: crate::alloc::Allocators, seed: HashMap<String, crate::alloc::TraderStats>) {
+        log!("allocator: {} portfolios, backtest statistics of {} traders", alloc.portfolios.len(), seed.len());
         self.alloc = alloc;
+        self.seed = seed;
     }
 
     pub fn set_picks(&mut self, picks: HashSet<String>) {
@@ -991,8 +991,16 @@ impl Engine {
                     let n = t.days.len().saturating_sub(DAYS_KEPT);
                     t.days.drain(..n);
                 }
-                stats.push(trader_stats(a, t, equity, at, &marks));
+                let st = trader_stats(a, t, equity, at, &marks);
+                // Its paper copy's once that has trades enough, the backtest's until then.
+                match self.seed.get(a) {
+                    Some(seed) if st.closed_trades < crate::alloc::MIN_TRADES => stats.push(seed.clone()),
+                    _ => stats.push(st),
+                }
             }
+            // The backtest's picks with no copy yet.
+            let have: HashSet<&String> = self.traders.keys().collect();
+            stats.extend(self.seed.iter().filter(|(a, _)| !have.contains(a)).map(|(_, s)| s.clone()));
             stats
         };
         if at - self.alloc.ranked_at >= crate::alloc::RANK_EVERY_S {

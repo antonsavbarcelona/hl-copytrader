@@ -64,10 +64,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         engine.set_live(l);
     }
     engine.set_picks(picks);
-    if let Some(a) = store::load_doc(&cfg, "allocator").await?.and_then(|v| serde_json::from_value::<alloc::Allocators>(v).ok()) {
-        log!("allocator: {} portfolios restored", a.portfolios.len());
-        engine.set_alloc(a);
-    }
+    let saved = store::load_doc(&cfg, "allocator").await?.and_then(|v| serde_json::from_value::<alloc::Allocators>(v).ok());
+    engine.set_alloc(alloc::Allocators::new(saved), store::load_backtest_stats(&cfg).await?);
     let followed = engine.followed.clone();
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

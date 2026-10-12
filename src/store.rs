@@ -393,6 +393,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
       CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
     // The traders the backtest found worth copying, copied on paper to check it (`engine`).
     ("2026-10-11-backtest-picks", include_str!("backtest_picks.sql")),
+    // The backtest's statistics of its picks, the allocator's until a paper copy has its own.
+    ("2026-10-12-backtest-stats", include_str!("backtest_stats.sql")),
     // The allocator portfolios' decisions on each entry (`alloc`).
     ("2026-10-12-allocator",
      "CREATE TABLE IF NOT EXISTS allocator_decisions (
@@ -451,6 +453,30 @@ pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String
         None => std::fs::read_to_string(cfg.data_dir.join("backtest_picks.json")).ok()
             .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default().into_iter().map(|a| a.to_lowercase()).collect(),
     })
+}
+
+/// The backtest's statistics of its picks (`backtest_stats`; `backtest_stats.json` without a
+/// database: address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins}).
+pub async fn load_backtest_stats(cfg: &Config) -> Result<HashMap<String, crate::alloc::TraderStats>> {
+    let rows: Vec<(String, Value)> = match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            migrate(&client).await?;
+            client.query("SELECT address, json_build_object('trips', trips, 'pnl', pnl, 'win_usd', win_usd, 'loss_usd', loss_usd,
+                'max_dd_pct', max_dd_pct, 'pnl_sq', pnl_sq, 'slip_bps', slip_bps, 'coins', coins)::text FROM backtest_stats", &[]).await?
+                .into_iter().filter_map(|r| Some((r.get::<_, String>(0).to_lowercase(), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect()
+        }
+        None => std::fs::read_to_string(cfg.data_dir.join("backtest_stats.json")).ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok()).unwrap_or_default().into_iter().collect(),
+    };
+    Ok(rows.into_iter().map(|(a, v)| {
+        let n = |k: &str| v[k].as_f64().unwrap_or(0.0);
+        let trips = v["trips"].as_u64().unwrap_or(0);
+        let mut s = crate::alloc::TraderStats::from_trips(&a, "backtest", trips, 0, n("win_usd"), n("loss_usd"), n("pnl_sq"), n("max_dd_pct"), n("slip_bps"));
+        s.pnl_net = n("pnl");
+        s.coins = v["coins"].as_object().map(|o| o.iter().map(|(c, x)| (c.clone(), x.as_u64().unwrap_or(0) as u32)).collect()).unwrap_or_default();
+        (a, s)
+    }).collect())
 }
 
 /// The day's list of followed traders saved by this run, if any.

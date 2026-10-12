@@ -48,6 +48,8 @@ pub struct Stats {
     pub wins: u64,
     pub win_usd: f64,
     pub loss_usd: f64,
+    /// Sum of the closed trips' PnL squared (their spread, for the allocator's t-statistic).
+    pub pnl_sq: f64,
     pub hold_s: f64,
     /// Per trip, the deepest it went against us (realized + unrealized, after fees), % of
     /// equity at its open: the risk the trip actually took.
@@ -180,6 +182,7 @@ impl Stats {
 
     pub fn close(&mut self, trip: &Trip, at: f64) {
         self.trips += 1;
+        self.pnl_sq += trip.pnl * trip.pnl;
         if trip.pnl > 0.0 {
             self.wins += 1;
             self.win_usd += trip.pnl;

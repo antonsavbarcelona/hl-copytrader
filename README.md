@@ -108,30 +108,41 @@ minute) is per IP, and the image takes 800 of it.
 
 ## Allocator
 
-A second layer over the paper copies (`src/alloc.rs`), apart from them: four paper portfolios of
+A second layer over the paper copies (`src/alloc.rs`), apart from them: 13 paper portfolios of
 $10 000 that get the same signals as the copies (each followed account's position moves) but
-decide whom to let in. The copies per account go on as they were; this answers whether choosing
-among them adds anything.
+decide whom to let in. The copies per account go on as they were. Each portfolio is a test of
+its own (`MODES`), sharing nothing with the others but the signals: a score to rank the eligible
+traders by and how many of the top it takes, or as many at random (the benchmark).
 
-- Each copy's statistics (its paper copy): closed trips, PnL, expectancy, profit factor, win
-  rate, drawdown, holding time, slippage, PnL over 7 / 30 days (daily equity kept in the
-  state), open risk, coins entered.
-- Eligible: 20+ closed trips, PnL above 0, profit factor above 1.1, drawdown under 15%,
-  slippage under 30 bp. Ranked by expectancy / drawdown. Re-ranked once a day.
-- Portfolios: `EQUAL` the top 10 at 2% risk each; `RANK_WEIGHTED` the top 10 from 2% down to
-  0.5% by rank; `DIVERSIFIED` the top ones but none trading much the same coins (Jaccard of the
-  coins entered under 0.5) and no two of its traders the same way in a coin;
-  `RANDOM_ELIGIBLE_10` 10 eligible at random each day: the benchmark of the ranking.
-- An entry is sized so the 20% stop loses its risk, cut to the portfolio's caps: total open risk
-  10%, per coin 4%, per trader 2%, per direction 6%; under 0.25% it is refused. A position is
-  followed to its end (reduced as the trader reduces, closed when it is flat) or the stop: a
-  trader dropping off the list stops new entries only.
+| score | portfolios |
+|---|---|
+| expectancy / drawdown | `EXPDD_10`, `EXPDD_30`, `EXPDD_50` |
+| PnL | `PNL_10`, `PNL_30` |
+| expectancy x sqrt(trades) | `PNLSQRTN_10`, `PNLSQRTN_30` |
+| profit factor | `PF_30`, `PF_50` |
+| t-statistic of the trades | `TSTAT_30` |
+| at random among the eligible (new each day) | `RANDOM_10`, `RANDOM_30`, `RANDOM_50` |
+
+- Each trader's statistics: its paper copy's once that has 20 closed trades, until then the
+  backtest's (`backtest_stats`, migration `2026-10-12-backtest-stats`, the 975 picks): closed
+  trades, PnL, expectancy and its spread, profit factor, drawdown, holding time, slippage,
+  PnL over 7 / 30 days (daily equity kept in the state), open risk, coins entered.
+- Eligible: 20+ closed trades, PnL above 0, profit factor above 1.1, drawdown under 15%,
+  slippage under 30 bp. Re-ranked once a day.
+- An entry gets 2% risk (the 20% stop loses that much of the portfolio), cut to the limits:
+  total open risk 100% (50 positions at 2%), per trader 10%, per direction 70%, at most 2
+  positions in a coin; under 0.25% it is refused. A position is followed to its end (reduced as
+  the trader reduces, closed when it is flat) or the stop: a trader dropping off the list stops
+  new entries only.
 - `allocator_decisions` (migration `2026-10-12-allocator`): each entry per portfolio, with rank,
-  score, requested and granted risk and why it was cut or refused (`NOT_ELIGIBLE`,
-  `NOT_PICKED`, `TOTAL_RISK_CAP`, `ASSET_RISK_CAP`, `TRADER_RISK_CAP`, `DIRECTION_RISK_CAP`,
-  `DUPLICATE_EXPOSURE`, `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their
-  equity, return, open risk in `bot_status.data.allocators`; each ranking an event
-  `allocator_rank`.
+  score, requested and granted risk and why it was cut or refused (`NOT_PICKED`,
+  `COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `DIRECTION_RISK_CAP`,
+  `TOO_SMALL`). The portfolios' state in `docs` (`allocator`), their equity, return, open risk
+  in `bot_status.data.allocators`; each ranking an event `allocator_rank`.
+- Out of sample on the backtest (ranked on the first 60 of 90 days, traded the last 30):
+  PNL_10 +108%, PNLSQRTN_10 +81%, EXPDD_30 +107%, EXPDD_50 +113%, against +39% / +73% / +73%
+  for 10 / 30 / 50 at random; the rest about as random. One month, at up to 5x on the
+  portfolio, a good month for longs: the paper decides.
 
 ## Live
 
@@ -238,6 +249,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
 - `allocator_decisions`: the allocator portfolios' decisions (above).
+- `backtest_stats`: the backtest's statistics of its picks (the allocator's start).
 - `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /
   again / out) and why (migration `2026-10-10-trader-weeks`).

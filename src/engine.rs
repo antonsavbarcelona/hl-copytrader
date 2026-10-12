@@ -826,6 +826,11 @@ impl Engine {
             let b = self.books.read().unwrap();
             self.alloc.check_stops(&b);
         }
+        // The allocator's first ranking at once (the books in after a few ticks), not with the
+        // first status 10 min on: its portfolios would refuse every entry till then.
+        if self.alloc.ranked_at == 0.0 && self.load.ticks == 6 {
+            self.allocate();
+        }
         let tick = started.elapsed().as_secs_f64() * 1000.0;
         self.load.ticks += 1;
         self.load.tick_ms += tick;

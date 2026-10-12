@@ -7,9 +7,11 @@
 //! anything over picking among the eligible blindly?). They share nothing but the signals.
 //!
 //!   - Each trader's statistics (`TraderStats`): its paper copy's once that has `MIN_TRADES`
-//!     closed trips, until then the backtest's (`backtest_stats`) if it has them. Eligible:
-//!     `MIN_TRADES`+ closed trips, PnL above 0, profit factor above `MIN_PF`, drawdown under
-//!     `MAX_DD_PCT`, slippage under `MAX_SLIP_BP`.
+//!     closed trips, until then the backtest's (`backtest_stats`) if it has them.
+//!   - Eligible for all: a closed trip and PnL above 0. Beyond that a portfolio's filter is
+//!     its score's own (`Score::min_trades`): a score over the trips' risk (their spread, the
+//!     losses, the drawdown) needs `RISK_TRADES` trips for that to be measured at all; a sum
+//!     of the PnL needs none. Nothing the score itself weighs is filtered again.
 //!   - Scores: expectancy / drawdown, PnL, t-statistic of the trips, profit factor, expectancy
 //!     x sqrt(trips). Re-ranked once a day (`RANK_EVERY_S`).
 //!   - A picked trader's entry gets `RISK` (its stop `STOP` away loses that much of the
@@ -41,9 +43,10 @@ const CAP_TOTAL: f64 = 1.00;
 const CAP_TRADER: f64 = 0.20;
 const MAX_PER_COIN: usize = 2;
 pub const MIN_TRADES: u64 = 20;
-const MIN_PF: f64 = 1.1;
-const MAX_DD_PCT: f64 = 15.0;
-const MAX_SLIP_BP: f64 = 30.0;
+/// Closed trips a score over their risk needs (`Score::min_trades`).
+const RISK_TRADES: u64 = 20;
+/// The portfolios' generation: a saved state of another is not restored (started again).
+const GENERATION: u32 = 2;
 const MIN_ORDER_USD: f64 = 10.0;
 
 /// The portfolios: name, score (None: at random among the eligible), how many traders.
@@ -70,6 +73,18 @@ pub enum Score {
     TStat,
     Pf,
     PnlSqrtN,
+}
+
+impl Score {
+    /// The closed trips a trader needs for the score to mean anything: over their risk
+    /// (t-statistic: their spread; profit factor: the losses; expectancy / drawdown: the
+    /// drawdown) `RISK_TRADES`, a sum of their PnL (PnL, expectancy x sqrt(trips)) one.
+    pub fn min_trades(self) -> u64 {
+        match self {
+            Score::TStat | Score::Pf | Score::ExpDd => RISK_TRADES,
+            Score::Pnl | Score::PnlSqrtN => 1,
+        }
+    }
 }
 
 /// A trader's statistics: its paper copy's, or the backtest's (`source`).
@@ -113,18 +128,12 @@ impl TraderStats {
         }
     }
 
-    /// Why it is not eligible (None: it is).
+    /// Why it is not eligible for any portfolio (None: it is).
     pub fn ineligible(&self) -> Option<&'static str> {
-        if self.closed_trades < MIN_TRADES {
-            Some("too few closed trades")
+        if self.closed_trades == 0 {
+            Some("no closed trades")
         } else if self.pnl_net <= 0.0 {
             Some("at a loss")
-        } else if self.profit_factor <= MIN_PF {
-            Some("profit factor")
-        } else if self.max_drawdown_pct >= MAX_DD_PCT {
-            Some("drawdown")
-        } else if self.avg_slippage_bps >= MAX_SLIP_BP {
-            Some("slippage")
         } else {
             None
         }
@@ -196,6 +205,8 @@ pub struct Allocators {
     /// How many traders' backtest statistics it was ranked with (a different set: rank again).
     #[serde(default)]
     pub seeded: usize,
+    #[serde(default)]
+    pub generation: u32,
 }
 
 fn key(user: &str, coin: &str) -> String {
@@ -203,8 +214,10 @@ fn key(user: &str, coin: &str) -> String {
 }
 
 impl Allocators {
-    /// The portfolios of `MODES` (any kept from `saved` by name, the rest new).
+    /// The portfolios of `MODES` (any kept from `saved` by name, the rest new; none of a
+    /// saved state of another `GENERATION`).
     pub fn new(saved: Option<Allocators>) -> Self {
+        let saved = saved.filter(|s| s.generation == GENERATION);
         let mut old: HashMap<String, Portfolio> = saved.as_ref().map(|s| s.portfolios.iter().map(|p| (p.name.clone(), p.clone())).collect()).unwrap_or_default();
         let portfolios = MODES.iter().map(|(n, ..)| old.remove(*n).unwrap_or_else(|| Portfolio { name: n.to_string(), acct: Account::new(START_USD), ..Default::default() })).collect();
         Self {
@@ -212,10 +225,12 @@ impl Allocators {
             eligible: saved.as_ref().map(|s| s.eligible).unwrap_or(0),
             seeded: saved.as_ref().map(|s| s.seeded).unwrap_or(0),
             ranked_at: saved.map(|s| s.ranked_at).unwrap_or(0.0),
+            generation: GENERATION,
         }
     }
 
-    /// Ranks the eligible traders and picks each portfolio's.
+    /// Ranks the eligible traders and picks each portfolio's: those with its score's
+    /// `min_trades`, at random from all.
     pub fn rerank(&mut self, stats: &[TraderStats], at: f64) -> Value {
         let elig: Vec<&TraderStats> = stats.iter().filter(|s| s.ineligible().is_none()).collect();
         self.eligible = elig.len();
@@ -224,7 +239,7 @@ impl Allocators {
         for (i, (name, score, n)) in MODES.iter().enumerate() {
             let chosen: Vec<(usize, &TraderStats, f64)> = match score {
                 Some(s) => {
-                    let mut v: Vec<&TraderStats> = elig.clone();
+                    let mut v: Vec<&TraderStats> = elig.iter().copied().filter(|t| t.closed_trades >= s.min_trades()).collect();
                     v.sort_by(|a, b| b.score(*s).total_cmp(&a.score(*s)));
                     v.into_iter().take(*n).enumerate().map(|(k, t)| (k + 1, t, t.score(*s))).collect()
                 }
@@ -393,18 +408,23 @@ mod tests {
     #[test]
     fn modes_rank_on_their_own() {
         // b: the better expectancy / drawdown; a: the bigger PnL.
-        let s = [stats("a", 100, 5.0, 10.0), stats("b", 30, 5.0, 1.0), stats("c", 10, 50.0, 1.0)];
-        assert_eq!(s[2].ineligible(), Some("too few closed trades"));
+        // c: few trips, the biggest PnL; d: at a loss.
+        let s = [stats("a", 100, 5.0, 10.0), stats("b", 30, 5.0, 1.0), stats("c", 10, 60.0, 1.0), stats("d", 50, -1.0, 1.0)];
+        assert_eq!(s[3].ineligible(), Some("at a loss"));
         let mut a = Allocators::new(None);
         assert_eq!(a.portfolios.len(), MODES.len());
         a.rerank(&s, 0.0);
         assert_eq!(port(&a, "EXPDD_10").picked["b"].0, 1);
-        assert_eq!(port(&a, "PNL_10").picked["a"].0, 1);
-        assert!(!port(&a, "PNL_10").picked.contains_key("c"));
-        assert_eq!(port(&a, "RANDOM_10").picked.len(), 2);
-        // Kept across a restart by name.
+        // A score over the trips' risk: not on 10 trips; a sum of their PnL: on any.
+        assert!(!port(&a, "EXPDD_10").picked.contains_key("c") && !port(&a, "TSTAT_30").picked.contains_key("c"));
+        assert_eq!(port(&a, "PNL_10").picked["c"].0, 1);
+        assert!(!port(&a, "PNL_10").picked.contains_key("d"));
+        assert_eq!(port(&a, "RANDOM_10").picked.len(), 3);
+        // Kept across a restart by name; not from another generation.
         let b = Allocators::new(Some(a.clone()));
-        assert_eq!(port(&b, "PNL_10").picked.len(), 2);
+        assert_eq!(port(&b, "PNL_10").picked.len(), 3);
+        let b = Allocators::new(Some(Allocators { generation: 1, ..a.clone() }));
+        assert!(port(&b, "PNL_10").picked.is_empty() && b.ranked_at == 0.0);
     }
 
     #[test]

@@ -395,6 +395,8 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("2026-10-11-backtest-picks", include_str!("backtest_picks.sql")),
     // The backtest's statistics of its picks, the allocator's until a paper copy has its own.
     ("2026-10-12-backtest-stats", include_str!("backtest_stats.sql")),
+    // ... and of all the wallets with copy trades, not only the picks.
+    ("2026-10-12-backtest-stats-all", include_str!("backtest_stats_all.sql")),
     // The allocator portfolios' decisions on each entry (`alloc`).
     ("2026-10-12-allocator",
      "CREATE TABLE IF NOT EXISTS allocator_decisions (

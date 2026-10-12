@@ -373,9 +373,15 @@ impl Engine {
     }
 
     pub fn set_alloc(&mut self, alloc: crate::alloc::Allocators, seed: HashMap<String, crate::alloc::TraderStats>) {
-        log!("allocator: {} portfolios, backtest statistics of {} traders", alloc.portfolios.len(), seed.len());
+        log!("allocator: {} portfolios, backtest statistics of {} traders (all followed)", alloc.portfolios.len(), seed.len());
         self.alloc = alloc;
+        // Other backtest statistics than it was ranked with: rank again at once.
+        if self.alloc.seeded != seed.len() {
+            self.alloc.ranked_at = 0.0;
+            self.alloc.seeded = seed.len();
+        }
         self.seed = seed;
+        self.refollow();
     }
 
     pub fn set_picks(&mut self, picks: HashSet<String>) {
@@ -480,6 +486,8 @@ impl Engine {
         let out = |a: &String| self.traders.get(a).is_some_and(|t| t.trial.rejected_until > at);
         let mut set: HashSet<String> = self.listed.iter().filter(|a| !out(a)).cloned().collect();
         set.extend(self.picks.iter().cloned());
+        // Every trader the allocator can rank by the backtest: it needs their signals.
+        set.extend(self.seed.keys().cloned());
         set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
         let n = set.len();
         *self.followed.write().unwrap() = set;

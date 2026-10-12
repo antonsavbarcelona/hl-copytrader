@@ -124,7 +124,9 @@ traders by and how many of the top it takes, or as many at random (the benchmark
 | at random among the eligible (new each day) | `RANDOM_10`, `RANDOM_30`, `RANDOM_50` |
 
 - Each trader's statistics: its paper copy's once that has 20 closed trades, until then the
-  backtest's (`backtest_stats`, migration `2026-10-12-backtest-stats`, the 975 picks): closed
+  backtest's (`backtest_stats`, migrations `2026-10-12-backtest-stats` and `-all`: all 6 887
+  wallets with copy trades, as the allocator was walked forward on, not only the 975 picks;
+  all of them followed, for their signals): closed
   trades, PnL, expectancy and its spread, profit factor, drawdown, holding time, slippage,
   PnL over 7 / 30 days (daily equity kept in the state), open risk, coins entered.
 - Eligible: 20+ closed trades, PnL above 0, profit factor above 1.1, drawdown under 15%,

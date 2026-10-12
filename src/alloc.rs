@@ -193,6 +193,9 @@ pub struct Allocators {
     /// Eligible traders as of `ranked_at`.
     pub eligible: usize,
     pub ranked_at: f64,
+    /// How many traders' backtest statistics it was ranked with (a different set: rank again).
+    #[serde(default)]
+    pub seeded: usize,
 }
 
 fn key(user: &str, coin: &str) -> String {
@@ -204,7 +207,12 @@ impl Allocators {
     pub fn new(saved: Option<Allocators>) -> Self {
         let mut old: HashMap<String, Portfolio> = saved.as_ref().map(|s| s.portfolios.iter().map(|p| (p.name.clone(), p.clone())).collect()).unwrap_or_default();
         let portfolios = MODES.iter().map(|(n, ..)| old.remove(*n).unwrap_or_else(|| Portfolio { name: n.to_string(), acct: Account::new(START_USD), ..Default::default() })).collect();
-        Self { portfolios, eligible: saved.as_ref().map(|s| s.eligible).unwrap_or(0), ranked_at: saved.map(|s| s.ranked_at).unwrap_or(0.0) }
+        Self {
+            portfolios,
+            eligible: saved.as_ref().map(|s| s.eligible).unwrap_or(0),
+            seeded: saved.as_ref().map(|s| s.seeded).unwrap_or(0),
+            ranked_at: saved.map(|s| s.ranked_at).unwrap_or(0.0),
+        }
     }
 
     /// Ranks the eligible traders and picks each portfolio's.

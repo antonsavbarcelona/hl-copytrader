@@ -701,7 +701,7 @@ impl Engine {
         // The allocator portfolios get the same move.
         let peak = t.legs.get(coin).map(|l| l.peak).unwrap_or(0.0);
         let signal = crate::alloc::Signal { user: user.to_string(), coin: coin.to_string(), dir: theirs.signum(),
-            frac: if peak > 0.0 { theirs.abs() / peak } else { 0.0 }, entry: opened };
+            frac: if peak > 0.0 { theirs.abs() / peak } else { 0.0 }, size: theirs.abs(), entry: opened };
         let rows = {
             let b = self.books.read().unwrap();
             let marks = |c: &str| b.get(c).and_then(Book::mid);
@@ -988,8 +988,9 @@ impl Engine {
     }
 
     /// Every 10 min (with the status): each copy's equity at the day's start, the allocator's
-    /// ranking once a day (`alloc::RANK_EVERY_S`), its state saved every `alloc::SAVE_EVERY_S`; its
-    /// portfolios' status.
+    /// ranking once a day (`alloc::RANK_EVERY_S`), its state saved every `alloc::SAVE_EVERY_S`, each
+    /// portfolio's status a row of `allocator_status` every `alloc::STATUS_EVERY_S`; the
+    /// portfolios in all (for `bot_status`).
     fn allocate(&mut self) -> serde_json::Value {
         let at = now();
         let day = (at / 86_400.0).floor() * 86_400.0;
@@ -1029,7 +1030,14 @@ impl Engine {
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
         let status = self.alloc.status(&marks);
+        let rows = (at - self.alloc.status_at >= crate::alloc::STATUS_EVERY_S).then(|| self.alloc.status_rows(&marks, at));
         drop(b);
+        if let Some(rows) = rows {
+            self.alloc.status_at = at;
+            for row in rows {
+                self.store.insert("allocator_status", row);
+            }
+        }
         if at - self.alloc.saved_at >= crate::alloc::SAVE_EVERY_S {
             self.alloc.saved_at = at;
             let (cfg, doc) = (self.cfg.clone(), serde_json::to_value(&self.alloc).unwrap_or_default());

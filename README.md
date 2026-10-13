@@ -112,75 +112,85 @@ A second layer over the paper copies (`src/alloc.rs`), apart from them: paper po
 $10 000 that get the same signals as the copies (each followed account's position moves) but
 decide whom to let in. The copies per account go on as they were. Each portfolio is a test of
 its own (`modes`), sharing nothing with the others but the signals. From generation 4 they are
-a grid, every combination run (paper costs nothing): 8 x 5 x 3 x 3 = 360 portfolios.
+a grid, every combination run (paper costs nothing): 22 x 5 x 3 x 3 x 2 = 1 980 portfolios.
 
 | | values |
 |---|---|
-| who: a score to rank the eligible by, or at random (3 draws: the benchmark) | expectancy / drawdown `EXPDD`, PnL `PNL`, expectancy x sqrt(trades) `PNLSQRTN`, profit factor `PF`, t-statistic `TSTAT`; `RANDOM1`, `RANDOM2`, `RANDOM3` |
+| who: a score to rank the eligible by, or at random (10 draws: the benchmark) | over the trades: expectancy / drawdown `EXPDD`, PnL `PNL`, expectancy x sqrt(trades) `PNLSQRTN`, profit factor `PF`, t-statistic `TSTAT`, expectancy less 2 standard errors `LCB`; over time: daily `SHARPE`, `SORTINO`, return a month / max drawdown `CALMAR`, PnL of the last 30 days `PNL30`, share of weeks in profit `WEEKS`; `COMBO`, the mean percentile over all of them; `RANDOM1`..`RANDOM10` |
 | how many of the top (or at random) | 10, 20, 30, 50, 100 |
 | risk an entry (lost at its 20% stop) | 0.5%, 1%, 2% |
 | cap on the open risk in one direction | 20%, 50%, 100% (none but the total's) |
+| the trader's adds | not followed; followed (`_ADD`) up to 2x the entry (as much risk) |
 
-Named `EXPDD_20_R0.5_D20`, `RANDOM2_20_R0.5_D20`. A draw picks the same traders at every risk
-and cap, so those portfolios differ by their sizing alone; each score's portfolio is judged
-against the three draws of its size, risk and cap (the spread of chance, not one draw).
+Named `EXPDD_20_R0.5_D20`, `RANDOM7_20_R0.5_D20_ADD`. A draw picks the same traders at every
+sizing, so those portfolios differ by their sizing alone; each score's portfolio is ranked
+among the ten draws of its traders and sizing (the spread of chance, not one draw).
 
-- Each trader's statistics: the backtest's over 90 days, the source of truth (`backtest_stats`, migrations `2026-10-12-backtest-stats` and `-all`: all 6 887
-  wallets with copy trades, as the allocator was walked forward on, not only the 975 picks;
-  all of them followed, for their signals): closed trades, PnL, expectancy and its spread,
+- Each trader's statistics: the backtest's over 90 days, the source of truth (`backtest_stats`,
+  migrations `2026-10-12-backtest-stats`, `-all`: all 6 887 wallets with copy trades, as the
+  allocator was walked forward on; all of them followed, for their signals; `-time` from
+  generation 4: daily Sharpe / Sortino, Calmar, PnL of the last 30 days, weeks in profit, from
+  the same trips as of the backtest's end): closed trades, PnL, expectancy and its spread,
   profit factor, drawdown, slippage, coins entered. The paper copies only calibrate the
-  backtester: a copy's own statistics (with holding time, PnL over 7 / 30 days, open risk)
-  take the backtest's place only after 90 days copied without a break (`PAPER_DAYS`, since
-  its enrollment). A trader with neither is not ranked. (Generations 1-3 let a paper copy of
-  20 closed trades replace the backtest: in generation 3, 304 of 530 entries were of three
-  traders on a day of paper, two of them scalpers the backtest had at a loss.)
-- Eligible for all: PnL above 0 (from paper, on 20+ closed trades). Beyond that each portfolio filters by its
-  score only (`Score::min_trades`): a score over the trades' risk (t-statistic: their spread;
-  profit factor: the losses; expectancy / drawdown: the drawdown) or their number
-  (expectancy x sqrt(trades) is the PnL / sqrt(trades): the fewer, the higher) needs 20
-  closed trades for it to be measured; the PnL alone needs one; at random draws from all the
-  eligible. Nothing the score itself weighs is filtered again (slippage is in the PnL
-  already). Re-ranked once a day. Generation 4 (the portfolios started again at $10 000):
-  ranked on the backtest only. Generation 3 (2026-10-12 22:30 UTC on): paper of 20 trades in
-  place of the backtest; generation 2 (20:07-22:30): also PNLSQRTN on any number of trades,
-  its top traders of 1-5; generation 1: all had 20+ trades, profit factor above 1.1, drawdown
-  under 15%, slippage under 30 bp.
+  backtester: a copy's own statistics take the backtest's place only after 90 days copied
+  without a break (`PAPER_DAYS`, since its enrollment). A trader with neither is not ranked.
+  (Generations 1-3 let a paper copy of 20 closed trades replace the backtest: in generation 3,
+  304 of 530 entries were of three traders on a day of paper, two of them scalpers the
+  backtest had at a loss.)
+- Eligible for all: PnL above 0 (from paper, on 20+ closed trades). Beyond that each portfolio
+  filters by its score only (`Score::min_trades`): a score over the trades' risk, their number
+  or their time needs 20 closed trades for it to be measured; a PnL sum (`PNL`, `PNL30`) one;
+  at random draws from all the eligible. Nothing the score itself weighs is filtered again
+  (slippage is in the PnL already). Re-ranked once a day and at every start (the picks are not
+  saved: the statistics are fixed and the draws seeded by the day, so a start picks the same).
+  Generation 4 (the portfolios started again at $10 000): the grid, ranked on the backtest
+  only. Generation 3 (2026-10-12 22:30 UTC on): paper of 20 trades in place of the backtest;
+  generation 2 (20:07-22:30): also PNLSQRTN on any number of trades, its top traders of 1-5;
+  generation 1: all had 20+ trades, profit factor above 1.1, drawdown under 15%, slippage
+  under 30 bp.
 - An entry gets its portfolio's risk (the 20% stop loses that much of the portfolio), cut to
   the limits: open risk in its direction (its cap: the traders mostly long together, so a
   portfolio is mostly one way; walked forward at 1% an entry, the real drawdown with open
   positions was 50-60% with no cap, ~20% at 30% in all), in all 100%, per trader 20%, at most 2
-  positions in a coin; under an eighth of its risk it is refused. A position is followed to its end (reduced as
-  the trader reduces, closed when it is flat) or the stop: a trader dropping off the list stops
-  new entries only.
-- `allocator_decisions` (migration `2026-10-12-allocator`): each entry of a picked trader per
-  portfolio, with rank, score, requested and granted risk and why it was cut or refused
-  (`COIN_POSITIONS_CAP`, `DIRECTION_RISK_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
-  (migration `2026-10-12-allocator-trades`, from generation 2): each position closed, with its
-  own entry and exit price (not the coin's legs' average), PnL net of its fees, R (PnL / the
-  risk granted in USD), hours held and why (`TRADER_CLOSED`, `TRADER_FLIPPED`, `STOP`). Both
-  carry the `generation`. The portfolios' state in `docs` (`allocator`, saved every 30 min and
-  at shutdown: a few MB), their equity, return, open risk (and of it long), entries of traders not picked (`not_picked`: counted only; until generation 3 a
-  `NOT_PICKED` row each, 99% of the rows) in `bot_status.data.allocators`; each ranking an event `allocator_rank`. No
-  funding on the portfolios (the copies have it).
-- Report: `python tools/alloc_report.py [--generation N] [--risk 0.5] [--cap 20] [--detail
-  NAME] [--traders NAME]` (read-only, `RAILWAY_DATABASE_URL` in `.env`): a block per risk and
-  cap, each score's return and drawdown at each size with its verdict, the random draws' range;
-  one portfolio's numbers, its PnL by trader. `python tools/alloc_audit.py`: an independent
+  positions in a coin; under an eighth of its risk it is refused. A position is followed to
+  its end (reduced as the trader reduces, closed when it is flat) or the stop: a trader
+  dropping off the list stops new entries only. With adds (`_ADD`): as the trader adds, so
+  does it, up to 2x its entry, within the caps; its stop 20% from its average entry; reduced
+  from its size at the trader's peak. (On the backtest the added money earned 51 bp a dollar
+  against 32 bp for the entries; in the portfolios walked forward it raised the drawdown more
+  than the return: the paper decides.)
+- `allocator_decisions` (migration `2026-10-12-allocator`): each entry of a picked trader that
+  a cap cut or refused (from generation 4; before, every entry), with rank, score, requested
+  and granted risk and why (`COIN_POSITIONS_CAP`, `DIRECTION_RISK_CAP`, `TOTAL_RISK_CAP`,
+  `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades` (migrations `2026-10-12-allocator-trades`,
+  `2026-10-13-allocator-status`): each position closed, with its own entry and exit price (not
+  the coin's legs' average), PnL net of its fees, R (PnL / the risk granted in USD), the most
+  it grew with adds (`max_x`), hours held and why (`TRADER_CLOSED`, `TRADER_FLIPPED`, `STOP`).
+  `allocator_status` (from generation 4): each portfolio's equity, return, open risk (and of it
+  long), entries, refusals, stops, entries of traders not picked, every hour. All carry the
+  `generation`. The state in `docs` (`allocator`, saved every hour and at shutdown: some MB);
+  the portfolios in all in `bot_status.data.allocators`; each ranking an event
+  `allocator_rank`. No funding on the portfolios (the copies have it).
+- Report: `python tools/alloc_report.py [--generation N] [--score NAME] [--detail NAME]
+  [--traders NAME]` (read-only, `RAILWAY_DATABASE_URL` in `.env`): each score's mean rank among
+  the random draws at each size and its verdict, each sizing's return and drawdown; a score's
+  portfolios; one portfolio, its PnL by trader. `python tools/alloc_audit.py`: an independent
   check of the portfolios from the database (filters, caps, sizing, stops, PnL, the books).
-- The criterion, fixed before the paper: after 21 days of a generation, a portfolio works if
-  its return is above all three random draws' of its size, risk and cap, and its closed
-  trades' mean R is above theirs in 80%+ of bootstrap draws, with 30+ closed trades each; else
-  it is no better than picking at random (before: too early).
-- Walked forward on the backtest (research 2026-10-12: all 6 887 wallets with copy trades,
-  ranked every day on the trips closed before it, days 30-90 traded): EXPDD_30 +109% (max
-  drawdown 15%), PNLSQRTN_30 +99% (19%), PF_50 +69% (22%), EXPDD_10 +55% (13%), against
-  +3% / +24% / +23% for 10 / 30 / 50 at random (30 draws; drawdown 22-35%); PNL_10 -1% (41%),
-  TSTAT_30 +5% (33%). At up to 5x on a portfolio, in two months good for longs: the paper
-  decides. With each score's own filter (generation 2, same walk; PNLSQRTN on 1+ trades, 20+
-  from generation 3: +145% / +40% for 30 / 10): PNLSQRTN_30 +164% (21%),
-  PNL_30 +129% (28%), EXPDD_30 +111% (22%), PNLSQRTN_10 +74% (18%), EXPDD_50 +73% (25%), PF_50
-  +61% (24%), EXPDD_10 +55% (11%), PF_30 +51% (18%), TSTAT_30 +36% (28%), PNL_10 +34% (36%),
-  against +1% / +29% / +41% at random from all the eligible (median of 10 draws).
+- The criterion, fixed before the paper: a score is judged on all its 90 portfolios, never on
+  one (among 990 some beat chance by chance). Each is ranked by return among the ten random
+  draws of its traders and sizing (0-10; at random, 5 on average). After 21 days of a
+  generation a score works if its mean rank is 7.5+ and above 5 at 4 of its 5 sizes; else it
+  is no better than picking at random (before: too early).
+- Walked forward on the backtest (research 2026-10-12/13: all 6 887 wallets with copy trades,
+  ranked every day on the trips closed before it, days 10-90 traded; one period, good for
+  longs; the paper decides). Rank among 10 draws, mean over 10 / 20 / 30 / 50 / 100 traders, at
+  0.5% an entry and 20% in one direction: PNL 7.0, COMBO 6.8, PNL30 6.8, LCB 6.6, EXPDD 6.4,
+  PNLSQRTN 5.8, TSTAT 4.4, PF 4.2, WEEKS 3.6, SORTINO 1.8, CALMAR 1.4, SHARPE 0.6 (at 10-30
+  traders the first five beat all ten draws; at 100 none beat any: the cap fills with whoever
+  comes first); at 1% and no cap: PNL30 10.0, COMBO 10.0, PNL 9.8, LCB 9.8, PNLSQRTN 8.2,
+  EXPDD 7.6, WEEKS 7.2, TSTAT 5.2, PF 4.4, SORTINO 4.4, CALMAR 3.8, SHARPE 3.0. Returns over
+  80 days at 0.5% / 20%: the best +25..+35% at a real drawdown (open positions) of 10-15%,
+  against +7% for 20 at random; at 1% with no cap +50..+113% but a real drawdown of 30-55%.
 
 ## Live
 
@@ -286,8 +296,8 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
 - `docs`: named state documents of a run (`live`: the live account's positions).
 - `live_checks`: the live account's health check at every start (migration
   `2026-10-09-live-checks`).
-- `allocator_decisions`, `allocator_trades`: the allocator portfolios' decisions and closed
-  positions (above).
+- `allocator_decisions`, `allocator_trades`, `allocator_status`: the allocator portfolios'
+  decisions, closed positions and hourly status (above).
 - `backtest_stats`: the backtest's statistics of its picks (the allocator's start).
 - `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /

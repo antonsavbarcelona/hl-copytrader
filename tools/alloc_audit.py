@@ -10,7 +10,7 @@ Run: python tools/alloc_audit.py [generation]  (reads RAILWAY_DATABASE_URL from 
      granted under its portfolio's risk says which cap cut it;
   3. each position's size is its risk over the 20% stop (notional = 5 x its risk in USD, to the
      re-averaging of its entry as it adds);
-  4. stops: each lost ~1 R, no other close lost more (a stop missed);
+  4. stops: each lost ~1 R (to 2 R with adds), no other close lost more (a stop missed);
   5. each position's PnL has the sign of its price move (its prices are averages: a path of
      adds and reduces can turn it, so a handful is no fault);
   6. the books: each portfolio's account and its positions, booked by separate code, give the
@@ -23,14 +23,17 @@ import psycopg2
 ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
 url = os.environ.get('RAILWAY_DATABASE_URL') or [l.split('=', 1)[1].strip() for l in open(ENV) if l.startswith('RAILWAY_DATABASE_URL=')][0]
 c = psycopg2.connect(url, connect_timeout=20); c.set_session(readonly=True); cur = c.cursor()
-RISK_SCORES = ('EXPDD', 'PF', 'TSTAT', 'PNLSQRTN')
+# Scores that are a PnL sum need a closed trip; the rest (and paper) 20.
+PNL_SUMS = ('PNL_', 'PNL30_', 'RANDOM')
 ok = lambda b: 'OK  ' if b else 'FAIL'
 
 cur.execute("select state, updated_at from docs where name = 'allocator'")
 doc, doc_at = cur.fetchone()
 GEN = int(sys.argv[1]) if len(sys.argv) > 1 else doc['generation']
+cur.execute("select count(*) from information_schema.columns where table_name = 'allocator_trades' and column_name = 'max_x'")
+max_x = 'coalesce(max_x, 1)' if cur.fetchone()[0] else '1.0::float8'   # (from generation 4)
 cur.execute("""select portfolio, trader, coin, side, extract(epoch from opened_at), extract(epoch from closed_at), entry_px, exit_px,
-  risk, risk_usd, notional, pnl, fees, r, reason, closed_at from allocator_trades where generation = %s order by closed_at""", (GEN,))
+  risk, risk_usd, notional, pnl, fees, r, reason, closed_at, {max_x} from allocator_trades where generation = %s order by closed_at""".format(max_x=max_x), (GEN,))
 T = cur.fetchall()
 cur.execute("""select portfolio, trader, coin, granted_risk, reject_reason, requested_risk from allocator_decisions where generation = %s""", (GEN,))
 D = cur.fetchall()
@@ -44,15 +47,20 @@ cur.execute("""select address, (state->'stats'->>'trips')::int, equity - (state-
   extract(epoch from now()) - (state->>'enrolled_at')::float8 >= 90 * 86400 from copy_accounts""")
 paper = {a: (t or 0, p) for a, t, p, aged in cur.fetchall() if aged or GEN < 4}
 granted = [d for d in D if d[3] > 0]
+# Every (portfolio, trader) entered: positions closed, open in the state, entries cut (from
+# generation 4 an entry granted in full has no decision row).
+entered = {(x[0], x[1]) for x in T} | {(d[0], d[1]) for d in granted}
+if doc['generation'] == GEN:
+    entered |= {(po['name'], l['user']) for po in doc['portfolios'] for l in po['legs'].values()}
 bad = []
-for p, u, coin, g, why, _req in granted:
+for p, u in sorted(entered):
     paper_wins = u in paper and (u not in bt or GEN >= 4 or paper[u][0] >= 20)
     src, (trips, pnl) = ('paper', paper[u]) if paper_wins else ('backtest', bt.get(u, (0, 0)))
     if u not in bt and u not in paper:
         bad.append((p, u[:10], 'unknown'))
-    elif trips < (20 if p.startswith(RISK_SCORES) or src == 'paper' else 1) or pnl <= 0:
+    elif trips < (1 if p.startswith(PNL_SUMS) and src != 'paper' else 20) or pnl <= 0:
         bad.append((p, u[:10], src, trips, round(pnl, 1)))
-print(f"{ok(not bad)} 1. entries' traders pass the filters: {len(granted)} checked, {len(bad)} not"
+print(f"{ok(not bad)} 1. entries' traders pass the filters: {len(entered)} portfolio-traders checked, {len(bad)} not"
       "  (a paper copy's statistics as now, not as at its ranking)")
 for b in bad[:8]:
     print("       ", b)
@@ -82,10 +90,11 @@ if ratio:
     print(f"{ok(not off)} 3. size = risk / 20% stop: notional / risk in USD {min(ratio):.3f}..{max(ratio):.3f}, {len(off)} off by 3%+")
 
 # 4. Stops.
-stops = [x[13] for x in T if x[14] == 'STOP']
-worst = min([x[13] for x in T if x[14] != 'STOP'] or [0])
-print(f"{ok(all(-1.3 < r < -0.95 for r in stops) and worst > -1.05)} 4. stops: {len(stops)}"
-      f"{' at R ' + ', '.join(f'{r:+.2f}' for r in stops[:10]) if stops else ''}; the worst other close R {worst:+.2f}")
+#    (A position grown with the trader's adds, up to max_x times its entry, can lose that many R.)
+stops = [(x[13], x[16]) for x in T if x[14] == 'STOP']
+worst = min([x[13] / x[16] for x in T if x[14] != 'STOP'] or [0])
+print(f"{ok(all(-1.3 * mx < r < -0.95 for r, mx in stops) and worst > -1.05)} 4. stops: {len(stops)}"
+      f"{' at R ' + ', '.join(f'{r:+.2f}' for r, _ in stops[:10]) if stops else ''}; the worst other close R per its size {worst:+.2f}")
 
 # 5. PnL against the price move.
 turned = []

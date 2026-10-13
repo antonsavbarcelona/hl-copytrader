@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 ";
 
 /// The tables `Store::insert` writes to.
-const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions", "allocator_trades"];
+const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions", "allocator_trades", "allocator_status"];
 
 /// One-off changes to what is in the database, by name, oldest first.
 const MIGRATIONS: &[(&str, &str)] = &[
@@ -442,6 +442,30 @@ const MIGRATIONS: &[(&str, &str)] = &[
           reason      text        NOT NULL
       );
       CREATE INDEX IF NOT EXISTS allocator_trades_closed ON allocator_trades (generation, portfolio, closed_at)"),
+    // The backtest's statistics over time, for the allocator's scores over time.
+    ("2026-10-13-backtest-stats-time", include_str!("backtest_stats_time.sql")),
+    // The allocator's grid (generation 4): each portfolio's status an hour (too many for
+    // bot_status), and how far a position grew with the trader's adds.
+    ("2026-10-13-allocator-status",
+     "ALTER TABLE allocator_trades ADD COLUMN IF NOT EXISTS max_x float8;
+      CREATE TABLE IF NOT EXISTS allocator_status (
+          id             bigserial   PRIMARY KEY,
+          run_id         text        NOT NULL,
+          generation     integer     NOT NULL,
+          at             timestamptz NOT NULL,
+          portfolio      text        NOT NULL,
+          equity         float8      NOT NULL,
+          return_pct     float8      NOT NULL,
+          open_risk_pct  float8      NOT NULL,
+          long_risk_pct  float8      NOT NULL,
+          legs           integer     NOT NULL,
+          entries        bigint      NOT NULL,
+          refused        bigint      NOT NULL,
+          stops          bigint      NOT NULL,
+          not_picked     bigint      NOT NULL,
+          fees           float8      NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS allocator_status_at ON allocator_status (generation, portfolio, at)"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -484,14 +508,16 @@ pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String
 }
 
 /// The backtest's statistics of its picks (`backtest_stats`; `backtest_stats.json` without a
-/// database: address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins}).
+/// database: address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins, sharpe_d,
+/// sortino_d, calmar, pnl_30d, weeks_pos, weeks}).
 pub async fn load_backtest_stats(cfg: &Config) -> Result<HashMap<String, crate::alloc::TraderStats>> {
     let rows: Vec<(String, Value)> = match &cfg.database_url {
         Some(url) => {
             let client = pg_connect(url).await?;
             migrate(&client).await?;
             client.query("SELECT address, json_build_object('trips', trips, 'pnl', pnl, 'win_usd', win_usd, 'loss_usd', loss_usd,
-                'max_dd_pct', max_dd_pct, 'pnl_sq', pnl_sq, 'slip_bps', slip_bps, 'coins', coins)::text FROM backtest_stats", &[]).await?
+                'max_dd_pct', max_dd_pct, 'pnl_sq', pnl_sq, 'slip_bps', slip_bps, 'coins', coins, 'sharpe_d', sharpe_d, 'sortino_d', sortino_d,
+                'calmar', calmar, 'pnl_30d', pnl_30d, 'weeks_pos', weeks_pos, 'weeks', weeks)::text FROM backtest_stats", &[]).await?
                 .into_iter().filter_map(|r| Some((r.get::<_, String>(0).to_lowercase(), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect()
         }
         None => std::fs::read_to_string(cfg.data_dir.join("backtest_stats.json")).ok()
@@ -502,6 +528,9 @@ pub async fn load_backtest_stats(cfg: &Config) -> Result<HashMap<String, crate::
         let trips = v["trips"].as_u64().unwrap_or(0);
         let mut s = crate::alloc::TraderStats::from_trips(&a, "backtest", trips, 0, n("win_usd"), n("loss_usd"), n("pnl_sq"), n("max_dd_pct"), n("slip_bps"));
         s.pnl_net = n("pnl");
+        (s.sharpe, s.sortino, s.calmar, s.weeks_pos) = (n("sharpe_d"), n("sortino_d"), n("calmar"), n("weeks_pos"));
+        s.pnl_30d = v["pnl_30d"].as_f64();
+        s.weeks = v["weeks"].as_u64().unwrap_or(0) as u32;
         s.coins = v["coins"].as_object().map(|o| o.iter().map(|(c, x)| (c.clone(), x.as_u64().unwrap_or(0) as u32)).collect()).unwrap_or_default();
         (a, s)
     }).collect())

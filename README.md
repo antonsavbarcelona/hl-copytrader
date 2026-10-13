@@ -108,20 +108,22 @@ minute) is per IP, and the image takes 800 of it.
 
 ## Allocator
 
-A second layer over the paper copies (`src/alloc.rs`), apart from them: 13 paper portfolios of
+A second layer over the paper copies (`src/alloc.rs`), apart from them: paper portfolios of
 $10 000 that get the same signals as the copies (each followed account's position moves) but
 decide whom to let in. The copies per account go on as they were. Each portfolio is a test of
-its own (`MODES`), sharing nothing with the others but the signals: a score to rank the eligible
-traders by and how many of the top it takes, or as many at random (the benchmark).
+its own (`modes`), sharing nothing with the others but the signals. From generation 4 they are
+a grid, every combination run (paper costs nothing): 8 x 5 x 3 x 3 = 360 portfolios.
 
-| score | portfolios |
+| | values |
 |---|---|
-| expectancy / drawdown | `EXPDD_10`, `EXPDD_30`, `EXPDD_50` |
-| PnL | `PNL_10`, `PNL_30` |
-| expectancy x sqrt(trades) | `PNLSQRTN_10`, `PNLSQRTN_30` |
-| profit factor | `PF_30`, `PF_50` |
-| t-statistic of the trades | `TSTAT_30` |
-| at random among the eligible (new each day) | `RANDOM_10`, `RANDOM_30`, `RANDOM_50` |
+| who: a score to rank the eligible by, or at random (3 draws: the benchmark) | expectancy / drawdown `EXPDD`, PnL `PNL`, expectancy x sqrt(trades) `PNLSQRTN`, profit factor `PF`, t-statistic `TSTAT`; `RANDOM1`, `RANDOM2`, `RANDOM3` |
+| how many of the top (or at random) | 10, 20, 30, 50, 100 |
+| risk an entry (lost at its 20% stop) | 0.5%, 1%, 2% |
+| cap on the open risk in one direction | 20%, 50%, 100% (none but the total's) |
+
+Named `EXPDD_20_R0.5_D20`, `RANDOM2_20_R0.5_D20`. A draw picks the same traders at every risk
+and cap, so those portfolios differ by their sizing alone; each score's portfolio is judged
+against the three draws of its size, risk and cap (the spread of chance, not one draw).
 
 - Each trader's statistics: the backtest's over 90 days, the source of truth (`backtest_stats`, migrations `2026-10-12-backtest-stats` and `-all`: all 6 887
   wallets with copy trades, as the allocator was walked forward on, not only the 975 picks;
@@ -143,28 +145,32 @@ traders by and how many of the top it takes, or as many at random (the benchmark
   place of the backtest; generation 2 (20:07-22:30): also PNLSQRTN on any number of trades,
   its top traders of 1-5; generation 1: all had 20+ trades, profit factor above 1.1, drawdown
   under 15%, slippage under 30 bp.
-- An entry gets 2% risk (the 20% stop loses that much of the portfolio), cut to the limits:
-  total open risk 100% (50 positions at 2%), per trader 20%, at most 2 positions in a coin (no
-  cap per direction); under 0.25% it is refused. A position is followed to its end (reduced as
+- An entry gets its portfolio's risk (the 20% stop loses that much of the portfolio), cut to
+  the limits: open risk in its direction (its cap: the traders mostly long together, so a
+  portfolio is mostly one way; walked forward at 1% an entry, the real drawdown with open
+  positions was 50-60% with no cap, ~20% at 30% in all), in all 100%, per trader 20%, at most 2
+  positions in a coin; under an eighth of its risk it is refused. A position is followed to its end (reduced as
   the trader reduces, closed when it is flat) or the stop: a trader dropping off the list stops
   new entries only.
 - `allocator_decisions` (migration `2026-10-12-allocator`): each entry of a picked trader per
   portfolio, with rank, score, requested and granted risk and why it was cut or refused
-  (`COIN_POSITIONS_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
+  (`COIN_POSITIONS_CAP`, `DIRECTION_RISK_CAP`, `TOTAL_RISK_CAP`, `TRADER_RISK_CAP`, `TOO_SMALL`). `allocator_trades`
   (migration `2026-10-12-allocator-trades`, from generation 2): each position closed, with its
   own entry and exit price (not the coin's legs' average), PnL net of its fees, R (PnL / the
   risk granted in USD), hours held and why (`TRADER_CLOSED`, `TRADER_FLIPPED`, `STOP`). Both
-  carry the `generation`. The portfolios' state in `docs` (`allocator`), their equity, return,
-  open risk, entries of traders not picked (`not_picked`: counted only; until generation 3 a
+  carry the `generation`. The portfolios' state in `docs` (`allocator`, saved every 30 min and
+  at shutdown: a few MB), their equity, return, open risk (and of it long), entries of traders not picked (`not_picked`: counted only; until generation 3 a
   `NOT_PICKED` row each, 99% of the rows) in `bot_status.data.allocators`; each ranking an event `allocator_rank`. No
   funding on the portfolios (the copies have it).
-- Report: `python tools/alloc_report.py [--generation N] [--traders PORTFOLIO]` (read-only,
-  `RAILWAY_DATABASE_URL` in `.env`): each portfolio's return, drawdown, trades, R against its
-  `RANDOM_<N>`, and PnL by trader.
+- Report: `python tools/alloc_report.py [--generation N] [--risk 0.5] [--cap 20] [--detail
+  NAME] [--traders NAME]` (read-only, `RAILWAY_DATABASE_URL` in `.env`): a block per risk and
+  cap, each score's return and drawdown at each size with its verdict, the random draws' range;
+  one portfolio's numbers, its PnL by trader. `python tools/alloc_audit.py`: an independent
+  check of the portfolios from the database (filters, caps, sizing, stops, PnL, the books).
 - The criterion, fixed before the paper: after 21 days of a generation, a portfolio works if
-  its return is above its `RANDOM_<N>`'s and its closed trades' mean R is above the random's
-  in 80%+ of bootstrap draws, with 30+ closed trades each; else it is no better than picking
-  at random (before: too early).
+  its return is above all three random draws' of its size, risk and cap, and its closed
+  trades' mean R is above theirs in 80%+ of bootstrap draws, with 30+ closed trades each; else
+  it is no better than picking at random (before: too early).
 - Walked forward on the backtest (research 2026-10-12: all 6 887 wallets with copy trades,
   ranked every day on the trips closed before it, days 30-90 traded): EXPDD_30 +109% (max
   drawdown 15%), PNLSQRTN_30 +99% (19%), PF_50 +69% (22%), EXPDD_10 +55% (13%), against

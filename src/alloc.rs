@@ -2,9 +2,13 @@
 //! signals (each followed account's position moves, `Signal`) but decide whom to let in, each
 //! with its own paper account and portfolio limits. The copies per account go on as they were.
 //!
-//! Each portfolio is a test of its own (`MODES`): a score to rank the eligible traders by and
+//! Each portfolio is a test of its own (`modes`): a score to rank the eligible traders by and
 //! how many of the top it takes, or as many at random (the benchmark: does the ranking add
-//! anything over picking among the eligible blindly?). They share nothing but the signals.
+//! anything over picking among the eligible blindly?), and its sizing: the risk an entry gets
+//! and the cap on the risk in one direction. Every score x size x risk x cap is run (paper
+//! costs nothing), each against three random portfolios of the same size, risk and cap, so a
+//! score is judged against the spread of chance, not one draw. They share nothing but the
+//! signals.
 //!
 //!   - Each trader's statistics (`TraderStats`): the backtest's over 90 days (`backtest_stats`),
 //!     the source of truth. The paper copies only calibrate the backtester: a copy's own take
@@ -18,11 +22,11 @@
 //!     at all; the PnL alone needs none. Nothing the score itself weighs is filtered again.
 //!   - Scores: expectancy / drawdown, PnL, t-statistic of the trips, profit factor, expectancy
 //!     x sqrt(trips). Re-ranked once a day (`RANK_EVERY_S`).
-//!   - A picked trader's entry gets `RISK` (its stop `STOP` away loses that much of the
-//!     portfolio's equity), less as the caps require: total open risk `CAP_TOTAL`, per trader
-//!     `CAP_TRADER`; at most `MAX_PER_COIN` positions in a coin (no cap per direction: on 90
-//!     days walked forward it cut more good entries than it saved); under `MIN_GRANT` it is
-//!     refused. Each entry's decision is a row of `allocator_decisions`, each position closed
+//!   - A picked trader's entry gets its portfolio's risk (`RISKS`: its stop `STOP` away loses
+//!     that much of the portfolio's equity), less as the caps require: open risk in its
+//!     direction (`CAPS_DIR`: the portfolios are mostly one way, the traders long together),
+//!     in all `CAP_TOTAL`, per trader `CAP_TRADER`; at most `MAX_PER_COIN` positions in a coin;
+//!     under an eighth of its risk it is refused. Each entry's decision is a row of `allocator_decisions`, each position closed
 //!     a row of `allocator_trades` (its own entry, exit, PnL net of its fees, and why).
 //!   - A position is followed to its end (reduced in proportion as the trader reduces from its
 //!     peak, closed when it is flat), or closed at the stop: a trader dropping off the list
@@ -41,9 +45,7 @@ use crate::ws::Book;
 
 pub const START_USD: f64 = 10_000.0;
 pub const RANK_EVERY_S: f64 = 86_400.0;
-const RISK: f64 = 0.02;
 const STOP: f64 = 0.20;
-const MIN_GRANT: f64 = 0.0025;
 const CAP_TOTAL: f64 = 1.00;
 const CAP_TRADER: f64 = 0.20;
 const MAX_PER_COIN: usize = 2;
@@ -54,26 +56,55 @@ pub const PAPER_DAYS: f64 = 90.0;
 const RISK_TRADES: u64 = 20;
 /// The portfolios' generation: a saved state of another is not restored (started again).
 const GENERATION: u32 = 4;
+/// The portfolios' state is saved this often (and at shutdown): a few MB of it.
+pub const SAVE_EVERY_S: f64 = 1800.0;
 const MIN_ORDER_USD: f64 = 10.0;
 
-/// The portfolios: name, score (None: at random among the eligible), how many traders.
-pub const MODES: [(&str, Option<Score>, usize); 13] = [
-    ("EXPDD_10", Some(Score::ExpDd), 10),
-    ("EXPDD_30", Some(Score::ExpDd), 30),
-    ("EXPDD_50", Some(Score::ExpDd), 50),
-    ("PNL_10", Some(Score::Pnl), 10),
-    ("PNL_30", Some(Score::Pnl), 30),
-    ("PNLSQRTN_10", Some(Score::PnlSqrtN), 10),
-    ("PNLSQRTN_30", Some(Score::PnlSqrtN), 30),
-    ("PF_30", Some(Score::Pf), 30),
-    ("PF_50", Some(Score::Pf), 50),
-    ("TSTAT_30", Some(Score::TStat), 30),
-    ("RANDOM_10", None, 10),
-    ("RANDOM_30", None, 30),
-    ("RANDOM_50", None, 50),
-];
+/// The grid: scores (and three random draws), how many traders, the risk an entry gets, the
+/// cap on open risk in one direction (1.0: none but the total's).
+pub const SCORES: [Score; 5] = [Score::ExpDd, Score::Pnl, Score::PnlSqrtN, Score::Pf, Score::TStat];
+pub const RANDOMS: u64 = 3;
+pub const SIZES: [usize; 5] = [10, 20, 30, 50, 100];
+pub const RISKS: [f64; 3] = [0.005, 0.01, 0.02];
+pub const CAPS_DIR: [f64; 3] = [0.20, 0.50, 1.00];
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A portfolio's test: picked by `score` (None: at random, draw `draw`), `n` traders, `risk` an
+/// entry, `cap_dir` in one direction. Its name: `EXPDD_20_R0.5_D20`, `RANDOM2_20_R0.5_D20`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mode {
+    pub score: Option<Score>,
+    pub draw: u64,
+    pub n: usize,
+    pub risk: f64,
+    pub cap_dir: f64,
+}
+
+impl Mode {
+    pub fn name(&self) -> String {
+        let who = match self.score {
+            Some(s) => s.name().to_string(),
+            None => format!("RANDOM{}", self.draw),
+        };
+        format!("{who}_{}_R{}_D{}", self.n, (self.risk * 1000.0).round() / 10.0, (self.cap_dir * 100.0).round())
+    }
+}
+
+pub fn modes() -> Vec<Mode> {
+    let mut out = Vec::new();
+    let who: Vec<(Option<Score>, u64)> = SCORES.iter().map(|s| (Some(*s), 0)).chain((1..=RANDOMS).map(|d| (None, d))).collect();
+    for (score, draw) in who {
+        for n in SIZES {
+            for risk in RISKS {
+                for cap_dir in CAPS_DIR {
+                    out.push(Mode { score, draw, n, risk, cap_dir });
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Score {
     ExpDd,
     Pnl,
@@ -83,6 +114,16 @@ pub enum Score {
 }
 
 impl Score {
+    pub fn name(self) -> &'static str {
+        match self {
+            Score::ExpDd => "EXPDD",
+            Score::Pnl => "PNL",
+            Score::TStat => "TSTAT",
+            Score::Pf => "PF",
+            Score::PnlSqrtN => "PNLSQRTN",
+        }
+    }
+
     /// The closed trips a trader needs for the score to mean anything: over their risk
     /// (t-statistic: their spread; profit factor: the losses; expectancy / drawdown: the
     /// drawdown) or their number (expectancy x sqrt(trips) is the PnL / sqrt(trips): the
@@ -221,6 +262,11 @@ impl Leg {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Portfolio {
     pub name: String,
+    /// Its risk an entry and cap in one direction (`Mode`).
+    #[serde(default)]
+    pub risk: f64,
+    #[serde(default)]
+    pub cap_dir: f64,
     pub acct: Account,
     /// `user|coin` -> leg.
     pub legs: HashMap<String, Leg>,
@@ -246,6 +292,9 @@ pub struct Allocators {
     pub seeded: usize,
     #[serde(default)]
     pub generation: u32,
+    /// When its state was last saved (`SAVE_EVERY_S`).
+    #[serde(skip)]
+    pub saved_at: f64,
 }
 
 fn key(user: &str, coin: &str) -> String {
@@ -253,18 +302,23 @@ fn key(user: &str, coin: &str) -> String {
 }
 
 impl Allocators {
-    /// The portfolios of `MODES` (any kept from `saved` by name, the rest new; none of a
+    /// The portfolios of `modes` (any kept from `saved` by name, the rest new; none of a
     /// saved state of another `GENERATION`).
     pub fn new(saved: Option<Allocators>) -> Self {
         let saved = saved.filter(|s| s.generation == GENERATION);
         let mut old: HashMap<String, Portfolio> = saved.as_ref().map(|s| s.portfolios.iter().map(|p| (p.name.clone(), p.clone())).collect()).unwrap_or_default();
-        let portfolios = MODES.iter().map(|(n, ..)| old.remove(*n).unwrap_or_else(|| Portfolio { name: n.to_string(), acct: Account::new(START_USD), ..Default::default() })).collect();
+        let portfolios = modes().into_iter().map(|m| {
+            let mut p = old.remove(&m.name()).unwrap_or_else(|| Portfolio { name: m.name(), acct: Account::new(START_USD), ..Default::default() });
+            (p.risk, p.cap_dir) = (m.risk, m.cap_dir);
+            p
+        }).collect();
         Self {
             portfolios,
             eligible: saved.as_ref().map(|s| s.eligible).unwrap_or(0),
             seeded: saved.as_ref().map(|s| s.seeded).unwrap_or(0),
             ranked_at: saved.map(|s| s.ranked_at).unwrap_or(0.0),
             generation: GENERATION,
+            saved_at: 0.0,
         }
     }
 
@@ -274,20 +328,25 @@ impl Allocators {
         let elig: Vec<&TraderStats> = stats.iter().filter(|s| s.ineligible().is_none()).collect();
         self.eligible = elig.len();
         self.ranked_at = at;
+        // Each score's ranking once (its portfolios of any size, risk and cap take its top).
+        let ranked: HashMap<Score, Vec<(&TraderStats, f64)>> = SCORES.iter().map(|s| {
+            let mut v: Vec<(&TraderStats, f64)> = elig.iter().copied().filter(|t| t.closed_trades >= s.min_trades()).map(|t| (t, t.score(*s))).collect();
+            v.sort_by(|a, b| b.1.total_cmp(&a.1));
+            (*s, v)
+        }).collect();
         let mut out = serde_json::Map::new();
-        for (i, (name, score, n)) in MODES.iter().enumerate() {
-            let chosen: Vec<(usize, &TraderStats, f64)> = match score {
-                Some(s) => {
-                    let mut v: Vec<&TraderStats> = elig.iter().copied().filter(|t| t.closed_trades >= s.min_trades()).collect();
-                    v.sort_by(|a, b| b.score(*s).total_cmp(&a.score(*s)));
-                    v.into_iter().take(*n).enumerate().map(|(k, t)| (k + 1, t, t.score(*s))).collect()
-                }
+        for m in modes() {
+            let chosen: Vec<(usize, &TraderStats, f64)> = match m.score {
+                Some(s) => ranked[&s].iter().take(m.n).enumerate().map(|(k, (t, sc))| (k + 1, *t, *sc)).collect(),
                 None => {
-                    // At random, seeded by the day and the portfolio: a restart picks the same.
+                    // At random, seeded by the day, the draw and the size: a restart picks the
+                    // same, and the draw's portfolios of every risk and cap the same traders.
                     let mut pool = elig.clone();
-                    let mut seed = ((at / 86_400.0) as u64 ^ 0x9e37_79b9_7f4a_7c15).wrapping_add((i as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+                    let mut seed = ((at / 86_400.0) as u64 ^ 0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add(m.draw.wrapping_mul(0x2545_f491_4f6c_dd1d))
+                        .wrapping_add((m.n as u64).wrapping_mul(0x9e37_79b9));
                     let mut v = Vec::new();
-                    while !pool.is_empty() && v.len() < *n {
+                    while !pool.is_empty() && v.len() < m.n {
                         seed ^= seed << 13;
                         seed ^= seed >> 7;
                         seed ^= seed << 17;
@@ -297,11 +356,15 @@ impl Allocators {
                     v
                 }
             };
-            if let Some(p) = self.portfolios.iter_mut().find(|p| p.name == *name) {
+            let name = m.name();
+            if let Some(p) = self.portfolios.iter_mut().find(|p| p.name == name) {
                 p.picked = chosen.iter().map(|(r, t, s)| (t.trader.clone(), (*r, *s))).collect();
             }
-            out.insert(name.to_string(), json!(chosen.iter().take(10).map(|(_, t, s)| json!({"trader": t.trader, "score": s, "source": t.source,
-                "trades": t.closed_trades, "pnl": t.pnl_net})).collect::<Vec<_>>()));
+            // The top of each score / draw once (all its sizes, risks and caps take from it).
+            if m.risk == RISKS[0] && m.cap_dir == CAPS_DIR[0] && m.n == SIZES[0] {
+                out.insert(name.split('_').next().unwrap_or("").to_string(), json!(chosen.iter().take(10).map(|(_, t, s)| json!({"trader": t.trader,
+                    "score": s, "source": t.source, "trades": t.closed_trades, "pnl": t.pnl_net})).collect::<Vec<_>>()));
+            }
         }
         json!({"eligible": elig.len(), "of": stats.len(), "from_paper": elig.iter().filter(|s| s.source == "paper").count(), "top": out})
     }
@@ -341,7 +404,7 @@ impl Allocators {
             let picked = Some(picked);
             let mut row = json!({"portfolio": p.name, "generation": generation, "trader": s.user, "coin": s.coin, "side": if s.dir > 0.0 { "long" } else { "short" },
                 "action": "open", "eligible": picked.is_some(), "rank": picked.map(|r| r.0), "score": picked.map(|r| r.1),
-                "requested_risk": if picked.is_some() { RISK } else { 0.0 }, "granted_risk": 0.0, "reject_reason": null, "at": crate::liq::iso(at)});
+                "requested_risk": p.risk, "granted_risk": 0.0, "reject_reason": null, "at": crate::liq::iso(at)});
             let mut decide = |row: Value| rows.push(("allocator_decisions", row));
             if p.legs.values().filter(|l| l.coin == s.coin).count() >= MAX_PER_COIN {
                 row["reject_reason"] = json!("COIN_POSITIONS_CAP");
@@ -352,10 +415,11 @@ impl Allocators {
             let sum = |f: &dyn Fn(&Leg) -> bool| p.legs.values().filter(|l| f(l)).map(Leg::risk_now).sum::<f64>();
             let rooms = [
                 (CAP_TOTAL - sum(&|_| true), "TOTAL_RISK_CAP"),
+                (p.cap_dir - sum(&|l| l.dir == s.dir), "DIRECTION_RISK_CAP"),
                 (CAP_TRADER - sum(&|l| l.user == s.user), "TRADER_RISK_CAP"),
             ];
-            let (room, binding) = rooms.iter().fold((RISK, None), |(g, why), &(r, n)| if r < g { (r.max(0.0), Some(n)) } else { (g, why) });
-            if room < MIN_GRANT {
+            let (room, binding) = rooms.iter().fold((p.risk, None), |(g, why), &(r, n)| if r < g { (r.max(0.0), Some(n)) } else { (g, why) });
+            if room < p.risk / 8.0 {
                 row["reject_reason"] = json!(binding.unwrap_or("TOTAL_RISK_CAP"));
                 p.refused += 1;
                 decide(row);
@@ -377,7 +441,7 @@ impl Allocators {
             p.legs.insert(k, leg);
             p.entries += 1;
             row["granted_risk"] = json!(room);
-            if room < RISK {
+            if room < p.risk {
                 row["reject_reason"] = json!(binding);
             }
             decide(row);
@@ -407,8 +471,9 @@ impl Allocators {
     pub fn status(&self, marks: &dyn Fn(&str) -> Option<f64>) -> Value {
         Value::Array(self.portfolios.iter().map(|p| {
             let eq = p.acct.equity(marks);
-            json!({"name": p.name, "generation": self.generation, "equity": (eq * 100.0).round() / 100.0, "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0,
-                "open_risk_pct": (p.legs.values().map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0, "legs": p.legs.len(),
+            json!({"name": p.name, "generation": self.generation, "risk": p.risk, "cap_dir": p.cap_dir, "equity": (eq * 100.0).round() / 100.0, "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0,
+                "open_risk_pct": (p.legs.values().map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0,
+                "long_risk_pct": (p.legs.values().filter(|l| l.dir > 0.0).map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0, "legs": p.legs.len(),
                 "picked": p.picked.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "not_picked": p.not_picked, "fees": p.acct.fees})
         }).collect())
     }
@@ -455,9 +520,12 @@ mod tests {
         s
     }
 
+    /// A portfolio by its score / draw and size, at 2% risk with no cap in one direction.
     fn port<'a>(a: &'a Allocators, n: &str) -> &'a Portfolio {
-        a.portfolios.iter().find(|p| p.name == n).unwrap()
+        let name = format!("{n}_R2_D100");
+        a.portfolios.iter().find(|p| p.name == name).unwrap()
     }
+    const RISK: f64 = 0.02;
 
     #[test]
     fn modes_rank_on_their_own() {
@@ -471,7 +539,9 @@ mod tests {
         few.source = "backtest";
         assert_eq!(few.ineligible(), None);
         let mut a = Allocators::new(None);
-        assert_eq!(a.portfolios.len(), MODES.len());
+        assert_eq!(a.portfolios.len(), 8 * 5 * 3 * 3);
+        assert!(a.portfolios.iter().any(|p| p.name == "EXPDD_20_R0.5_D20" && p.risk == 0.005 && p.cap_dir == 0.2));
+        assert!(a.portfolios.iter().any(|p| p.name == "RANDOM3_100_R1_D50"));
         a.rerank(&s, 0.0);
         assert_eq!(port(&a, "EXPDD_10").picked["b"].0, 1);
         // A score over the trips' risk or number: not on 10 trips; the PnL: on any.
@@ -480,7 +550,10 @@ mod tests {
         }
         assert_eq!(port(&a, "PNL_10").picked["c"].0, 1);
         assert!(!port(&a, "PNL_10").picked.contains_key("d"));
-        assert_eq!(port(&a, "RANDOM_10").picked.len(), 3);
+        assert_eq!(port(&a, "RANDOM1_10").picked.len(), 3);
+        // A draw picks the same traders at every risk and cap.
+        let same = |n: &str| a.portfolios.iter().find(|p| p.name == n).unwrap().picked.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(same("RANDOM2_10_R0.5_D20"), same("RANDOM2_10_R2_D100"));
         // Kept across a restart by name; not from another generation.
         let b = Allocators::new(Some(a.clone()));
         assert_eq!(port(&b, "PNL_10").picked.len(), 3);
@@ -499,7 +572,7 @@ mod tests {
         a.on_signal(&sig("t0", "BTC"), &b, &marks, 0.0);
         a.on_signal(&sig("t1", "BTC"), &b, &marks, 0.0);
         let rows = a.on_signal(&sig("t2", "BTC"), &b, &marks, 0.0);
-        let r = &rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10").unwrap().1;
+        let r = &rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10_R2_D100").unwrap().1;
         assert_eq!(r["reject_reason"], "COIN_POSITIONS_CAP");
         let p = port(&a, "EXPDD_10");
         assert_eq!(p.legs.len(), 2);
@@ -513,7 +586,7 @@ mod tests {
         assert!((l.size - l.full / 2.0).abs() < 1e-6);
         let rows = a.on_signal(&Signal { user: "t0".into(), coin: "BTC".into(), dir: 1.0, frac: 0.0, entry: false }, &b, &marks, 7200.0);
         assert!(!port(&a, "EXPDD_10").legs.contains_key("t0|BTC"));
-        let t = &rows.iter().find(|r| r.0 == "allocator_trades" && r.1["portfolio"] == "EXPDD_10").unwrap().1;
+        let t = &rows.iter().find(|r| r.0 == "allocator_trades" && r.1["portfolio"] == "EXPDD_10_R2_D100").unwrap().1;
         assert_eq!((t["reason"].as_str(), t["held_h"].as_f64()), (Some("TRADER_CLOSED"), Some(2.0)));
         // At the same price: a loss of its fees only (and the spread).
         assert!(t["pnl"].as_f64().unwrap() < 0.0 && t["pnl"].as_f64().unwrap() > -2.0 * t["fees"].as_f64().unwrap());
@@ -524,7 +597,22 @@ mod tests {
             a.on_signal(&sig("t0", c), &b, &marks, 0.0);
         }
         let rows = a.on_signal(&sig("t0", "K"), &b, &marks, 0.0);
-        assert_eq!(rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10").unwrap().1["reject_reason"], "TRADER_RISK_CAP");
+        assert_eq!(rows.iter().find(|r| r.1["portfolio"] == "EXPDD_10_R2_D100").unwrap().1["reject_reason"], "TRADER_RISK_CAP");
+        // In one direction: 20% at 2% = ten longs (of five traders), the eleventh refused, a short let in.
+        let mut a = Allocators::new(None);
+        a.rerank(&s, 0.0);
+        for (i, c) in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"].iter().enumerate() {
+            a.on_signal(&sig(&format!("t{}", i % 5), c), &b, &marks, 0.0);
+        }
+        let rows = a.on_signal(&sig("t5", "K"), &b, &marks, 0.0);
+        let r = |rows: &Vec<(&str, Value)>, n: &str| rows.iter().find(|r| r.1["portfolio"] == n).unwrap().1.clone();
+        assert_eq!(r(&rows, "EXPDD_10_R2_D20")["reject_reason"], "DIRECTION_RISK_CAP");
+        assert_eq!(r(&rows, "EXPDD_10_R2_D50")["granted_risk"], 0.02);
+        let rows = a.on_signal(&Signal { user: "t5".into(), coin: "L".into(), dir: -1.0, frac: 1.0, entry: true }, &b, &marks, 0.0);
+        assert_eq!(r(&rows, "EXPDD_10_R2_D20")["granted_risk"], 0.02);
+        // At 0.5% an entry is a quarter the size.
+        let p = a.portfolios.iter().find(|p| p.name == "EXPDD_10_R0.5_D100").unwrap();
+        assert!((p.legs["t0|A"].full * 100.0 - 0.005 / STOP * START_USD).abs() < 1.0);
     }
 
     #[test]
@@ -539,7 +627,7 @@ mod tests {
         let p = port(&a, "EXPDD_10");
         assert!(p.legs.is_empty() && p.stops == 1);
         assert!(p.acct.equity(&|_| Some(79.0)) < START_USD);
-        let t = rows.iter().find(|r| r["portfolio"] == "EXPDD_10").unwrap();
+        let t = rows.iter().find(|r| r["portfolio"] == "EXPDD_10_R2_D100").unwrap();
         assert_eq!(t["reason"], "STOP");
         // 2% of the portfolio at the stop, a hair more with the fees and the spread.
         let r = t["r"].as_f64().unwrap();

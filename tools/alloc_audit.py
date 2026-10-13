@@ -5,8 +5,9 @@ Run: python tools/alloc_audit.py [generation]  (reads RAILWAY_DATABASE_URL from 
   1. every entry's trader passes the filters on its statistics (the backtest's; a paper copy's
      only after 90 days copied: PnL > 0, 20+ trips from paper or for a score over risk or their
      number); from generation 4 a trader with no backtest and no 90 days of paper never enters;
-  2. the caps hold in the saved state (2 positions a coin; 20% a trader and 100% in all, of the
-     risk now: a leg reduced holds less), and every entry granted under 2% says which cap cut it;
+  2. the caps hold in the saved state (2 positions a coin; 20% a trader, its portfolio's cap in
+     one direction and 100% in all, of the risk now: a leg reduced holds less), and every entry
+     granted under its portfolio's risk says which cap cut it;
   3. each position's size is its risk over the 20% stop (notional = 5 x its risk in USD, to the
      re-averaging of its entry as it adds);
   4. stops: each lost ~1 R, no other close lost more (a stop missed);
@@ -31,7 +32,7 @@ GEN = int(sys.argv[1]) if len(sys.argv) > 1 else doc['generation']
 cur.execute("""select portfolio, trader, coin, side, extract(epoch from opened_at), extract(epoch from closed_at), entry_px, exit_px,
   risk, risk_usd, notional, pnl, fees, r, reason, closed_at from allocator_trades where generation = %s order by closed_at""", (GEN,))
 T = cur.fetchall()
-cur.execute("""select portfolio, trader, coin, granted_risk, reject_reason from allocator_decisions where generation = %s""", (GEN,))
+cur.execute("""select portfolio, trader, coin, granted_risk, reject_reason, requested_risk from allocator_decisions where generation = %s""", (GEN,))
 D = cur.fetchall()
 print(f"generation {GEN}: {len(T)} positions closed, {len(D)} decisions; the state saved {doc_at:%Y-%m-%d %H:%M} UTC"
       + ("" if doc['generation'] == GEN else f" (of generation {doc['generation']}: checks 2 and 6 skipped)") + "\n")
@@ -44,7 +45,7 @@ cur.execute("""select address, (state->'stats'->>'trips')::int, equity - (state-
 paper = {a: (t or 0, p) for a, t, p, aged in cur.fetchall() if aged or GEN < 4}
 granted = [d for d in D if d[3] > 0]
 bad = []
-for p, u, coin, g, why in granted:
+for p, u, coin, g, why, _req in granted:
     paper_wins = u in paper and (u not in bt or GEN >= 4 or paper[u][0] >= 20)
     src, (trips, pnl) = ('paper', paper[u]) if paper_wins else ('backtest', bt.get(u, (0, 0)))
     if u not in bt and u not in paper:
@@ -60,17 +61,19 @@ for b in bad[:8]:
 if doc['generation'] == GEN:
     viol = []
     for po in doc['portfolios']:
-        coins, traders, total = defaultdict(int), defaultdict(float), 0.0
+        coins, traders, total, side = defaultdict(int), defaultdict(float), 0.0, defaultdict(float)
         for l in po['legs'].values():
             now = l['risk'] * abs(l['size']) / l['full'] if l['full'] else 0.0
-            coins[l['coin']] += 1; traders[l['user']] += now; total += now
+            coins[l['coin']] += 1; traders[l['user']] += now; total += now; side[l['dir']] += now
+        cap_dir = po.get('cap_dir') or 1.0
         viol += [(po['name'], c_, n) for c_, n in coins.items() if n > 2]
         viol += [(po['name'], u[:10], round(r, 4)) for u, r in traders.items() if r > 0.20 + 1e-9]
         viol += [(po['name'], 'total', round(total, 4))] if total > 1.0 + 1e-9 else []
-    unexplained = [d for d in granted if d[3] < 0.02 - 1e-9 and not d[4]]
+        viol += [(po['name'], 'long' if d > 0 else 'short', round(r, 4)) for d, r in side.items() if r > cap_dir + 1e-9]
+    cut = [d for d in granted if d[3] < (d[5] or 0.02) - 1e-9]
+    unexplained = [d for d in cut if not d[4]]
     print(f"{ok(not viol and not unexplained)} 2. caps hold in the state ({sum(len(p['legs']) for p in doc['portfolios'])} open): "
-          f"{viol or 'none broken'}; grants under 2%: {sum(1 for d in granted if d[3] < 0.02 - 1e-9)}, "
-          f"{len(unexplained)} with no cap named")
+          f"{viol[:5] or 'none broken'}; grants under the portfolio's risk: {len(cut)}, {len(unexplained)} with no cap named")
 
 # 3. Sizing.
 ratio = [x[10] / x[9] for x in T if x[9] > 0]

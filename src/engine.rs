@@ -988,7 +988,8 @@ impl Engine {
     }
 
     /// Every 10 min (with the status): each copy's equity at the day's start, the allocator's
-    /// ranking once a day (`alloc::RANK_EVERY_S`), its state saved; its portfolios' status.
+    /// ranking once a day (`alloc::RANK_EVERY_S`), its state saved every `alloc::SAVE_EVERY_S`; its
+    /// portfolios' status.
     fn allocate(&mut self) -> serde_json::Value {
         let at = now();
         let day = (at / 86_400.0).floor() * 86_400.0;
@@ -1029,12 +1030,15 @@ impl Engine {
         let marks = |c: &str| b.get(c).and_then(Book::mid);
         let status = self.alloc.status(&marks);
         drop(b);
-        let (cfg, doc) = (self.cfg.clone(), serde_json::to_value(&self.alloc).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, "allocator", &doc).await {
-                log!("allocator: not saved: {e:#}");
-            }
-        });
+        if at - self.alloc.saved_at >= crate::alloc::SAVE_EVERY_S {
+            self.alloc.saved_at = at;
+            let (cfg, doc) = (self.cfg.clone(), serde_json::to_value(&self.alloc).unwrap_or_default());
+            tokio::spawn(async move {
+                if let Err(e) = crate::store::save_doc(&cfg, "allocator", &doc).await {
+                    log!("allocator: not saved: {e:#}");
+                }
+            });
+        }
         status
     }
 

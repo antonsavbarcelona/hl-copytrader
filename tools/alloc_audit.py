@@ -2,8 +2,9 @@
 (read-only): each check recomputes what the bot did by another route, and prints OK / FAIL.
 Run: python tools/alloc_audit.py [generation]  (reads RAILWAY_DATABASE_URL from the repo's .env)
 
-  1. every entry's trader passes the filters (PnL > 0 on the backtest, or a paper copy of 20+
-     trips; 20+ trips for a score over risk or their number);
+  1. every entry's trader passes the filters on its statistics (the backtest's; a paper copy's
+     only after 90 days copied: PnL > 0, 20+ trips from paper or for a score over risk or their
+     number); from generation 4 a trader with no backtest and no 90 days of paper never enters;
   2. the caps hold in the saved state (2 positions a coin; 20% a trader and 100% in all, of the
      risk now: a leg reduced holds less), and every entry granted under 2% says which cap cut it;
   3. each position's size is its risk over the 20% stop (notional = 5 x its risk in USD, to the
@@ -38,12 +39,14 @@ print(f"generation {GEN}: {len(T)} positions closed, {len(D)} decisions; the sta
 # 1. The filters.
 cur.execute("select address, trips, pnl from backtest_stats")
 bt = {a: (t, p) for a, t, p in cur.fetchall()}
-cur.execute("select address, (state->'stats'->>'trips')::int, equity - (state->'acct'->>'start')::float8 from copy_accounts")
-paper = {a: (t or 0, p) for a, t, p in cur.fetchall()}
+cur.execute("""select address, (state->'stats'->>'trips')::int, equity - (state->'acct'->>'start')::float8,
+  extract(epoch from now()) - (state->>'enrolled_at')::float8 >= 90 * 86400 from copy_accounts""")
+paper = {a: (t or 0, p) for a, t, p, aged in cur.fetchall() if aged or GEN < 4}
 granted = [d for d in D if d[3] > 0]
 bad = []
 for p, u, coin, g, why in granted:
-    src, (trips, pnl) = ('paper', paper[u]) if paper.get(u, (0, 0))[0] >= 20 or u not in bt else ('backtest', bt[u])
+    paper_wins = u in paper and (u not in bt or GEN >= 4 or paper[u][0] >= 20)
+    src, (trips, pnl) = ('paper', paper[u]) if paper_wins else ('backtest', bt.get(u, (0, 0)))
     if u not in bt and u not in paper:
         bad.append((p, u[:10], 'unknown'))
     elif trips < (20 if p.startswith(RISK_SCORES) or src == 'paper' else 1) or pnl <= 0:

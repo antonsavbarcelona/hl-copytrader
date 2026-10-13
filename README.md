@@ -123,23 +123,25 @@ traders by and how many of the top it takes, or as many at random (the benchmark
 | t-statistic of the trades | `TSTAT_30` |
 | at random among the eligible (new each day) | `RANDOM_10`, `RANDOM_30`, `RANDOM_50` |
 
-- Each trader's statistics: its paper copy's once that has 20 closed trades, until then the
-  backtest's (`backtest_stats`, migrations `2026-10-12-backtest-stats` and `-all`: all 6 887
+- Each trader's statistics: the backtest's over 90 days, the source of truth (`backtest_stats`, migrations `2026-10-12-backtest-stats` and `-all`: all 6 887
   wallets with copy trades, as the allocator was walked forward on, not only the 975 picks;
-  all of them followed, for their signals): closed
-  trades, PnL, expectancy and its spread, profit factor, drawdown, holding time, slippage,
-  PnL over 7 / 30 days (daily equity kept in the state), open risk, coins entered.
-- Eligible for all: PnL above 0 on history enough: the backtest's, or a paper copy's of 20+
-  closed trades (a copy with no backtest in profit on a trade or two is a coin's toss, and the
-  backtest walked forward had no such). Beyond that each portfolio filters by its
+  all of them followed, for their signals): closed trades, PnL, expectancy and its spread,
+  profit factor, drawdown, slippage, coins entered. The paper copies only calibrate the
+  backtester: a copy's own statistics (with holding time, PnL over 7 / 30 days, open risk)
+  take the backtest's place only after 90 days copied without a break (`PAPER_DAYS`, since
+  its enrollment). A trader with neither is not ranked. (Generations 1-3 let a paper copy of
+  20 closed trades replace the backtest: in generation 3, 304 of 530 entries were of three
+  traders on a day of paper, two of them scalpers the backtest had at a loss.)
+- Eligible for all: PnL above 0 (from paper, on 20+ closed trades). Beyond that each portfolio filters by its
   score only (`Score::min_trades`): a score over the trades' risk (t-statistic: their spread;
   profit factor: the losses; expectancy / drawdown: the drawdown) or their number
   (expectancy x sqrt(trades) is the PnL / sqrt(trades): the fewer, the higher) needs 20
   closed trades for it to be measured; the PnL alone needs one; at random draws from all the
   eligible. Nothing the score itself weighs is filtered again (slippage is in the PnL
-  already). Re-ranked once a day. Generation 3 from 2026-10-12 21:00 UTC (the portfolios
-  started again at $10 000); generation 2 (20:00-21:00) had PNLSQRTN on any number of trades,
-  its top traders of 1-5; before that, all had 20+ trades, profit factor above 1.1, drawdown
+  already). Re-ranked once a day. Generation 4 (the portfolios started again at $10 000):
+  ranked on the backtest only. Generation 3 (2026-10-12 22:30 UTC on): paper of 20 trades in
+  place of the backtest; generation 2 (20:07-22:30): also PNLSQRTN on any number of trades,
+  its top traders of 1-5; generation 1: all had 20+ trades, profit factor above 1.1, drawdown
   under 15%, slippage under 30 bp.
 - An entry gets 2% risk (the 20% stop loses that much of the portfolio), cut to the limits:
   total open risk 100% (50 positions at 2%), per trader 20%, at most 2 positions in a coin (no

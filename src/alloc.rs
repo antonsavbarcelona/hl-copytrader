@@ -6,11 +6,13 @@
 //! how many of the top it takes, or as many at random (the benchmark: does the ranking add
 //! anything over picking among the eligible blindly?). They share nothing but the signals.
 //!
-//!   - Each trader's statistics (`TraderStats`): its paper copy's once that has `MIN_TRADES`
-//!     closed trips, until then the backtest's (`backtest_stats`) if it has them.
-//!   - Eligible for all: PnL above 0 on history enough: the backtest's, or a paper copy's of
-//!     `MIN_TRADES` closed trips (a copy in profit on a trip or two is a coin's toss, and the
-//!     backtest walked forward had no such). Beyond that a portfolio's filter is
+//!   - Each trader's statistics (`TraderStats`): the backtest's over 90 days (`backtest_stats`),
+//!     the source of truth. The paper copies only calibrate the backtester: a copy's own take
+//!     the backtest's place only after `PAPER_DAYS` copied without a break (a day of paper
+//!     is not 90 days of history: it put scalpers the backtest had at a loss on top). A trader
+//!     with neither is not ranked.
+//!   - Eligible for all: PnL above 0 (and, from paper, `MIN_TRADES` closed trips). Beyond
+//!     that a portfolio's filter is
 //!     its score's own (`Score::min_trades`): a score over the trips' risk (their spread, the
 //!     losses, the drawdown) or their number needs `RISK_TRADES` trips for it to be measured
 //!     at all; the PnL alone needs none. Nothing the score itself weighs is filtered again.
@@ -46,10 +48,12 @@ const CAP_TOTAL: f64 = 1.00;
 const CAP_TRADER: f64 = 0.20;
 const MAX_PER_COIN: usize = 2;
 pub const MIN_TRADES: u64 = 20;
+/// Days a paper copy runs without a break before its statistics take the backtest's place.
+pub const PAPER_DAYS: f64 = 90.0;
 /// Closed trips a score over their risk needs (`Score::min_trades`).
 const RISK_TRADES: u64 = 20;
 /// The portfolios' generation: a saved state of another is not restored (started again).
-const GENERATION: u32 = 3;
+const GENERATION: u32 = 4;
 const MIN_ORDER_USD: f64 = 10.0;
 
 /// The portfolios: name, score (None: at random among the eligible), how many traders.

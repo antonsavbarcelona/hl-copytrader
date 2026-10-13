@@ -308,8 +308,8 @@ pub struct Engine {
     listed: HashSet<String>,
     /// The allocator portfolios over the copies (`alloc`).
     alloc: crate::alloc::Allocators,
-    /// The backtest's statistics of its picks (`backtest_stats`): the allocator's until a
-    /// copy's paper has `alloc::MIN_TRADES` closed trades.
+    /// The backtest's statistics (`backtest_stats`): the allocator's source of truth, until a
+    /// copy has run `alloc::PAPER_DAYS` without a break.
     seed: HashMap<String, crate::alloc::TraderStats>,
     /// The backtest's picks (`backtest_picks`): followed and copied on paper always, not tried
     /// week by week (the paper copies are what checks them).
@@ -1006,11 +1006,13 @@ impl Engine {
                     let n = t.days.len().saturating_sub(DAYS_KEPT);
                     t.days.drain(..n);
                 }
-                let st = trader_stats(a, t, equity, at, &marks);
-                // Its paper copy's once that has trades enough, the backtest's until then.
-                match self.seed.get(a) {
-                    Some(seed) if st.closed_trades < crate::alloc::MIN_TRADES => stats.push(seed.clone()),
-                    _ => stats.push(st),
+                // The backtest's; its paper copy's only after `PAPER_DAYS` copied without a
+                // break (enrolled since: dropped and enrolled again starts it over); neither: not
+                // ranked.
+                if at - t.enrolled_at >= crate::alloc::PAPER_DAYS * 86_400.0 {
+                    stats.push(trader_stats(a, t, equity, at, &marks));
+                } else if let Some(seed) = self.seed.get(a) {
+                    stats.push(seed.clone());
                 }
             }
             // The backtest's picks with no copy yet.

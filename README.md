@@ -227,6 +227,13 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
 
 ## Liquidation research
 
+Off since 2026-10-14 (`LIQ_ENABLED=1` to run it again). On 2026-10-09..13 it simulated 214
+trades on ~54 touches (14 coins, mostly BTC and ETH): all four strategies lost (average trade
+cascade_15m -6 bp, bounce_60m -12, bounce_15m -19, cascade_60m -33; 9 bp of fees a trade);
+after a touch the price went +15 bp in 5 min, +18 in 15, -19 in 60 on average, through the
+level 58% of the times: no direction to trade. Its scanner had then stopped finding touches
+(none after 2026-10-13 07:35), not looked into. The tables are kept.
+
 A separate strategy, researched on paper apart from the copies (`src/liq.rs`; its own tables,
 its own paper accounts; it shares only the process, the books and the API budget, in which
 it goes last): when the price reaches a dense level of liquidations, does it run on through

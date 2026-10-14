@@ -82,7 +82,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         });
     }
     // Leaderboard now and every 6 h: round 1 from it (the saved list until then), and the
-    // larger accounts for the liquidation research.
+    // larger accounts for the liquidation research (off unless LIQ_ENABLED=1: switched off
+    // 2026-10-14, all four strategies at a loss on its ~54 touches).
     {
         let (api, tx, cfg) = (api.clone(), tx.clone(), cfg.clone());
         if let Some(s) = selection {
@@ -90,7 +91,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             let _ = tx.send(engine::Msg::Selected(s));
         }
         let (acc_tx, acc_rx) = tokio::sync::watch::channel(Vec::new());
-        liq::spawn(api.clone(), books.clone(), acc_rx, store_liq, cfg.clone());
+        if std::env::var("LIQ_ENABLED").unwrap_or_default().trim() == "1" {
+            liq::spawn(api.clone(), books.clone(), acc_rx, store_liq, cfg.clone());
+        } else {
+            log!("liq: the liquidation research is off (LIQ_ENABLED=1 to run it)");
+        }
         tokio::spawn(async move {
             loop {
                 let wait = match api.leaders().await {

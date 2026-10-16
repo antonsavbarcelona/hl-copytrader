@@ -494,6 +494,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
           weeks       integer,
           PRIMARY KEY (day, address)
       )"),
+    // The breaker's entries refused (`_BRK`), in each portfolio's status: without the column
+    // the row failed, and the writer, retrying its whole batch, wrote nothing after it
+    // (2026-10-16 21:17-22:50).
+    ("2026-10-16-allocator-braked", "ALTER TABLE allocator_status ADD COLUMN IF NOT EXISTS braked bigint"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {

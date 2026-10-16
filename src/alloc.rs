@@ -38,6 +38,10 @@
 //!     stops new entries only. With adds (`_ADD`): as the trader adds, so does it, up to
 //!     `ADD_MAX` times its entry (as much risk), within the caps; the stop then 20% from its
 //!     average entry; reduced from its size at the trader's peak.
+//!   - The breaker (`_BRK`, a family of its own: the strongest scores and the draws at 10-30
+//!     traders, `brk_modes`): after `BRK_LOSSES` losing positions of a trader in a row, no new
+//!     entries of its for `BRK_PAUSE_S` (walked forward it lifted the scores' return and cut
+//!     their drawdown, the draws' hardly: it works on a selection).
 //!   - Each portfolio's status is a row of `allocator_status` every `STATUS_EVERY_S`; the state
 //!     is saved every `SAVE_EVERY_S` and at shutdown.
 //!
@@ -71,11 +75,20 @@ pub const STATUS_EVERY_S: f64 = 3600.0;
 /// Following the trader's adds: up to this many times the entry's size (and risk).
 const ADD_MAX: f64 = 2.0;
 const MIN_ORDER_USD: f64 = 10.0;
+/// The breaker: this many losing positions of a trader in a row pause its new entries this long.
+const BRK_LOSSES: u32 = 5;
+const BRK_PAUSE_S: f64 = 3.0 * 86_400.0;
+/// COMBO3: the traders in this top of 2+ of LCB, EXPDD, PNLSQRTN.
+const COMBO3_TOP: usize = 40;
 
 /// The grid: scores and ten random draws, how many traders, the risk an entry gets, the cap on
 /// the open risk in one direction (1.0: none but the total's), the trader's adds followed or not.
-pub const SCORES: [Score; 12] = [Score::ExpDd, Score::Pnl, Score::PnlSqrtN, Score::Pf, Score::TStat, Score::Lcb, Score::Sharpe, Score::Sortino,
-    Score::Calmar, Score::Pnl30, Score::Weeks, Score::Combo];
+pub const SCORES: [Score; 13] = [Score::ExpDd, Score::Pnl, Score::PnlSqrtN, Score::Pf, Score::TStat, Score::Lcb, Score::Sharpe, Score::Sortino,
+    Score::Calmar, Score::Pnl30, Score::Weeks, Score::Combo, Score::Combo3];
+/// The breaker's family: these scores and the draws, at these sizes, risks and caps, no adds.
+pub const BRK_SCORES: [Score; 7] = [Score::Lcb, Score::PnlSqrtN, Score::ExpDd, Score::Pnl, Score::Pnl30, Score::Combo, Score::Combo3];
+pub const BRK_SIZES: [usize; 3] = [10, 20, 30];
+pub const BRK_CAPS: [f64; 2] = [0.20, 0.50];
 pub const RANDOMS: u64 = 10;
 pub const SIZES: [usize; 5] = [10, 20, 30, 50, 100];
 pub const RISKS: [f64; 3] = [0.005, 0.01, 0.02];
@@ -93,6 +106,7 @@ pub struct Mode {
     pub risk: f64,
     pub cap_dir: f64,
     pub adds: bool,
+    pub brk: bool,
 }
 
 impl Mode {
@@ -101,8 +115,8 @@ impl Mode {
             Some(s) => s.name().to_string(),
             None => format!("RANDOM{}", self.draw),
         };
-        format!("{who}_{}_R{}_D{}{}", self.n, (self.risk * 1000.0).round() / 10.0, (self.cap_dir * 100.0).round(),
-            if self.adds { "_ADD" } else { "" })
+        format!("{who}_{}_R{}_D{}{}{}", self.n, (self.risk * 1000.0).round() / 10.0, (self.cap_dir * 100.0).round(),
+            if self.adds { "_ADD" } else { "" }, if self.brk { "_BRK" } else { "" })
     }
 }
 
@@ -114,8 +128,18 @@ pub fn modes() -> Vec<Mode> {
             for risk in RISKS {
                 for cap_dir in CAPS_DIR {
                     for adds in ADDS {
-                        out.push(Mode { score, draw, n, risk, cap_dir, adds });
+                        out.push(Mode { score, draw, n, risk, cap_dir, adds, brk: false });
                     }
+                }
+            }
+        }
+    }
+    let who: Vec<(Option<Score>, u64)> = BRK_SCORES.iter().map(|s| (Some(*s), 0)).chain((1..=RANDOMS).map(|d| (None, d))).collect();
+    for (score, draw) in who {
+        for n in BRK_SIZES {
+            for risk in RISKS {
+                for cap_dir in BRK_CAPS {
+                    out.push(Mode { score, draw, n, risk, cap_dir, adds: false, brk: true });
                 }
             }
         }
@@ -143,6 +167,8 @@ pub enum Score {
     Weeks,
     /// Its mean percentile over all the other scores.
     Combo,
+    /// In the top of 2+ of LCB, EXPDD, PNLSQRTN (`COMBO3_TOP`), by its mean place in them.
+    Combo3,
 }
 
 impl Score {
@@ -160,6 +186,7 @@ impl Score {
             Score::Pnl30 => "PNL30",
             Score::Weeks => "WEEKS",
             Score::Combo => "COMBO",
+            Score::Combo3 => "COMBO3",
         }
     }
 
@@ -250,7 +277,7 @@ impl TraderStats {
             Score::Pnl30 => self.pnl_30d.unwrap_or(0.0),
             // Ties: the more weeks first.
             Score::Weeks => self.weeks_pos + self.weeks as f64 * 1e-6,
-            Score::Combo => 0.0,
+            Score::Combo | Score::Combo3 => 0.0,
         }
     }
 }
@@ -338,6 +365,13 @@ pub struct Portfolio {
     pub cap_dir: f64,
     #[serde(default)]
     pub adds: bool,
+    /// The breaker on (`_BRK`): each trader's losing positions in a row, and when its pause ends.
+    #[serde(default)]
+    pub brk: bool,
+    #[serde(default)]
+    pub losing: HashMap<String, u32>,
+    #[serde(default)]
+    pub paused: HashMap<String, f64>,
     pub acct: Account,
     /// `user|coin` -> leg.
     pub legs: HashMap<String, Leg>,
@@ -347,9 +381,11 @@ pub struct Portfolio {
     pub entries: u64,
     pub refused: u64,
     pub stops: u64,
-    /// Entries of traders it has not picked (counted, not written).
+    /// Entries of traders it has not picked (counted, not written), and of a trader paused.
     #[serde(default)]
     pub not_picked: u64,
+    #[serde(default)]
+    pub braked: u64,
 }
 
 impl Portfolio {
@@ -402,7 +438,7 @@ impl Allocators {
         let mut old: HashMap<String, Portfolio> = saved.as_ref().map(|s| s.portfolios.iter().map(|p| (p.name.clone(), p.clone())).collect()).unwrap_or_default();
         let portfolios = modes().into_iter().map(|m| {
             let mut p = old.remove(&m.name()).unwrap_or_else(|| Portfolio { name: m.name(), acct: Account::new(START_USD), ..Default::default() });
-            (p.risk, p.cap_dir, p.adds) = (m.risk, m.cap_dir, m.adds);
+            (p.risk, p.cap_dir, p.adds, p.brk) = (m.risk, m.cap_dir, m.adds, m.brk);
             p
         }).collect();
         Self {
@@ -423,7 +459,7 @@ impl Allocators {
         self.eligible = elig.len();
         self.ranked_at = at;
         // Each score's ranking once (its portfolios of any size and sizing take its top).
-        let mut ranked: HashMap<Score, Vec<(&TraderStats, f64)>> = SCORES.iter().filter(|s| **s != Score::Combo).map(|s| {
+        let mut ranked: HashMap<Score, Vec<(&TraderStats, f64)>> = SCORES.iter().filter(|s| !matches!(s, Score::Combo | Score::Combo3)).map(|s| {
             let mut v: Vec<(&TraderStats, f64)> = elig.iter().copied().filter(|t| t.closed_trades >= s.min_trades()).map(|t| (t, t.score(*s))).collect();
             v.sort_by(|a, b| b.1.total_cmp(&a.1));
             (*s, v)
@@ -437,11 +473,19 @@ impl Allocators {
                 *pct.entry(t.trader.as_str()).or_default() += j as f64 / m;
             }
         }
-        let others = (SCORES.len() - 1) as f64;
+        let others = (SCORES.len() - 2) as f64;
         let mut combo: Vec<(&TraderStats, f64)> = elig.iter().copied().filter(|t| t.closed_trades >= RISK_TRADES)
             .map(|t| (t, 1.0 - pct.get(t.trader.as_str()).copied().unwrap_or(others) / others)).collect();
         combo.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // COMBO3: in the top `COMBO3_TOP` of 2+ of the three steadiest on paper, by mean place.
+        let place: Vec<HashMap<&str, usize>> = [Score::Lcb, Score::ExpDd, Score::PnlSqrtN].iter()
+            .map(|s| ranked[s].iter().take(COMBO3_TOP).enumerate().map(|(j, (t, _))| (t.trader.as_str(), j)).collect()).collect();
+        let mut combo3: Vec<(&TraderStats, f64)> = elig.iter().copied().filter(|t| t.closed_trades >= RISK_TRADES)
+            .filter(|t| place.iter().filter(|m| m.contains_key(t.trader.as_str())).count() >= 2)
+            .map(|t| (t, -(place.iter().map(|m| m.get(t.trader.as_str()).copied().unwrap_or(COMBO3_TOP)).sum::<usize>() as f64) / 3.0)).collect();
+        combo3.sort_by(|a, b| b.1.total_cmp(&a.1));
         ranked.insert(Score::Combo, combo);
+        ranked.insert(Score::Combo3, combo3);
         let index: HashMap<String, usize> = self.portfolios.iter().enumerate().map(|(i, p)| (p.name.clone(), i)).collect();
         let mut out = serde_json::Map::new();
         for m in modes() {
@@ -470,7 +514,7 @@ impl Allocators {
                 self.portfolios[i].picked = chosen.iter().map(|(r, t, s)| (t.trader.clone(), (*r, *s))).collect();
             }
             // The top of each score / draw once (all its sizes and sizings take from it).
-            if m.risk == RISKS[0] && m.cap_dir == CAPS_DIR[0] && m.n == SIZES[0] && !m.adds {
+            if m.risk == RISKS[0] && m.cap_dir == CAPS_DIR[0] && m.n == SIZES[0] && !m.adds && !m.brk {
                 out.insert(name.split('_').next().unwrap_or("").to_string(), json!(chosen.iter().take(10).map(|(_, t, s)| json!({"trader": t.trader,
                     "score": s, "source": t.source, "trades": t.closed_trades, "pnl": t.pnl_net})).collect::<Vec<_>>()));
             }
@@ -530,6 +574,10 @@ impl Allocators {
                 p.not_picked += 1;
                 continue;
             };
+            if p.brk && p.paused.get(&s.user).is_some_and(|&until| until > at) {
+                p.braked += 1;
+                continue;
+            }
             let mut row = json!({"portfolio": p.name, "generation": generation, "trader": s.user, "coin": s.coin, "side": if s.dir > 0.0 { "long" } else { "short" },
                 "action": "open", "eligible": true, "rank": picked.0, "score": picked.1,
                 "requested_risk": p.risk, "granted_risk": 0.0, "reject_reason": null, "at": crate::liq::iso(at)});
@@ -613,7 +661,8 @@ impl Allocators {
             let risk = |f: &dyn Fn(&Leg) -> bool| (p.legs.values().filter(|l| f(l)).map(Leg::risk_now).sum::<f64>() * 1e4).round() / 100.0 + 0.0;
             json!({"generation": self.generation, "at": crate::liq::iso(at), "portfolio": p.name, "equity": (eq * 100.0).round() / 100.0,
                 "return_pct": ((eq / START_USD - 1.0) * 1e4).round() / 100.0, "open_risk_pct": risk(&|_| true), "long_risk_pct": risk(&|l| l.dir > 0.0),
-                "legs": p.legs.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "not_picked": p.not_picked, "fees": p.acct.fees})
+                "legs": p.legs.len(), "entries": p.entries, "refused": p.refused, "stops": p.stops, "not_picked": p.not_picked, "braked": p.braked,
+                "fees": p.acct.fees})
         }).collect()
     }
 }
@@ -637,6 +686,15 @@ fn close(p: &mut Portfolio, k: &str, book: &Book, why: &str, at: f64, generation
         if let Some((got, px, fee)) = trade(&mut p.acct, &l.coin, -l.size, book) {
             l.fill(got, px, fee);
         }
+    }
+    if p.brk {
+        let n = p.losing.entry(l.user.clone()).or_default();
+        *n = if l.pnl < 0.0 { *n + 1 } else { 0 };
+        if *n >= BRK_LOSSES {
+            p.losing.remove(&l.user);
+            p.paused.insert(l.user.clone(), at + BRK_PAUSE_S);
+        }
+        p.paused.retain(|_, &mut until| until > at);
     }
     Some(json!({"portfolio": p.name, "generation": generation, "trader": l.user, "coin": l.coin,
         "side": if l.dir > 0.0 { "long" } else { "short" }, "opened_at": crate::liq::iso(l.opened), "closed_at": crate::liq::iso(at),
@@ -690,7 +748,8 @@ mod tests {
         few.source = "backtest";
         assert_eq!(few.ineligible(), None);
         let mut a = Allocators::new(None);
-        assert_eq!(a.portfolios.len(), (12 + 10) * 5 * 3 * 3 * 2);
+        assert_eq!(a.portfolios.len(), (13 + 10) * 5 * 3 * 3 * 2 + (7 + 10) * 3 * 3 * 2);
+        assert!(a.portfolios.iter().any(|p| p.name == "LCB_20_R0.5_D20_BRK" && p.brk));
         assert!(a.portfolios.iter().any(|p| p.name == "EXPDD_20_R0.5_D20" && p.risk == 0.005 && p.cap_dir == 0.2 && !p.adds));
         assert!(a.portfolios.iter().any(|p| p.name == "RANDOM10_100_R1_D50_ADD" && p.adds));
         a.rerank(&s, 0.0);
@@ -824,5 +883,26 @@ mod tests {
         assert!(r < -1.0 && r > -1.1, "{r}");
         // The status rows: one a portfolio.
         assert_eq!(a.status_rows(&marks, 2.0).len(), a.portfolios.len());
+    }
+
+    #[test]
+    fn breaker_pauses_a_trader_after_five_losses() {
+        let s = [stats("t0", 30, 5.0, 2.0)];
+        let mut a = Allocators::new(None);
+        a.rerank(&s, 0.0);
+        let marks = |_: &str| Some(100.0);
+        let b = book(100.0);
+        // Five round trips at the same price: each a loss of its fees.
+        for k in 0..5 {
+            let at = k as f64 * 10.0;
+            a.on_signal(&sig("t0", "BTC"), &b, &marks, at);
+            a.on_signal(&Signal { frac: 0.0, size: 0.0, entry: false, ..sig("t0", "BTC") }, &b, &marks, at + 1.0);
+        }
+        a.on_signal(&sig("t0", "ETH"), &b, &marks, 100.0);
+        assert!(!named(&a, "LCB_10_R2_D20_BRK").legs.contains_key("t0|ETH") && named(&a, "LCB_10_R2_D20_BRK").braked == 1);
+        assert!(named(&a, "LCB_10_R2_D20").legs.contains_key("t0|ETH"));
+        // Three days on: in again.
+        a.on_signal(&sig("t0", "SOL"), &b, &marks, 100.0 + BRK_PAUSE_S);
+        assert!(named(&a, "LCB_10_R2_D20_BRK").legs.contains_key("t0|SOL"));
     }
 }

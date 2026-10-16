@@ -122,7 +122,17 @@ a grid, every combination run (paper costs nothing): 22 x 5 x 3 x 3 x 2 = 1 980 
 | cap on the open risk in one direction | 20%, 50%, 100% (none but the total's) |
 | the trader's adds | not followed; followed (`_ADD`) up to 2x the entry (as much risk) |
 
-Named `EXPDD_20_R0.5_D20`, `RANDOM7_20_R0.5_D20_ADD`. A draw picks the same traders at every
+Added 2026-10-16 (alongside, the others kept): COMBO3 (in the top 40 of 2+ of LCB, EXPDD,
+PNLSQRTN, by mean place; its 90) and the breaker family `_BRK` (LCB, PNLSQRTN, EXPDD, PNL,
+PNL30, COMBO, COMBO3 and the 10 draws x 10/20/30 traders x 0.5/1/2% x 20/50% in one
+direction, no adds: 306): after 5 losing positions of a trader in a row, no new entries of
+its for 3 days. Walked forward (days 10-90) it lifted the return in 10 of 12 score x sizing
+cells (+10 pp on average, -7 to +29) and cut the real drawdown in most (-3.6 pp), the draws'
+hardly (+0.3 pp): it works on a selection. 2 466 portfolios in all; one added later is
+ranked on its own window (its return since its first status against the draws' over the
+same hours).
+
+Named `EXPDD_20_R0.5_D20`, `RANDOM7_20_R0.5_D20_ADD`, `LCB_20_R1_D50_BRK`. A draw picks the same traders at every
 sizing, so those portfolios differ by their sizing alone; each score's portfolio is ranked
 among the ten draws of its traders and sizing (the spread of chance, not one draw).
 

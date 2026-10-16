@@ -11,6 +11,10 @@ some beat chance by chance). The criterion, fixed before the paper (README, Allo
   after 21 days, a score works if its mean rank over its 90 portfolios is 7.5+ of 10 and its
   mean rank is above 5 at 4 of its 5 sizes; before 21 days: too early.
 
+A portfolio added later (COMBO3, the breaker's `_BRK` family) is ranked on its own window: its
+return since its first status against each draw's over the same hours. The `_BRK` family is
+judged the same way against the draws with the breaker (3 sizes: above 5 at 2 of them).
+
 Run: python tools/alloc_report.py [--generation N] [--score NAME] [--detail NAME] [--traders NAME]
 (reads RAILWAY_DATABASE_URL from the repo's .env). By default: each score's mean rank at each
 size and its verdict; each sizing's mean return and drawdown. --score: its 90 portfolios;
@@ -45,7 +49,11 @@ for name, a, b, last, eq in cur.fetchall():
     peak, dd = eq[0], 0.0
     for e in eq:
         peak = max(peak, e); dd = max(dd, 1 - e / peak)
-    S[name] = dict(last=last, dd=dd * 100, ret=last['return_pct'], r=[])
+    S[name] = dict(last=last, dd=dd * 100, ret=last['return_pct'], r=[], t0=a)
+cur.execute("select portfolio, at, equity from allocator_status where generation = %s order by at", (gen,))
+SERIES = defaultdict(list)
+for name, at, e in cur.fetchall():
+    SERIES[name].append((at, e))
     t0 = min(t0 or a, a); t1 = max(t1 or b, b)
 days = (t1 - t0).total_seconds() / 86400
 cur.execute("select portfolio, trader, coin, pnl, r, reason from allocator_trades where generation = %s", (gen,))
@@ -56,16 +64,30 @@ for n, s in S.items():
     s['r'] = [t[4] for t in trades.get(n, [])]
 
 def parts(name):
-    """('EXPDD', 20, '0.5', '20', True) from EXPDD_20_R0.5_D20_ADD."""
+    """('EXPDD', 20, '0.5', '20', adds, breaker) from EXPDD_20_R0.5_D20[_ADD][_BRK]."""
     x = name.split('_')
-    return x[0], int(x[1]), x[2][1:], x[3][1:], len(x) > 4
+    return x[0], int(x[1]), x[2][1:], x[3][1:], 'ADD' in x[4:], 'BRK' in x[4:]
+
+def suffix(add, brk):
+    return ('_ADD' if add else '') + ('_BRK' if brk else '')
+
+def draw_names(name):
+    who, n, r, d, add, brk = parts(name)
+    return [k for k in (f"RANDOM{i}_{n}_R{r}_D{d}{suffix(add, brk)}" for i in range(1, 11)) if k in S]
 
 def draws(name):
-    who, n, r, d, add = parts(name)
-    return [S[k] for k in (f"RANDOM{i}_{n}_R{r}_D{d}{'_ADD' if add else ''}" for i in range(1, 11)) if k in S]
+    return [S[k] for k in draw_names(name)]
+
+def since(name, t0):
+    """A portfolio's return since `t0` (its first status at or after it)."""
+    v = SERIES[name]
+    e0 = next((e for at, e in v if at >= t0), None)
+    return (v[-1][1] / e0 - 1) * 100 if e0 else 0.0
 
 def rank(name):
-    return sum(1 for x in draws(name) if S[name]['ret'] > x['ret'])
+    t0 = S[name]['t0']
+    mine = since(name, t0)
+    return sum(1 for k in draw_names(name) if mine > since(k, t0))
 
 print(f"generation {gen}: {t0:%Y-%m-%d %H:%M} .. {t1:%Y-%m-%d %H:%M} UTC, {days:.1f} days, {len(S)} portfolios, "
       f"{sum(len(v) for v in trades.values())} positions closed")
@@ -92,24 +114,28 @@ scored = [n for n in S if not n.startswith('RANDOM')]
 if args.score:
     print(f"{args.score}: each portfolio's return, max drawdown, closed trades, rank among its 10 draws (their range)")
     for n in sorted((n for n in scored if parts(n)[0] == args.score), key=lambda n: parts(n)[1:]):
-        s = S[n]; dr = [x['ret'] for x in draws(n)]
+        s = S[n]; dr = [since(k, s['t0']) for k in draw_names(n)]
         print(f"  {n:28s} {s['ret']:+7.2f}%  dd {s['dd']:5.1f}%  closed {len(s['r']):5d}  rank {rank(n):2d}  ({min(dr):+.1f}..{max(dr):+.1f}%)")
     raise SystemExit
 
 sizes = sorted({parts(n)[1] for n in scored})
-print(f"{'score':10s}" + "".join(f"{'top ' + str(n):>9s}" for n in sizes) + f"{'mean rank':>11s}{'median ret':>12s}{'median dd':>11s}  verdict")
-for who in sorted({parts(n)[0] for n in scored}):
-    mine = [n for n in scored if parts(n)[0] == who]
-    by = {sz: st.mean(rank(n) for n in mine if parts(n)[1] == sz) for sz in sizes}
+print(f"{'score':12s}" + "".join(f"{'top ' + str(n):>9s}" for n in sizes) + f"{'mean rank':>11s}{'median ret':>12s}{'median dd':>11s}  verdict")
+for who, brk in sorted({(parts(n)[0], parts(n)[5]) for n in scored}, key=lambda x: (x[1], x[0])):
+    mine = [n for n in scored if parts(n)[0] == who and parts(n)[5] == brk]
+    by = {sz: st.mean(rank(n) for n in mine if parts(n)[1] == sz) for sz in sizes if any(parts(n)[1] == sz for n in mine)}
     mean = st.mean(rank(n) for n in mine)
-    ok = mean >= WORKS and sum(1 for v in by.values() if v > SIZE_OK) >= SIZES_OK
-    verdict = 'too early' if days < DAYS else ('WORKS' if ok else 'no better than random')
-    print(f"{who:10s}" + "".join(f"{by[sz]:9.1f}" for sz in sizes) + f"{mean:11.1f}{st.median(S[n]['ret'] for n in mine):+11.2f}%"
-          f"{st.median(S[n]['dd'] for n in mine):10.1f}%  {verdict}")
+    need = SIZES_OK if len(by) == 5 else max(1, len(by) - 1)
+    ok = mean >= WORKS and sum(1 for v in by.values() if v > SIZE_OK) >= need
+    own_days = (t1 - min(S[n]['t0'] for n in mine)).total_seconds() / 86400
+    verdict = 'too early' if own_days < DAYS else ('WORKS' if ok else 'no better than random')
+    print(f"{who + ('+BRK' if brk else ''):12s}" + "".join(f"{by[sz]:9.1f}" if sz in by else f"{'-':>9s}" for sz in sizes)
+          + f"{mean:11.1f}{st.median(since(n, S[n]['t0']) for n in mine):+11.2f}%{st.median(S[n]['dd'] for n in mine):10.1f}%  {verdict}")
 
 print(f"\n{'sizing':22s}{'scored: mean ret':>17s}{'mean dd':>9s}{'worst dd':>10s}{'random: mean ret':>18s}{'mean dd':>9s}")
-for (r, d, add) in sorted({parts(n)[2:] for n in S}, key=lambda x: (float(x[0]), float(x[1]), x[2])):
-    a = [S[n] for n in scored if parts(n)[2:] == (r, d, add)]
-    b = [S[n] for n in S if n.startswith('RANDOM') and parts(n)[2:] == (r, d, add)]
-    print(f"{f'risk {r}% cap {d}%' + (' adds' if add else ''):22s}{st.mean(x['ret'] for x in a):+16.2f}%{st.mean(x['dd'] for x in a):8.1f}%"
+for (r, d, add, brk) in sorted({parts(n)[2:] for n in S}, key=lambda x: (x[3], float(x[0]), float(x[1]), x[2])):
+    a = [S[n] for n in scored if parts(n)[2:] == (r, d, add, brk)]
+    b = [S[n] for n in S if n.startswith('RANDOM') and parts(n)[2:] == (r, d, add, brk)]
+    if not a or not b:
+        continue
+    print(f"{f'risk {r}% cap {d}%' + (' adds' if add else '') + (' breaker' if brk else ''):22s}{st.mean(x['ret'] for x in a):+16.2f}%{st.mean(x['dd'] for x in a):8.1f}%"
           f"{max(x['dd'] for x in a):9.1f}%{st.mean(x['ret'] for x in b):+17.2f}%{st.mean(x['dd'] for x in b):8.1f}%")

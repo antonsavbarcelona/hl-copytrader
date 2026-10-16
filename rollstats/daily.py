@@ -8,7 +8,7 @@ statistics on the 90 days to today 00:00 UTC, so its ranking moves a day every d
   3. a row each in `backtest_stats_daily` for the day (the bot reloads the latest and ranks
      again); days older than KEEP_DAYS dropped.
 
-Env: DATABASE_URL; ROLL_API_PER_MIN (default 350); ROLL_LIMIT (traders, for a test).
+Env: DATABASE_URL; ROLL_API_PER_MIN (default 250); ROLL_LIMIT (traders, for a test).
 The universe is the traders in trader_fills (the research's 9 342; refreshing it from the
 leaderboard is a later step)."""
 import gzip, json, os, sys, time

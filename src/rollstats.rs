@@ -1,7 +1,7 @@
 //! The rolling backtest (`rollstats/daily.py`, Python: the research's model as it was), run by
 //! the bot once a day: the allocator's statistics on the 90 days to today 00:00 UTC, so its
 //! ranking moves a day every day and the portfolios rotate as they did walked forward. At a
-//! start (when today's are not in yet) and each day `RUN_AT_S` past midnight UTC; a run cut
+//! start (`START_DELAY_S` on, when today's are not in yet) and each day `RUN_AT_S` past midnight UTC; a run cut
 //! short (a redeploy) resumes, its fills saved as it goes. When today's are in, they go to the
 //! engine (`Msg::Seed`), which ranks again at once. Off without a database, without the
 //! script (a local build), or with ROLLSTATS=0.
@@ -20,6 +20,9 @@ const SCRIPT: &str = "/app/rollstats/daily.py";
 const RUN_AT_S: f64 = 300.0;
 /// After a run that did not bring today's in, again in this long.
 const RETRY_S: f64 = 3600.0;
+/// After a start it waits this long: the bot's own start reads thousands of accounts, and the
+/// two on one IP's API limit kept it from coming up (2026-10-16).
+const START_DELAY_S: u64 = 1800;
 
 pub fn spawn(cfg: Config, tx: mpsc::UnboundedSender<Msg>) {
     let Some(url) = cfg.database_url.clone() else { return };
@@ -28,8 +31,8 @@ pub fn spawn(cfg: Config, tx: mpsc::UnboundedSender<Msg>) {
         return;
     }
     tokio::spawn(async move {
-        // Let the start settle first.
-        tokio::time::sleep(Duration::from_secs(120)).await;
+        // Let the bot's start settle first.
+        tokio::time::sleep(Duration::from_secs(START_DELAY_S)).await;
         loop {
             let today = (crate::api::now() / 86_400.0).floor() * 86_400.0;
             let have = |d: Option<f64>| d.is_some_and(|d| d >= today);

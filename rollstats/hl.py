@@ -1,8 +1,8 @@
 """Hyperliquid's info API, paced by request weight: ROLL_API_PER_MIN of the IP's 1200 a minute
-(default 350: the bot beside it takes ~330 on average, up to its own 800)."""
+(default 250: the bot beside it takes ~110-330 on average, more at its start)."""
 import json, os, threading, time, urllib.error, urllib.request
 API = 'https://api.hyperliquid.xyz/info'
-PER_MIN = float(os.environ.get('ROLL_API_PER_MIN', '350'))
+PER_MIN = float(os.environ.get('ROLL_API_PER_MIN', '250'))
 _lock = threading.Lock(); _next = [0.0]
 
 

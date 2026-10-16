@@ -210,13 +210,14 @@ The allocator ranks on the backtest, and the backtest moves a day every day (`sr
 fixed at 2026-10-10 they never did: the same picks every day). From 2026-10-16.
 
 - The bot runs `rollstats/daily.py` (Python: the research's model as it was, `sim.py`,
-  `metrics.py`, its data in `model.json`) at a start when today's statistics are not in yet,
+  `metrics.py`, its data in `model.json`) 30 min after a start (its own start first: the two at once on one IP's API limit kept
+  the bot from coming up, 2026-10-16) when today's statistics are not in yet,
   and every day at 00:05 UTC; a run that did not bring them is retried in an hour. Its output
   goes to the bot's log (`rollstats: ...`). Off without a database or with `ROLLSTATS=0`.
 - Each trader's fills are in `trader_fills` (gzip JSON, the last 100 days; migration
   `2026-10-16-rollstats`), topped up each run with the fills since its last (incremental and
   saved as it goes: a run cut short by a redeploy resumes). Its API weight is
-  `ROLL_API_PER_MIN` (default 350 a minute, beside the bot's ~330: ~8 h a run for 9 342
+  `ROLL_API_PER_MIN` (default 250 a minute, beside the bot's ~110-330: ~11 h a run for 9 342
   traders, ~25k weight for the coins' candles and funding).
 - Each day's statistics are rows of `backtest_stats_daily` (the columns of `backtest_stats`;
   14 days kept). The bot loads the latest day's at a start and when a run brings a new one

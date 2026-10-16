@@ -797,7 +797,21 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     }
 }
 
+/// A batch in one transaction: all of it or none (a batch half written and retried wrote its
+/// first tables again: 436 217 copies of decision rows on 2026-10-16).
 async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
+               inserts: &[(&'static str, Value)]) -> Result<()> {
+    c.batch_execute("BEGIN").await.context("beginning a batch")?;
+    match write_batch(c, run, events, accounts, statuses, inserts).await {
+        Ok(()) => c.batch_execute("COMMIT").await.context("committing a batch"),
+        Err(e) => {
+            let _ = c.batch_execute("ROLLBACK").await;
+            Err(e)
+        }
+    }
+}
+
+async fn write_batch(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
                inserts: &[(&'static str, Value)]) -> Result<()> {
     // One statement a table (a row a round trip fell behind a burst of entries).
     let mut tables: BTreeMap<&str, Vec<Value>> = BTreeMap::new();

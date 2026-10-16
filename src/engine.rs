@@ -273,6 +273,8 @@ pub enum Msg {
     /// A week that ended with our copy at a profit, and the account's steadiness then.
     Steady { user: String, row: serde_json::Value, result: anyhow::Result<crate::stable::Steadiness> },
     Funding(HashMap<String, CoinCtx>),
+    /// The rolling backtest's statistics of a new day (`rollstats`): the allocator ranks again.
+    Seed(HashMap<String, crate::alloc::TraderStats>),
     Tick,
     /// Save and stop.
     Shutdown,
@@ -449,6 +451,13 @@ impl Engine {
                 Msg::Selected(s) => self.on_selected(s),
                 Msg::Steady { user, row, result } => self.on_steady(user, row, result),
                 Msg::Funding(ctx) => self.on_funding(ctx),
+                Msg::Seed(seed) => {
+                    log!("allocator: the backtest statistics of a new day, {} traders: ranking again", seed.len());
+                    self.alloc.seeded = seed.len();
+                    self.alloc.ranked_at = 0.0;
+                    self.seed = seed;
+                    self.refollow();
+                }
                 Msg::Tick => self.on_tick(),
                 Msg::Shutdown => {
                     self.full_saved = 0.0;

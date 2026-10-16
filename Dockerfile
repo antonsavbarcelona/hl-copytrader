@@ -6,6 +6,9 @@ COPY src src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
+# Python for the rolling backtest the bot runs once a day (src/rollstats.rs, rollstats/).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-psycopg2 ca-certificates     && rm -rf /var/lib/apt/lists/*
+COPY rollstats /app/rollstats
 COPY --from=build /src/target/release/hl-copytrader /usr/local/bin/hl-copytrader
 COPY start.sh /usr/local/bin/start.sh
 # Strip CRLF (a Windows checkout) so the shebang works.

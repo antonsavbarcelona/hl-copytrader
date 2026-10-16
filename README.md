@@ -192,6 +192,31 @@ among the ten draws of its traders and sizing (the spread of chance, not one dra
   80 days at 0.5% / 20%: the best +25..+35% at a real drawdown (open positions) of 10-15%,
   against +7% for 20 at random; at 1% with no cap +50..+113% but a real drawdown of 30-55%.
 
+## Rolling backtest
+
+The allocator ranks on the backtest, and the backtest moves a day every day (`src/rollstats.rs`,
+`rollstats/`): its 90-day window ends at today 00:00 UTC, so the scores see the traders' last
+90 days and the portfolios rotate as they did walked forward (with the original backtest
+fixed at 2026-10-10 they never did: the same picks every day). From 2026-10-16.
+
+- The bot runs `rollstats/daily.py` (Python: the research's model as it was, `sim.py`,
+  `metrics.py`, its data in `model.json`) at a start when today's statistics are not in yet,
+  and every day at 00:05 UTC; a run that did not bring them is retried in an hour. Its output
+  goes to the bot's log (`rollstats: ...`). Off without a database or with `ROLLSTATS=0`.
+- Each trader's fills are in `trader_fills` (gzip JSON, the last 100 days; migration
+  `2026-10-16-rollstats`), topped up each run with the fills since its last (incremental and
+  saved as it goes: a run cut short by a redeploy resumes). Its API weight is
+  `ROLL_API_PER_MIN` (default 350 a minute, beside the bot's ~330: ~8 h a run for 9 342
+  traders, ~25k weight for the coins' candles and funding).
+- Each day's statistics are rows of `backtest_stats_daily` (the columns of `backtest_stats`;
+  14 days kept). The bot loads the latest day's at a start and when a run brings a new one
+  (`Msg::Seed`), and the allocator ranks again at once; without any it uses `backtest_stats`.
+- The universe is the research's 9 342 accounts (in profit over the month to 2026-10-10),
+  loaded once with `python rollstats/upload.py <research dir>`; refreshing it from the
+  leaderboard is a later step. Checked: the window ending at the original backtest's end
+  gives backtest_stats again (6 882 of 6 887 rows; 5 differ at its edge, the original
+  download having fills after its end), and the job's statistics equal the research code's.
+
 ## Live
 
 With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,
@@ -305,6 +330,7 @@ With `DATABASE_URL` (env or `.env`) the run is kept in Postgres, tables created 
   `2026-10-09-live-checks`).
 - `allocator_decisions`, `allocator_trades`, `allocator_status`: the allocator portfolios'
   decisions, closed positions and hourly status (above).
+- `trader_fills`, `backtest_stats_daily`: the rolling backtest's fills and daily statistics (above).
 - `backtest_stats`: the backtest's statistics of its picks (the allocator's start).
 - `backtest_picks`: the backtest's picks and what it expects of their copies (above).
 - `trader_weeks`: round 2, each account's weeks: its PnL and our copy's, the verdict (golden /

@@ -14,6 +14,7 @@ mod exchange;
 mod liq;
 mod live;
 mod report;
+mod rollstats;
 mod stable;
 mod stats;
 mod store;
@@ -67,6 +68,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let saved = store::load_doc(&cfg, "allocator").await?.and_then(|v| serde_json::from_value::<alloc::Allocators>(v).ok());
     engine.set_alloc(alloc::Allocators::new(saved), store::load_backtest_stats(&cfg).await?);
     let followed = engine.followed.clone();
+    rollstats::spawn(cfg.clone(), tx.clone());
 
     // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
     {

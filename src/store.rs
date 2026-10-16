@@ -466,6 +466,34 @@ const MIGRATIONS: &[(&str, &str)] = &[
           fees           float8      NOT NULL
       );
       CREATE INDEX IF NOT EXISTS allocator_status_at ON allocator_status (generation, portfolio, at)"),
+    // The rolling backtest (`rollstats`): each trader's fills (gzip JSON, its window and a
+    // margin), and the statistics of each day's 90-day window.
+    ("2026-10-16-rollstats",
+     "CREATE TABLE IF NOT EXISTS trader_fills (
+          address     text        PRIMARY KEY,
+          fills       bytea       NOT NULL,
+          fetched_to  bigint,
+          updated_at  timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS backtest_stats_daily (
+          day         date    NOT NULL,
+          address     text    NOT NULL,
+          trips       integer NOT NULL,
+          pnl         float8  NOT NULL,
+          win_usd     float8  NOT NULL,
+          loss_usd    float8  NOT NULL,
+          max_dd_pct  float8  NOT NULL,
+          pnl_sq      float8  NOT NULL,
+          slip_bps    float8  NOT NULL,
+          coins       jsonb   NOT NULL,
+          sharpe_d    float8,
+          sortino_d   float8,
+          calmar      float8,
+          pnl_30d     float8,
+          weeks_pos   float8,
+          weeks       integer,
+          PRIMARY KEY (day, address)
+      )"),
 ];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
@@ -507,18 +535,36 @@ pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String
     })
 }
 
-/// The backtest's statistics of its picks (`backtest_stats`; `backtest_stats.json` without a
-/// database: address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins, sharpe_d,
+/// The day of the latest rolling statistics (`backtest_stats_daily`), unix s; None: none yet.
+pub async fn stats_day(cfg: &Config) -> Result<Option<f64>> {
+    let Some(url) = &cfg.database_url else { return Ok(None) };
+    let client = pg_connect(url).await?;
+    migrate(&client).await?;
+    let row = client.query_one("SELECT extract(epoch FROM max(day))::float8 FROM backtest_stats_daily", &[]).await?;
+    Ok(row.get(0))
+}
+
+/// The backtest's statistics: the latest day's of the rolling backtest (`backtest_stats_daily`),
+/// else the original one's (`backtest_stats`; `backtest_stats.json` without a database:
+/// address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins, sharpe_d,
 /// sortino_d, calmar, pnl_30d, weeks_pos, weeks}).
 pub async fn load_backtest_stats(cfg: &Config) -> Result<HashMap<String, crate::alloc::TraderStats>> {
     let rows: Vec<(String, Value)> = match &cfg.database_url {
         Some(url) => {
             let client = pg_connect(url).await?;
             migrate(&client).await?;
-            client.query("SELECT address, json_build_object('trips', trips, 'pnl', pnl, 'win_usd', win_usd, 'loss_usd', loss_usd,
+            let cols = "address, json_build_object('trips', trips, 'pnl', pnl, 'win_usd', win_usd, 'loss_usd', loss_usd,
                 'max_dd_pct', max_dd_pct, 'pnl_sq', pnl_sq, 'slip_bps', slip_bps, 'coins', coins, 'sharpe_d', sharpe_d, 'sortino_d', sortino_d,
-                'calmar', calmar, 'pnl_30d', pnl_30d, 'weeks_pos', weeks_pos, 'weeks', weeks)::text FROM backtest_stats", &[]).await?
-                .into_iter().filter_map(|r| Some((r.get::<_, String>(0).to_lowercase(), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect()
+                'calmar', calmar, 'pnl_30d', pnl_30d, 'weeks_pos', weeks_pos, 'weeks', weeks)::text";
+            let day: Option<String> = client.query_one("SELECT max(day)::text FROM backtest_stats_daily", &[]).await?.get(0);
+            let q = match &day {
+                Some(d) => format!("SELECT {cols} FROM backtest_stats_daily WHERE day = '{d}'"),
+                None => format!("SELECT {cols} FROM backtest_stats"),
+            };
+            let rows: Vec<(String, Value)> = client.query(&q, &[]).await?
+                .into_iter().filter_map(|r| Some((r.get::<_, String>(0).to_lowercase(), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect();
+            log!("backtest statistics: {} traders, {}", rows.len(), day.map(|d| format!("the rolling backtest's of {d}")).unwrap_or("the original backtest's".into()));
+            rows
         }
         None => std::fs::read_to_string(cfg.data_dir.join("backtest_stats.json")).ok()
             .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok()).unwrap_or_default().into_iter().collect(),

@@ -320,6 +320,8 @@ pub struct Engine {
     load: Load,
     /// Real orders for the golden list (`live`): its updates and its status.
     live: Option<(mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)>,
+    /// The portfolio whose picks the live account enters (`LIVE_PORTFOLIO`; None: the golden list).
+    live_portfolio: Option<String>,
 }
 
 #[derive(Default)]
@@ -370,6 +372,7 @@ impl Engine {
             seed: HashMap::new(),
             load: Load::default(),
             live: None,
+            live_portfolio: std::env::var("LIVE_PORTFOLIO").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
             cfg,
         })
     }
@@ -393,6 +396,11 @@ impl Engine {
     }
 
     pub fn set_live(&mut self, live: (mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)) {
+        match &self.live_portfolio {
+            Some(n) if self.alloc.portfolios.iter().any(|p| &p.name == n) => log!("live: entering the picks of {n}"),
+            Some(n) => log!("live: LIVE_PORTFOLIO {n} is no portfolio here: nothing will be entered"),
+            None => log!("live: entering the golden list's"),
+        }
         self.live = Some(live);
     }
 
@@ -697,12 +705,17 @@ impl Engine {
             entry = false;
         }
         let target = target(&mut t.legs, coin, theirs, ours, entry, full);
-        // The live account follows its position on its own (golden accounts' entries).
+        // The live account follows its position on its own: the entries of the traders the
+        // LIVE_PORTFOLIO portfolio picks today, else of the golden accounts.
         if let Some((live, _)) = &self.live {
             let peak = t.legs.get(coin).map(|l| l.peak).unwrap_or(0.0);
             let frac = if peak > 0.0 { theirs.abs() / peak } else { 0.0 };
+            let enter = match &self.live_portfolio {
+                Some(name) => self.alloc.portfolios.iter().any(|p| &p.name == name && p.picked.contains_key(user)),
+                None => t.golden,
+            };
             let _ = live.send(crate::live::Update { user: user.to_string(), coin: coin.to_string(), dir: theirs.signum(), frac,
-                entry: opened, golden: t.golden });
+                entry: opened, golden: enter });
         }
         if entry && target.abs() > 0.0 {
             *t.coins.entry(coin.to_string()).or_default() += 1;

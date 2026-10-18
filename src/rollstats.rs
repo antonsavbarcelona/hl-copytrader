@@ -5,6 +5,10 @@
 //! short (a redeploy) resumes, its fills saved as it goes. When today's are in, they go to the
 //! engine (`Msg::Seed`), which ranks again at once. Off without a database, without the
 //! script (a local build), or with ROLLSTATS=0.
+//!
+//! Whether it runs or not, the day's statistics are watched (`WATCH_S`): rows written from
+//! outside (the archive pick, `archive/daily.py`, run on a desktop with the S3 archive: every
+//! wallet of the exchange, the best by Sharpe among them) go to the engine as they come.
 
 use std::time::Duration;
 
@@ -23,9 +27,12 @@ const RETRY_S: f64 = 3600.0;
 /// After a start it waits this long: the bot's own start reads thousands of accounts, and the
 /// two on one IP's API limit kept it from coming up (2026-10-16).
 const START_DELAY_S: u64 = 1800;
+/// How often the day's statistics are checked for new rows.
+const WATCH_S: u64 = 600;
 
 pub fn spawn(cfg: Config, tx: mpsc::UnboundedSender<Msg>) {
     let Some(url) = cfg.database_url.clone() else { return };
+    watch(cfg.clone(), tx.clone());
     if std::env::var("ROLLSTATS").is_ok_and(|v| v.trim() == "0") || !std::path::Path::new(SCRIPT).exists() {
         log!("rollstats: off ({SCRIPT} not here, or ROLLSTATS=0)");
         return;
@@ -86,4 +93,31 @@ async fn echo<R: tokio::io::AsyncRead + Unpin>(r: Option<R>) {
             println!("{l}");
         }
     }
+}
+
+/// Loads the day's statistics again whenever the latest day or its number of rows changes.
+fn watch(cfg: Config, tx: mpsc::UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        let mut seen = crate::store::stats_mark(&cfg).await.ok().flatten();
+        loop {
+            tokio::time::sleep(Duration::from_secs(WATCH_S)).await;
+            let mark = match crate::store::stats_mark(&cfg).await {
+                Ok(m) => m,
+                Err(e) => {
+                    log!("statistics watch: {e:#}");
+                    continue;
+                }
+            };
+            if mark.is_some() && mark != seen {
+                match crate::store::load_backtest_stats(&cfg).await {
+                    Ok(s) => {
+                        log!("statistics watch: new rows ({:?} -> {:?}): loaded", seen.map(|m| m.1), mark.map(|m| m.1));
+                        let _ = tx.send(Msg::Seed(s));
+                        seen = mark;
+                    }
+                    Err(e) => log!("statistics watch: not loaded: {e:#}"),
+                }
+            }
+        }
+    });
 }

@@ -228,6 +228,27 @@ fixed at 2026-10-10 they never did: the same picks every day). From 2026-10-16.
   gives backtest_stats again (6 882 of 6 887 rows; 5 differ at its edge, the original
   download having fills after its end), and the job's statistics equal the research code's.
 
+- Sharpe, Sortino and Calmar are over the whole 90-day window (the days before a copy's first
+  trip count as flat; from 2026-10-18): from the first trip, a wallet of a few lucky days
+  ranked first by them. The slippage means (`model.json`) are the paper's of 2026-10-14..16.
+- Every 10 min the latest day's rows are counted: a change (rows written from outside, the
+  archive pick below) is loaded at once (`statistics watch: ...`), with rollstats on or off.
+
+## Archive pick
+
+`archive/daily.py`, run each morning on a desktop (`archive/run_daily.ps1`, which reads the
+repo's `.env`: `RAILWAY_DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`); Railway
+only trades. It reads Hyperliquid's S3 archive (every fill of every wallet,
+`s3://hl-mainnet-node-data/node_fills_by_block`, requester pays; ~0.7 GB a day, kept extracted
+for 120 days in `D:\hl-daily`, ~20 GB), backtests every wallet's copy with rollstats' model
+(stops on minute bars from every fill, funding from the archive's asset contexts) and writes the
+day's `backtest_stats_daily` rows: the bot's universe (`trader_fills`) and the exchange's 500
+best by the copy's Sharpe over 90 days (10+ closed trips, in profit). It replaces rollstats:
+run the bot with `ROLLSTATS=0`. Market makers (mostly maker in an hour of 500+ fills) and HFT
+(by its decisions, not its fills) are left out. The research walk-forward behind it (2026-10-18,
+2025-05 .. 2026-10, the paper as its check): the copy's Sharpe over 90 days was the one score in
+profit both on the months it was chosen on and on the months after.
+
 ## Live
 
 With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,
@@ -236,6 +257,12 @@ or an API wallet's approved for it) set, the golden list is also traded for real
 like mainnet's, so it showed the mechanics only):
 testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`).
 
+- `LIVE_PORTFOLIO` (e.g. `SHARPE_20_R1_D50`): the traders that portfolio picks today are entered
+  instead of the golden list, with its limits on the account: `LIVE_RISK_PCT` an entry (default
+  the paper's 2), open risk at most `LIVE_CAP_TOTAL_PCT` (100) in all, `LIVE_CAP_DIR_PCT` (50) in
+  one direction, `LIVE_CAP_TRADER_PCT` (20) of one trader, two legs a coin; with
+  `LIVE_MAX_DD_PCT` (off at 0) no entries once the account is that far below its peak (its legs
+  are followed out).
 - Health check at every start: a $15 market buy of BTC (else ETH, SOL: one not held), sold at
   once; the result (ok, prices, fee, PnL, time, error) is a row of `live_checks`
   (`live_checks.jsonl` without a database). A failed one is logged; trading runs on regardless.

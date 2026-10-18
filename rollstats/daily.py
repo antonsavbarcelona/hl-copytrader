@@ -83,7 +83,10 @@ def main():
                 tr = []
                 print(f"rollstats: {u} not backtested: {e}", flush=True)
             if tr:
-                m = metrics(tr, start, end)
+                # Over the whole window (days before the copy's first trip count as flat), not
+                # from its first trip: from its first trip a wallet of a few lucky days ranked first
+                # by Sharpe, Sortino and Calmar (the archive walk-forward of 2026-10-18).
+                m = metrics(tr, t_from, end)
                 rows.append((day, u, m['n'], m['pnl'], m['win'], m['loss'], m['dd'], m['sq'], sum(t['slip_in'] for t in tr) / len(tr),
                              json.dumps(dict(Counter(t['coin'] for t in tr))), m['sharpe'], m['sortino'], m['calmar'], m['pnl30'], m['weeks_pos'], m['weeks']))
         if (i + 1) % 500 == 0:
@@ -91,7 +94,8 @@ def main():
     if not rows:
         print(f"rollstats: no traders with copy trips on {day} (none in trader_fills yet?): nothing written", flush=True)
         return
-    cur.execute("delete from backtest_stats_daily where day = %s", (day,))
+    # Its own traders' rows only: the archive pick (archive/daily.py) adds others for the day.
+    cur.execute("delete from backtest_stats_daily where day = %s and address = any(%s)", (day, universe))
     execute_values(cur, """insert into backtest_stats_daily (day, address, trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins,
         sharpe_d, sortino_d, calmar, pnl_30d, weeks_pos, weeks) values %s""", rows, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s)",
         page_size=1000)

@@ -61,12 +61,13 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let live = live::start(&cfg, store.clone(), false).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
-    if let Some(l) = live {
-        engine.set_live(l);
-    }
     engine.set_picks(picks);
     let saved = store::load_doc(&cfg, "allocator").await?.and_then(|v| serde_json::from_value::<alloc::Allocators>(v).ok());
     engine.set_alloc(alloc::Allocators::new(saved), store::load_backtest_stats(&cfg).await?);
+    // After the allocator: the live account may enter one of its portfolios' picks.
+    if let Some(l) = live {
+        engine.set_live(l);
+    }
     let followed = engine.followed.clone();
     rollstats::spawn(cfg.clone(), tx.clone());
 

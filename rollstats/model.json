@@ -1,5 +1,5 @@
 {
-"_about": "The copy model of the backtest (research 2026-10-10): each coin's day volume (its liquidity bucket) and our measured slippage vs the trader's price (bp), mean per bucket and kind.",
+"_about": "The copy model of the backtest (research 2026-10-10): each coin's day volume (its liquidity bucket) and our measured slippage vs the trader's price (bp), mean per bucket and kind; slip_mean recalibrated on the paper of 2026-10-14..16 (the archive check: the old means overstated entries by ~19 bp).",
 "dayvol": {
 "0G": 438082.8599400002,
 "2Z": 197408.11681,
@@ -237,17 +237,17 @@
 "kSHIB": 306405.2823149998
 },
 "slip_mean": {
-"20-100M|entry": 32.465018587360596,
-"20-100M|exit": 1.9753846153846153,
-"20-100M|partial": 12.127616645649432,
-"5-20M|entry": 17.294655737704918,
-"5-20M|exit": 0.13148351648351644,
-"5-20M|partial": 6.092931529315293,
-"<5M|entry": 38.58548223350254,
-"<5M|exit": 0.952880658436214,
-"<5M|partial": 11.879916281755197,
-">=100M|entry": 3.833186813186813,
-">=100M|exit": -0.27742187500000004,
-">=100M|partial": 3.2327708333333334
+"20-100M|entry": 4.411,
+"20-100M|exit": -0.906,
+"20-100M|partial": 4.306,
+"5-20M|entry": 6.72,
+"5-20M|exit": -1.139,
+"5-20M|partial": 4.426,
+"<5M|entry": 5.775,
+"<5M|exit": 14.081,
+"<5M|partial": 7.698,
+">=100M|entry": 0.775,
+">=100M|exit": -1.009,
+">=100M|partial": 2.34
 }
 }

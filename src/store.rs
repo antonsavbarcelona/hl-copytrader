@@ -540,6 +540,18 @@ pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String
 }
 
 /// The day of the latest rolling statistics (`backtest_stats_daily`), unix s; None: none yet.
+/// The latest day of `backtest_stats_daily` (unix s) and its number of rows: a change means
+/// new statistics to load (the archive pick, written from outside, adds a day's rows).
+pub async fn stats_mark(cfg: &Config) -> Result<Option<(f64, i64)>> {
+    let Some(url) = &cfg.database_url else { return Ok(None) };
+    let client = pg_connect(url).await?;
+    let row = client.query_one(
+        "SELECT extract(epoch FROM d)::float8, (SELECT count(*) FROM backtest_stats_daily WHERE day = d) FROM (SELECT max(day) AS d FROM backtest_stats_daily) m",
+        &[]).await?;
+    let day: Option<f64> = row.get(0);
+    Ok(day.map(|d| (d, row.get(1))))
+}
+
 pub async fn stats_day(cfg: &Config) -> Result<Option<f64>> {
     let Some(url) = &cfg.database_url else { return Ok(None) };
     let client = pg_connect(url).await?;

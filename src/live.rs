@@ -21,6 +21,13 @@
 //! Orders are IOC limits 5% through the mid (market orders, as the SDK places them). Prices are
 //! the live account's venue's: on testnet its own books, not mainnet's.
 //!
+//! What it enters (`LIVE_PORTFOLIO`): the traders an allocator portfolio picks today, e.g.
+//! `SHARPE_20_R1_D50` (the archive walk-forward of 2026-10-18), instead of the golden list; with
+//! that portfolio's limits on our account: `LIVE_RISK_PCT` an entry (default `risk_pct`), the
+//! open risk in all (`LIVE_CAP_TOTAL_PCT`, 100), in one direction (`LIVE_CAP_DIR_PCT`, 50), of
+//! one trader (`LIVE_CAP_TRADER_PCT`, 20), two legs a coin; no entries once the account is
+//! `LIVE_MAX_DD_PCT` below its peak (off at 0), its legs followed out.
+//!
 //! At every start a health check runs first: a small market buy ($15) of BTC (else ETH,
 //! SOL: a coin we hold no position in), sold at once; its result goes to `live_checks`. A
 //! failed check is recorded and logged; the live trader runs on regardless.
@@ -92,6 +99,9 @@ pub struct State {
     /// Entries not followed: the other way from the coin's legs, or `max_positions` open.
     pub skipped: u64,
     pub orders: u64,
+    /// The account's highest equity seen at an entry (`LIVE_MAX_DD_PCT`).
+    #[serde(default)]
+    pub peak: f64,
 }
 
 /// A leg's key: the coin and the account it follows.
@@ -126,6 +136,26 @@ pub struct Live {
     cfg: Config,
     store: Store,
     status: Arc<Mutex<Value>>,
+    limits: Limits,
+}
+
+/// The entries' limits (env, see the module's doc), in % of the account's equity.
+#[derive(Clone, Debug)]
+struct Limits {
+    risk: f64,
+    total: f64,
+    dir: f64,
+    trader: f64,
+    per_coin: usize,
+    max_dd: f64,
+}
+
+impl Limits {
+    fn from_env(cfg: &Config) -> Self {
+        let pct = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+        Limits { risk: pct("LIVE_RISK_PCT", cfg.risk_pct), total: pct("LIVE_CAP_TOTAL_PCT", 100.0), dir: pct("LIVE_CAP_DIR_PCT", 50.0),
+            trader: pct("LIVE_CAP_TRADER_PCT", 20.0), per_coin: 2, max_dd: pct("LIVE_MAX_DD_PCT", 0.0) }
+    }
 }
 
 /// Starts the live trader if `LIVE_ENABLED` is "1" (or `force`, for `live-check`) and
@@ -154,7 +184,7 @@ pub async fn start(cfg: &Config, store: Store, force: bool) -> Result<Option<(mp
     log!("live: {} account {} (signer {}{}), {} coins, {} legs held", if base == MAINNET { "MAINNET" } else { "testnet" },
         account, ex.signer(), if unified { ", unified" } else { "" }, coins.len(), state.legs.len());
     let status = Arc::new(Mutex::new(json!({})));
-    let mut live = Live { ex, account, unified, coins, state, cfg: cfg.clone(), store, status: status.clone() };
+    let mut live = Live { ex, account, unified, coins, state, cfg: cfg.clone(), store, status: status.clone(), limits: Limits::from_env(cfg) };
     let (tx, mut rx) = mpsc::unbounded_channel::<Update>();
     tokio::spawn(async move {
         live.health().await;
@@ -355,10 +385,33 @@ impl Live {
             self.skip(u, "other way from the coin's legs");
             return Ok(());
         }
+        // The portfolio's limits: each open leg holds `risk` of the account at its entry.
+        let lim = self.limits.clone();
+        let legs = |f: &dyn Fn(&Leg) -> bool| self.state.legs.values().filter(|l| f(l)).count() as f64 * lim.risk;
+        let why = if legs(&|_| true) + lim.risk > lim.total + 1e-9 {
+            Some("total risk")
+        } else if legs(&|l| l.dir == u.dir) + lim.risk > lim.dir + 1e-9 {
+            Some("risk in one direction")
+        } else if legs(&|l| l.user == u.user) + lim.risk > lim.trader + 1e-9 {
+            Some("risk of one trader")
+        } else if self.state.in_coin(&u.coin).count() >= lim.per_coin {
+            Some("legs in the coin")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.skip(u, why);
+            return Ok(());
+        }
         let (equity, _) = self.equity().await?;
+        self.state.peak = self.state.peak.max(equity);
+        if lim.max_dd > 0.0 && equity < self.state.peak * (1.0 - lim.max_dd / 100.0) {
+            self.skip(u, "drawdown brake");
+            return Ok(());
+        }
         let mid = self.mid(&u.coin).await?;
         let dec = self.coins[&u.coin].1;
-        let full = round_size(self.cfg.risk_pct / self.cfg.stop_pct * equity / mid, dec);
+        let full = round_size(lim.risk / self.cfg.stop_pct * equity / mid, dec);
         if full * mid < MIN_ORDER_USD {
             self.event(json!({"what": "too small", "user": u.user, "coin": u.coin, "equity": equity, "size": full}));
             return Ok(());

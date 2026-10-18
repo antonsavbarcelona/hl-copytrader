@@ -263,6 +263,18 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
   one direction, `LIVE_CAP_TRADER_PCT` (20) of one trader, two legs a coin; with
   `LIVE_MAX_DD_PCT` (off at 0) no entries once the account is that far below its peak (its legs
   are followed out).
+- `LIVE_ONLY=1`: only the live portfolio's picks and the accounts the live account holds legs
+  of are followed, nothing on paper beyond them (no trial, no selection's thousands). The picks
+  are enrolled as soon as they are picked (their positions read), not on their first fill: an
+  entry in several fills read whole on enrolment was taken for a position held before.
+- Orders do not wait for each other across coins: each coin's moves are one job at a time, the
+  coins' jobs run at once; the moves that came while a coin's job ran are taken together (each
+  account's last); an entry more than 3 s after its fill reached the bot is skipped (`late`).
+  The mid comes from the bot's books (the API's mids, read every 5 s, where they have none),
+  the equity from a read every 15 s, the minute's account check is read in the background: an
+  entry is one request. Measured from a desktop in Europe (2026-10-18): 1.7 s from the trader's
+  fill to ours, against 5-48 s before; most of it the round trip to the exchange (Tokyo), so
+  the bot trades from Railway's Singapore region.
 - Health check at every start: a $15 market buy of BTC (else ETH, SOL: one not held), sold at
   once; the result (ok, prices, fee, PnL, time, error) is a row of `live_checks`
   (`live_checks.jsonl` without a database). A failed one is logged; trading runs on regardless.

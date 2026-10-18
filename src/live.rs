@@ -62,6 +62,13 @@ const MIN_LEFT_USD: f64 = 11.0;
 const DOC: &str = "live";
 /// The start's check trades this much (USD; the exchange's minimum is $10).
 const CHECK_USD: f64 = 15.0;
+/// An entry this long (s) after its fill reached the engine is not taken: the price has moved
+/// on (a scalper may be out already).
+const ENTRY_MAX_AGE_S: f64 = 3.0;
+/// How often the account's equity is read in the background (entries size on it).
+const EQUITY_EVERY_S: f64 = 15.0;
+/// How often every coin's mid is read in the background (the books' fallback).
+const MIDS_EVERY_S: f64 = 5.0;
 
 /// A move of a followed account's position in a coin.
 #[derive(Debug)]
@@ -75,6 +82,8 @@ pub struct Update {
     /// Its fills opened the position.
     pub entry: bool,
     pub golden: bool,
+    /// When its fill reached the engine (unix s): a late entry is not taken.
+    pub at: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -126,17 +135,182 @@ impl State {
     }
 }
 
-pub struct Live {
+/// The venue and what its orders need, shared by the coins' jobs (each runs on its own: one
+/// coin's orders do not wait for another's).
+#[derive(Clone)]
+struct Venue {
     ex: Exchange,
+    /// Coin -> (asset index, size decimals) on the live venue.
+    coins: Arc<HashMap<String, (u32, u32)>>,
+    /// The engine's live books (mainnet's): a mid without a request. None: read from the API.
+    books: Option<crate::ws::Books>,
+    /// Every coin's mid, read in the background (`MIDS_EVERY_S`): where the books have none.
+    mids: Arc<std::sync::RwLock<HashMap<String, f64>>>,
+}
+
+impl Venue {
+    async fn mid(&self, coin: &str) -> Result<f64> {
+        if self.ex.mainnet() {
+            if let Some(m) = self.books.as_ref().and_then(|b| b.read().unwrap().get(coin).and_then(crate::ws::Book::mid)) {
+                return Ok(m);
+            }
+        }
+        let mids = self.ex.info(json!({"type": "allMids"})).await?;
+        let m = num(&mids[coin]);
+        if m <= 0.0 {
+            bail!("no mid for {coin}");
+        }
+        Ok(m)
+    }
+
+    /// A market order (IOC through the mid): the size filled (signed), its average price and
+    /// its order id.
+    async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
+        let (asset, dec) = self.coins[coin];
+        let mid = self.mid(coin).await?;
+        let buy = size > 0.0;
+        let sz = round_size(size.abs(), dec);
+        if sz <= 0.0 {
+            bail!("{coin}: size {size} rounds to 0");
+        }
+        let mut last = Value::Null;
+        for slip in [SLIPPAGE, SLIPPAGE_RETRY] {
+            let px = round_px(mid * if buy { 1.0 + slip } else { 1.0 - slip }, dec);
+            let order = OrderWire { a: asset, b: buy, p: wire(px), s: wire(sz), r: reduce, t: OrderType::Limit { tif: "Ioc".into() } };
+            let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
+            let st = r["data"]["statuses"][0].clone();
+            if let Some(f) = st.get("filled") {
+                let got = num(&f["totalSz"]);
+                return Ok((if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
+            }
+            // Nothing within reach: once more, further through the mid; any other error is final.
+            let nothing = st["error"].as_str().is_some_and(|e| e.contains("could not immediately match"));
+            last = st;
+            if !nothing {
+                break;
+            }
+        }
+        bail!("{coin} order not filled: {last}");
+    }
+
+    /// Our stop: a reduce-only stop-market order for `size` at `trigger`; its order id.
+    async fn stop(&self, coin: &str, dir: f64, size: f64, trigger: f64) -> Result<u64> {
+        let (asset, dec) = self.coins[coin];
+        let trigger = round_px(trigger, dec);
+        let px = round_px(trigger * (1.0 - dir * STOP_SLIPPAGE), dec);
+        let order = OrderWire {
+            a: asset, b: dir < 0.0, p: wire(px), s: wire(round_size(size.abs(), dec)), r: true,
+            t: OrderType::Trigger { is_market: true, trigger_px: wire(trigger), tpsl: "sl".into() },
+        };
+        let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
+        let st = &r["data"]["statuses"][0];
+        st["resting"]["oid"].as_u64().with_context(|| format!("{coin} stop not placed: {st}"))
+    }
+
+    async fn cancel(&self, coin: &str, oid: u64) {
+        let a = self.coins[coin].0;
+        if let Err(e) = self.ex.act(&Action::Cancel { cancels: vec![CancelWire { a, o: oid }] }).await {
+            log!("live: cancel {coin} {oid}: {e:#}");
+        }
+    }
+}
+
+/// One coin's next moves, planned at once from the state (and from each other: a close before
+/// the same account's entry the other way), done in order by the coin's job.
+#[derive(Debug)]
+enum Step {
+    Open { key: String, user: String, coin: String, dir: f64, full: f64, size: f64, equity: f64 },
+    Follow { key: String, leg: Leg, delta: f64, reduce: bool },
+    Close { key: String, leg: Leg, why: &'static str },
+}
+
+/// What a step did, for the state.
+#[derive(Debug)]
+enum Done {
+    Opened { key: String, leg: Leg, equity: f64 },
+    Moved { key: String, leg: Leg, got: f64, px: f64, reduce: bool },
+    Closed { key: String, leg: Leg, got: f64, px: f64, why: &'static str },
+    Failed { user: String, coin: String, error: String },
+}
+
+/// A coin's steps against the venue, in order: an entry's stop placed after its fill; a move's
+/// stop replaced (the new one placed and the old one cancelled at once); a close's stop cancelled
+/// with the close (the exchange drops a reduce-only order without a position anyway).
+async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
+    let mut out = Vec::new();
+    for s in steps {
+        let (user, coin) = match &s {
+            Step::Open { user, coin, .. } => (user.clone(), coin.clone()),
+            Step::Follow { leg, .. } | Step::Close { leg, .. } => (leg.user.clone(), leg.coin.clone()),
+        };
+        let r: Result<Done> = async {
+            Ok(match s {
+                Step::Open { key, user, coin, dir, full, size, equity } => {
+                    let (got, px, _) = v.market(&coin, size, false).await?;
+                    if got == 0.0 {
+                        bail!("nothing filled");
+                    }
+                    let stop_px = px * (1.0 - dir * stop_pct / 100.0);
+                    let stop_oid = match v.stop(&coin, dir, got, stop_px).await {
+                        Ok(o) => Some(o),
+                        Err(e) => {
+                            log!("live: {coin} stop not placed (the next check places it): {e:#}");
+                            None
+                        }
+                    };
+                    Done::Opened { key, leg: Leg { coin, user, dir, full, size: got, entry_px: px, stop_px, stop_oid, opened: now() }, equity }
+                }
+                Step::Follow { key, mut leg, delta, reduce } => {
+                    let (got, px, _) = v.market(&leg.coin, delta, reduce).await?;
+                    leg.size += got;
+                    let old = leg.stop_oid;
+                    let (new, _) = tokio::join!(v.stop(&leg.coin, leg.dir, leg.size, leg.stop_px), async {
+                        if let Some(o) = old {
+                            v.cancel(&leg.coin, o).await;
+                        }
+                    });
+                    leg.stop_oid = new.ok();
+                    Done::Moved { key, leg, got, px, reduce }
+                }
+                Step::Close { key, leg, why } => {
+                    let close = async {
+                        if leg.size != 0.0 { v.market(&leg.coin, -leg.size, true).await.map(|(g, p, _)| (g, p)) } else { Ok((0.0, 0.0)) }
+                    };
+                    let cancel = async {
+                        if let Some(o) = leg.stop_oid {
+                            v.cancel(&leg.coin, o).await;
+                        }
+                    };
+                    let (r, _) = tokio::join!(close, cancel);
+                    let (got, px) = r?;
+                    Done::Closed { key, leg, got, px, why }
+                }
+            })
+        }.await;
+        match r {
+            Ok(d) => out.push(d),
+            Err(e) => out.push(Done::Failed { user, coin, error: format!("{e:#}") }),
+        }
+    }
+    out
+}
+
+pub struct Live {
+    venue: Venue,
     account: String,
     unified: bool,
-    /// Coin -> (asset index, size decimals) on the live venue.
-    coins: HashMap<String, (u32, u32)>,
     state: State,
     cfg: Config,
     store: Store,
     status: Arc<Mutex<Value>>,
     limits: Limits,
+    /// The account's equity and when it was read (refreshed in the background).
+    equity: (f64, f64),
+    /// Moves not acted on yet, by coin, and the coins with a job in flight.
+    pending: HashMap<String, Vec<Update>>,
+    busy: std::collections::HashSet<String>,
+    /// When each coin's last job was done: a read begun before it is stale for the coin.
+    touched: HashMap<String, f64>,
 }
 
 /// The entries' limits (env, see the module's doc), in % of the account's equity.
@@ -160,7 +334,9 @@ impl Limits {
 
 /// Starts the live trader if `LIVE_ENABLED` is "1" (or `force`, for `live-check`) and
 /// `LIVE_KEY` and `LIVE_ACCOUNT` are set: its sender, and its status (for `bot_status`).
-pub async fn start(cfg: &Config, store: Store, force: bool) -> Result<Option<(mpsc::UnboundedSender<Update>, Arc<Mutex<Value>>)>> {
+/// `books`: the engine's live books (mainnet's), its mids.
+pub async fn start(cfg: &Config, store: Store, force: bool, books: Option<crate::ws::Books>)
+    -> Result<Option<(mpsc::UnboundedSender<Update>, Arc<Mutex<Value>>)>> {
     if !force && std::env::var("LIVE_ENABLED").unwrap_or_default().trim() != "1" {
         return Ok(None);
     }
@@ -184,23 +360,107 @@ pub async fn start(cfg: &Config, store: Store, force: bool) -> Result<Option<(mp
     log!("live: {} account {} (signer {}{}), {} coins, {} legs held", if base == MAINNET { "MAINNET" } else { "testnet" },
         account, ex.signer(), if unified { ", unified" } else { "" }, coins.len(), state.legs.len());
     let status = Arc::new(Mutex::new(json!({})));
-    let mut live = Live { ex, account, unified, coins, state, cfg: cfg.clone(), store, status: status.clone(), limits: Limits::from_env(cfg) };
+    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default() };
+    let mut live = Live { venue, account, unified, state, cfg: cfg.clone(), store, status: status.clone(), limits: Limits::from_env(cfg),
+        equity: (0.0, 0.0), pending: HashMap::new(), busy: Default::default(), touched: HashMap::new() };
     let (tx, mut rx) = mpsc::unbounded_channel::<Update>();
+    let (dtx, mut drx) = mpsc::unbounded_channel::<(String, Vec<Done>)>();
+    let (etx, mut erx) = mpsc::unbounded_channel::<f64>();
     tokio::spawn(async move {
         live.health().await;
         live.reconcile().await;
+        // The equity in the background: entries size on it without a request of their own.
+        let (venue, account, unified) = (live.venue.clone(), live.account.clone(), live.unified);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((e, _)) = equity_of(&venue.ex, &account, unified).await {
+                    if etx.send(e).is_err() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs_f64(EQUITY_EVERY_S)).await;
+            }
+        });
+        let v = live.venue.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(m) = v.ex.info(json!({"type": "allMids"})).await {
+                    if let Some(o) = m.as_object() {
+                        *v.mids.write().unwrap() = o.iter().map(|(c, x)| (c.clone(), num(x))).filter(|(_, x)| *x > 0.0).collect();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs_f64(MIDS_EVERY_S)).await;
+            }
+        });
+        let (rtx, mut rrx) = mpsc::unbounded_channel::<Read>();
         let mut every = tokio::time::interval(std::time::Duration::from_secs(60));
+        every.tick().await;
         loop {
             tokio::select! {
                 u = rx.recv() => match u {
-                    Some(u) => live.on_update(u).await,
+                    Some(u) => live.queue(u, &dtx),
                     None => break,
                 },
-                _ = every.tick() => live.reconcile().await,
+                Some((coin, done)) = drx.recv() => live.done(coin, done, &dtx),
+                Some(e) = erx.recv() => live.equity = (e, now()),
+                Some(r) = rrx.recv() => live.reconcile_with(r).await,
+                _ = every.tick() => {
+                    let (ex, account, unified, rtx) = (live.venue.ex.clone(), live.account.clone(), live.unified, rtx.clone());
+                    tokio::spawn(async move {
+                        if let Some(r) = read_account(&ex, &account, unified).await {
+                            let _ = rtx.send(r);
+                        }
+                    });
+                }
             }
         }
     });
     Ok(Some((tx, status)))
+}
+
+/// The account as read for `reconcile_with`: when the read began, the equity, the positions,
+/// the resting orders' ids (None: not read).
+struct Read {
+    at: f64,
+    equity: f64,
+    positions: HashMap<String, f64>,
+    resting: Option<std::collections::HashSet<u64>>,
+}
+
+async fn read_account(ex: &Exchange, account: &str, unified: bool) -> Option<Read> {
+    let at = now();
+    let (equity, positions) = match equity_of(ex, account, unified).await {
+        Ok(x) => x,
+        Err(e) => {
+            log!("live: account read failed: {e:#}");
+            return None;
+        }
+    };
+    let resting = match ex.info(json!({"type": "frontendOpenOrders", "user": account})).await {
+        Ok(v) => Some(v.as_array().into_iter().flatten().filter_map(|o| o["oid"].as_u64()).collect()),
+        Err(e) => {
+            log!("live: orders read failed: {e:#}");
+            None
+        }
+    };
+    Some(Read { at, equity, positions, resting })
+}
+
+/// Our account's equity: its perp account value, and on a unified account the spot USDC not
+/// held as perp margin (it backs the perps too); and its positions.
+async fn equity_of(ex: &Exchange, account: &str, unified: bool) -> Result<(f64, HashMap<String, f64>)> {
+    let st = ex.info(json!({"type": "clearinghouseState", "user": account})).await?;
+    let mut eq = num(&st["marginSummary"]["accountValue"]);
+    if unified {
+        let spot = ex.info(json!({"type": "spotClearinghouseState", "user": account})).await?;
+        if let Some(b) = spot["balances"].as_array().into_iter().flatten().find(|b| b["coin"] == "USDC") {
+            eq += num(&b["total"]) - num(&b["hold"]);
+        }
+    }
+    let positions = st["assetPositions"].as_array().into_iter().flatten()
+        .filter_map(|p| Some((p["position"]["coin"].as_str()?.to_string(), num(&p["position"]["szi"]))))
+        .collect();
+    Ok((eq, positions))
 }
 
 impl Live {
@@ -211,114 +471,239 @@ impl Live {
         self.store.event(ev);
     }
 
-    async fn save(&self) {
-        if let Err(e) = crate::store::save_doc(&self.cfg, DOC, &serde_json::to_value(&self.state).unwrap_or_default()).await {
-            log!("live: state not saved: {e:#}");
+    /// The state to the store, in the background (a job's results do not wait for it).
+    fn save(&self) {
+        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
+        tokio::spawn(async move {
+            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
+                log!("live: state not saved: {e:#}");
+            }
+        });
+    }
+
+    fn skip(&mut self, u: &Update, why: &str) {
+        self.state.skipped += 1;
+        self.event(json!({"what": "skipped", "why": why, "user": u.user, "coin": u.coin, "late_s": (now() - u.at).max(0.0)}));
+    }
+
+    /// A move in: acted on at once if its coin has no job in flight, else when that job is done
+    /// (the moves that came meanwhile taken together: each account's last, an entry among them
+    /// kept).
+    fn queue(&mut self, u: Update, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
+        if !self.venue.coins.contains_key(&u.coin) {
+            // A followed account's entry in a coin the live venue does not list: recorded, so it
+            // is not taken for a missed one.
+            if u.entry && u.golden && u.frac > 0.0 {
+                self.skip(&u, "coin not listed on the live venue");
+            }
+            return;
+        }
+        let coin = u.coin.clone();
+        self.pending.entry(coin.clone()).or_default().push(u);
+        if !self.busy.contains(&coin) {
+            self.launch(&coin, dtx);
         }
     }
 
-    /// Our account's equity: its perp account value, and on a unified account the spot USDC
-    /// not held as perp margin (it backs the perps too).
-    async fn equity(&self) -> Result<(f64, HashMap<String, f64>)> {
-        let st = self.ex.info(json!({"type": "clearinghouseState", "user": self.account})).await?;
-        let mut eq = num(&st["marginSummary"]["accountValue"]);
-        if self.unified {
-            let spot = self.ex.info(json!({"type": "spotClearinghouseState", "user": self.account})).await?;
-            if let Some(b) = spot["balances"].as_array().into_iter().flatten().find(|b| b["coin"] == "USDC") {
-                eq += num(&b["total"]) - num(&b["hold"]);
+    /// Plans the coin's pending moves and starts its job.
+    fn launch(&mut self, coin: &str, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
+        let Some(us) = self.pending.remove(coin) else { return };
+        // Each account's moves together: its last state; an entry if any was one (the first's time).
+        let mut merged: Vec<Update> = Vec::new();
+        for u in us {
+            match merged.iter_mut().find(|m| m.user == u.user) {
+                Some(m) => {
+                    let (entry, at) = (m.entry || u.entry, if m.entry { m.at } else { u.at });
+                    *m = Update { entry, at, ..u };
+                }
+                None => merged.push(u),
             }
         }
-        let positions = st["assetPositions"].as_array().into_iter().flatten()
-            .filter_map(|p| Some((p["position"]["coin"].as_str()?.to_string(), num(&p["position"]["szi"]))))
-            .collect();
-        Ok((eq, positions))
-    }
-
-    async fn mid(&self, coin: &str) -> Result<f64> {
-        let mids = self.ex.info(json!({"type": "allMids"})).await?;
-        let m = num(&mids[coin]);
-        if m <= 0.0 {
-            bail!("no mid for {coin}");
+        let mut steps = Vec::new();
+        // The legs as they will be after the steps planned so far.
+        let mut view = self.state.legs.clone();
+        for u in merged {
+            self.plan(&u, &mut view, &mut steps);
         }
-        Ok(m)
-    }
-
-    /// A market order (IOC through the mid): the size filled (signed) and its average price.
-    async fn market(&mut self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64)> {
-        self.market_oid(coin, size, reduce).await.map(|(got, px, _)| (got, px))
-    }
-
-    /// `market`, with the order's id.
-    async fn market_oid(&mut self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
-        let (asset, dec) = self.coins[coin];
-        let mid = self.mid(coin).await?;
-        let buy = size > 0.0;
-        let sz = round_size(size.abs(), dec);
-        if sz <= 0.0 {
-            bail!("{coin}: size {size} rounds to 0");
+        if steps.is_empty() {
+            return;
         }
-        let mut last = Value::Null;
-        for slip in [SLIPPAGE, SLIPPAGE_RETRY] {
-            let px = round_px(mid * if buy { 1.0 + slip } else { 1.0 - slip }, dec);
-            let order = OrderWire { a: asset, b: buy, p: wire(px), s: wire(sz), r: reduce, t: OrderType::Limit { tif: "Ioc".into() } };
-            self.state.orders += 1;
-            let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
-            let st = r["data"]["statuses"][0].clone();
-            if let Some(f) = st.get("filled") {
-                let got = num(&f["totalSz"]);
-                return Ok((if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
+        self.state.orders += steps.len() as u64;
+        self.busy.insert(coin.to_string());
+        let (v, stop_pct, dtx, coin) = (self.venue.clone(), self.cfg.stop_pct, dtx.clone(), coin.to_string());
+        tokio::spawn(async move {
+            let done = run_steps(v, stop_pct, steps).await;
+            let _ = dtx.send((coin, done));
+        });
+    }
+
+    /// One account's move as steps, against `view` (updated as if they were done).
+    fn plan(&mut self, u: &Update, view: &mut HashMap<String, Leg>, steps: &mut Vec<Step>) {
+        let k = key(&u.coin, &u.user);
+        match view.get(&k).cloned() {
+            Some(leg) if u.frac <= 0.0 || u.dir != leg.dir => {
+                view.remove(&k);
+                steps.push(Step::Close { key: k, leg, why: if u.frac <= 0.0 { "exit" } else { "flip" } });
+                if u.frac > 0.0 && u.entry && u.golden {
+                    self.plan_open(u, view, steps);
+                }
             }
-            // Nothing within reach: once more, further through the mid; any other error is final.
-            let nothing = st["error"].as_str().is_some_and(|e| e.contains("could not immediately match"));
-            last = st;
-            if !nothing {
-                break;
+            Some(leg) => {
+                let Some(mid) = self.mid_now(&u.coin) else { return };
+                let target = leg.dir * leg.full * u.frac.min(1.0);
+                if target.abs() * mid < MIN_LEFT_USD {
+                    view.remove(&k);
+                    steps.push(Step::Close { key: k, leg, why: "small" });
+                    return;
+                }
+                let delta = target - leg.size;
+                if round_size(delta.abs(), self.venue.coins[&u.coin].1) * mid < MIN_ORDER_USD {
+                    return;
+                }
+                let reduce = target.abs() < leg.size.abs();
+                if let Some(l) = view.get_mut(&k) {
+                    l.size = target;
+                }
+                steps.push(Step::Follow { key: k, leg, delta, reduce });
             }
+            None if u.entry && u.golden && u.frac > 0.0 => self.plan_open(u, view, steps),
+            None => {}
         }
-        bail!("{coin} order not filled: {last}");
     }
 
-    /// Our stop: a reduce-only stop-market order for `size` at `trigger`; its order id.
-    async fn stop(&mut self, coin: &str, dir: f64, size: f64, trigger: f64) -> Result<u64> {
-        let (asset, dec) = self.coins[coin];
-        let trigger = round_px(trigger, dec);
-        let px = round_px(trigger * (1.0 - dir * STOP_SLIPPAGE), dec);
-        let order = OrderWire {
-            a: asset, b: dir < 0.0, p: wire(px), s: wire(round_size(size.abs(), dec)), r: true,
-            t: OrderType::Trigger { is_market: true, trigger_px: wire(trigger), tpsl: "sl".into() },
+    /// The mid from the books, else from the background read (no request): None if neither has it.
+    fn mid_now(&self, coin: &str) -> Option<f64> {
+        self.venue.books.as_ref().filter(|_| self.venue.ex.mainnet()).and_then(|b| b.read().unwrap().get(coin).and_then(crate::ws::Book::mid))
+            .or_else(|| self.venue.mids.read().unwrap().get(coin).copied())
+    }
+
+    fn plan_open(&mut self, u: &Update, view: &mut HashMap<String, Leg>, steps: &mut Vec<Step>) {
+        let late = now() - u.at;
+        if late > ENTRY_MAX_AGE_S {
+            self.skip(u, "late");
+            return;
+        }
+        if view.len() >= self.cfg.max_positions {
+            self.skip(u, "max positions");
+            return;
+        }
+        if view.values().any(|l| l.coin == u.coin && l.dir != u.dir) {
+            self.skip(u, "other way from the coin's legs");
+            return;
+        }
+        // The portfolio's limits: each open leg holds `risk` of the account at its entry.
+        let lim = self.limits.clone();
+        let legs = |f: &dyn Fn(&Leg) -> bool| view.values().filter(|l| f(l)).count() as f64 * lim.risk;
+        let why = if legs(&|_| true) + lim.risk > lim.total + 1e-9 {
+            Some("total risk")
+        } else if legs(&|l| l.dir == u.dir) + lim.risk > lim.dir + 1e-9 {
+            Some("risk in one direction")
+        } else if legs(&|l| l.user == u.user) + lim.risk > lim.trader + 1e-9 {
+            Some("risk of one trader")
+        } else if view.values().filter(|l| l.coin == u.coin).count() >= lim.per_coin {
+            Some("legs in the coin")
+        } else {
+            None
         };
-        self.state.orders += 1;
-        let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
-        let st = &r["data"]["statuses"][0];
-        st["resting"]["oid"].as_u64().with_context(|| format!("{coin} stop not placed: {st}"))
+        if let Some(why) = why {
+            self.skip(u, why);
+            return;
+        }
+        let equity = self.equity.0;
+        if equity <= 0.0 {
+            self.skip(u, "equity not read yet");
+            return;
+        }
+        self.state.peak = self.state.peak.max(equity);
+        if lim.max_dd > 0.0 && equity < self.state.peak * (1.0 - lim.max_dd / 100.0) {
+            self.skip(u, "drawdown brake");
+            return;
+        }
+        let Some(mid) = self.mid_now(&u.coin) else {
+            self.skip(u, "no book");
+            return;
+        };
+        let dec = self.venue.coins[&u.coin].1;
+        let full = round_size(lim.risk / self.cfg.stop_pct * equity / mid, dec);
+        if full * mid < MIN_ORDER_USD {
+            self.event(json!({"what": "too small", "user": u.user, "coin": u.coin, "equity": equity, "size": full}));
+            return;
+        }
+        let k = key(&u.coin, &u.user);
+        let size = u.dir * full * u.frac.min(1.0);
+        // In the view as held: the limits count it for the moves after it.
+        view.insert(k.clone(), Leg { coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size, ..Default::default() });
+        steps.push(Step::Open { key: k, user: u.user.clone(), coin: u.coin.clone(), dir: u.dir, full, size, equity });
+    }
+
+    /// A job's results into the state; the coin's moves that came meanwhile next.
+    fn done(&mut self, coin: String, done: Vec<Done>, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
+        for d in done {
+            match d {
+                Done::Opened { key, leg, equity } => {
+                    self.event(json!({"what": "open", "user": leg.user, "coin": leg.coin, "size": leg.size, "px": leg.entry_px,
+                        "notional": leg.size.abs() * leg.entry_px, "equity": equity, "stop_px": leg.stop_px, "stop_oid": leg.stop_oid}));
+                    self.state.legs.insert(key, leg);
+                }
+                Done::Moved { key, leg, got, px, reduce } => {
+                    self.event(json!({"what": if reduce { "reduce" } else { "add" }, "user": leg.user, "coin": leg.coin, "size": got, "px": px,
+                        "pos_after": leg.size, "stop_oid": leg.stop_oid}));
+                    self.state.legs.insert(key, leg);
+                }
+                Done::Closed { key, leg, got, px, why } => {
+                    self.event(json!({"what": "close", "why": why, "user": leg.user, "coin": leg.coin, "size": got, "px": px,
+                        "pnl_approx": -got * (px - leg.entry_px)}));
+                    self.state.legs.remove(&key);
+                }
+                Done::Failed { user, coin, error } => self.event(json!({"what": "error", "user": user, "coin": coin, "error": error})),
+            }
+        }
+        self.busy.remove(&coin);
+        self.touched.insert(coin.clone(), now());
+        self.publish_users();
+        self.save();
+        if self.pending.contains_key(&coin) {
+            self.launch(&coin, dtx);
+        }
+    }
+
+    /// The accounts we hold legs of, in the status (`users`): the engine keeps following them
+    /// to their exits when it follows nothing else (`LIVE_ONLY`).
+    fn publish_users(&self) {
+        let users: std::collections::BTreeSet<&String> = self.state.legs.values().map(|l| &l.user).collect();
+        self.status.lock().unwrap()["users"] = json!(users);
     }
 
     /// The start's check (see the module): bought and sold at once, recorded either way.
     async fn health(&mut self) {
         let started = std::time::Instant::now();
-        let Some(coin) = ["BTC", "ETH", "SOL"].into_iter().find(|c| self.coins.contains_key(*c) && self.state.in_coin(c).next().is_none()) else {
+        let Some(coin) = ["BTC", "ETH", "SOL"].into_iter().find(|c| self.venue.coins.contains_key(*c) && self.state.in_coin(c).next().is_none()) else {
             log!("live: health check skipped (BTC, ETH and SOL all held)");
             return;
         };
-        let mut rec = json!({"net": if self.ex.mainnet() { "mainnet" } else { "testnet" }, "account": self.account, "coin": coin});
+        let mut rec = json!({"net": if self.venue.ex.mainnet() { "mainnet" } else { "testnet" }, "account": self.account, "coin": coin});
+        let v = self.venue.clone();
         let r: Result<()> = async {
-            let (equity, _) = self.equity().await?;
+            let (equity, _) = equity_of(&v.ex, &self.account, self.unified).await?;
+            self.equity = (equity, now());
             rec["equity"] = json!(equity);
-            let mid = self.mid(coin).await?;
-            let m = 10f64.powi(self.coins[coin].1 as i32);
+            let mid = v.mid(coin).await?;
+            let m = 10f64.powi(v.coins[coin].1 as i32);
             let size = (CHECK_USD / mid * m).ceil() / m;
-            let (got, open_px, open_oid) = self.market_oid(coin, size, false).await?;
+            let t0 = std::time::Instant::now();
+            let (got, open_px, open_oid) = v.market(coin, size, false).await?;
+            rec["order_ms"] = json!(t0.elapsed().as_millis() as u64);
             rec["size"] = json!(got);
             rec["open_px"] = json!(open_px);
-            let close = match self.market_oid(coin, -got, true).await {
+            let close = match v.market(coin, -got, true).await {
                 Ok(x) => x,
                 Err(_) => {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    self.market_oid(coin, -got, true).await.context("bought, not sold: the position is left open")?
+                    v.market(coin, -got, true).await.context("bought, not sold: the position is left open")?
                 }
             };
             rec["close_px"] = json!(close.1);
-            let fills = self.ex.info(json!({"type": "userFills", "user": self.account})).await?;
+            let fills = v.ex.info(json!({"type": "userFills", "user": self.account})).await?;
             let fee: f64 = fills.as_array().into_iter().flatten()
                 .filter(|f| [open_oid, close.2].contains(&f["oid"].as_u64().unwrap_or(0))).map(|f| num(&f["fee"])).sum();
             rec["fee"] = json!(fee);
@@ -334,113 +719,14 @@ impl Live {
         }
     }
 
-    async fn cancel(&mut self, coin: &str, oid: u64) {
-        let a = self.coins[coin].0;
-        if let Err(e) = self.ex.act(&Action::Cancel { cancels: vec![CancelWire { a, o: oid }] }).await {
-            log!("live: cancel {coin} {oid}: {e:#}");
-        }
-    }
-
-    async fn on_update(&mut self, u: Update) {
-        if !self.coins.contains_key(&u.coin) {
-            // A golden account's entry in a coin the live venue does not list (testnet lists
-            // fewer coins than mainnet): recorded, so it is not taken for a missed one.
-            if u.entry && u.golden && u.frac > 0.0 {
-                self.skip(&u, "coin not listed on the live venue");
-                self.save().await;
-            }
-            return;
-        }
-        let k = key(&u.coin, &u.user);
-        let r = match self.state.legs.get(&k).map(|l| l.dir) {
-            Some(dir) if u.frac <= 0.0 || u.dir != dir => {
-                let r = self.close(&k, if u.frac <= 0.0 { "exit" } else { "flip" }).await;
-                if r.is_ok() && u.frac > 0.0 && u.entry && u.golden {
-                    self.open(&u).await
-                } else {
-                    r
-                }
-            }
-            Some(_) => self.follow(&k, &u).await,
-            None if u.entry && u.golden && u.frac > 0.0 => self.open(&u).await,
-            None => return,
-        };
-        if let Err(e) = r {
-            self.event(json!({"what": "error", "user": u.user, "coin": u.coin, "error": format!("{e:#}")}));
-        }
-        self.save().await;
-    }
-
-    fn skip(&mut self, u: &Update, why: &str) {
-        self.state.skipped += 1;
-        self.event(json!({"what": "skipped", "why": why, "user": u.user, "coin": u.coin}));
-    }
-
-    async fn open(&mut self, u: &Update) -> Result<()> {
-        if self.state.legs.len() >= self.cfg.max_positions {
-            self.skip(u, "max positions");
-            return Ok(());
-        }
-        if self.state.in_coin(&u.coin).any(|(_, l)| l.dir != u.dir) {
-            self.skip(u, "other way from the coin's legs");
-            return Ok(());
-        }
-        // The portfolio's limits: each open leg holds `risk` of the account at its entry.
-        let lim = self.limits.clone();
-        let legs = |f: &dyn Fn(&Leg) -> bool| self.state.legs.values().filter(|l| f(l)).count() as f64 * lim.risk;
-        let why = if legs(&|_| true) + lim.risk > lim.total + 1e-9 {
-            Some("total risk")
-        } else if legs(&|l| l.dir == u.dir) + lim.risk > lim.dir + 1e-9 {
-            Some("risk in one direction")
-        } else if legs(&|l| l.user == u.user) + lim.risk > lim.trader + 1e-9 {
-            Some("risk of one trader")
-        } else if self.state.in_coin(&u.coin).count() >= lim.per_coin {
-            Some("legs in the coin")
-        } else {
-            None
-        };
-        if let Some(why) = why {
-            self.skip(u, why);
-            return Ok(());
-        }
-        let (equity, _) = self.equity().await?;
-        self.state.peak = self.state.peak.max(equity);
-        if lim.max_dd > 0.0 && equity < self.state.peak * (1.0 - lim.max_dd / 100.0) {
-            self.skip(u, "drawdown brake");
-            return Ok(());
-        }
-        let mid = self.mid(&u.coin).await?;
-        let dec = self.coins[&u.coin].1;
-        let full = round_size(lim.risk / self.cfg.stop_pct * equity / mid, dec);
-        if full * mid < MIN_ORDER_USD {
-            self.event(json!({"what": "too small", "user": u.user, "coin": u.coin, "equity": equity, "size": full}));
-            return Ok(());
-        }
-        let size = u.dir * full * u.frac.min(1.0);
-        let (got, px) = self.market(&u.coin, size, false).await?;
-        if got == 0.0 {
-            bail!("nothing filled");
-        }
-        let stop_px = px * (1.0 - u.dir * self.cfg.stop_pct / 100.0);
-        let k = key(&u.coin, &u.user);
-        self.state.legs.insert(k.clone(), Leg {
-            coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size: got, entry_px: px, stop_px, stop_oid: None, opened: now(),
-        });
-        self.restop(&k).await;
-        let oid = self.state.legs[&k].stop_oid;
-        self.event(json!({"what": "open", "user": u.user, "coin": u.coin, "size": got, "px": px, "notional": got.abs() * px,
-            "equity": equity, "stop_px": stop_px, "stop_oid": oid}));
-        Ok(())
-    }
-
     /// Puts the leg's stop order on for its size now (the old one cancelled): its size alone,
     /// so it does not close the coin's other legs.
     async fn restop(&mut self, k: &str) {
         let Some(l) = self.state.legs.get(k).cloned() else { return };
         if let Some(oid) = l.stop_oid {
-            self.cancel(&l.coin, oid).await;
+            self.venue.cancel(&l.coin, oid).await;
         }
-        let oid = match self.stop(&l.coin, l.dir, l.size, l.stop_px).await {
+        let oid = match self.venue.stop(&l.coin, l.dir, l.size, l.stop_px).await {
             Ok(oid) => Some(oid),
             Err(e) => {
                 self.event(json!({"what": "stop failed", "user": l.user, "coin": l.coin, "error": format!("{e:#}")}));
@@ -452,63 +738,29 @@ impl Live {
         }
     }
 
-    /// Moves the leg's size to its share of `full`, its stop order with it.
-    async fn follow(&mut self, k: &str, u: &Update) -> Result<()> {
-        let l = self.state.legs[k].clone();
-        let mid = self.mid(&l.coin).await?;
-        let target = l.dir * l.full * u.frac.min(1.0);
-        if target.abs() * mid < MIN_LEFT_USD {
-            return self.close(k, "small").await;
-        }
-        let delta = target - l.size;
-        if round_size(delta.abs(), self.coins[&l.coin].1) * mid < MIN_ORDER_USD {
-            return Ok(());
-        }
-        let reduce = target.abs() < l.size.abs();
-        let (got, px) = self.market(&l.coin, delta, reduce).await?;
-        let leg = self.state.legs.get_mut(k).context("leg gone")?;
-        leg.size += got;
-        let after = leg.size;
-        self.restop(k).await;
-        self.event(json!({"what": if reduce { "reduce" } else { "add" }, "user": l.user, "coin": l.coin, "size": got, "px": px,
-            "pos_after": after}));
-        Ok(())
-    }
-
-    async fn close(&mut self, k: &str, why: &str) -> Result<()> {
-        let Some(l) = self.state.legs.get(k).cloned() else { return Ok(()) };
-        let (got, px) = if l.size != 0.0 { self.market(&l.coin, -l.size, true).await? } else { (0.0, 0.0) };
-        if let Some(oid) = l.stop_oid {
-            self.cancel(&l.coin, oid).await;
-        }
-        self.state.legs.remove(k);
-        let pnl = -got * (px - l.entry_px);
-        self.event(json!({"what": "close", "why": why, "user": l.user, "coin": l.coin, "size": got, "px": px, "pnl_approx": pnl}));
-        Ok(())
-    }
-
     /// The exchange's positions and orders: a leg whose stop order is no longer resting was
     /// stopped out; a coin's position gone (a liquidation) or the other way ends its legs; the
     /// rest take their share of what is held. A leg without a stop order gets one. Then the
     /// status.
     async fn reconcile(&mut self) {
-        let (equity, positions) = match self.equity().await {
-            Ok(x) => x,
-            Err(e) => {
-                log!("live: account read failed: {e:#}");
-                return;
-            }
-        };
-        let resting: Option<std::collections::HashSet<u64>> = match self.ex.info(json!({"type": "frontendOpenOrders", "user": self.account})).await {
-            Ok(v) => Some(v.as_array().into_iter().flatten().filter_map(|o| o["oid"].as_u64()).collect()),
-            Err(e) => {
-                log!("live: orders read failed: {e:#}");
-                None
-            }
-        };
+        if let Some(r) = read_account(&self.venue.ex, &self.account, self.unified).await {
+            self.reconcile_with(r).await;
+        }
+    }
+
+    /// `reconcile` on what `read_account` read (in the background: the moves do not wait for
+    /// the reads). A coin moved since the read began is left for the next one.
+    async fn reconcile_with(&mut self, r: Read) {
+        let Read { at, equity, positions, resting } = r;
+        self.equity = (equity, now());
+        let fresh = |c: &String, s: &Self| s.busy.contains(c) || s.pending.contains_key(c) || s.touched.get(c).is_some_and(|t| *t >= at - 1.0);
         let mut changed = false;
         if let Some(resting) = &resting {
             for (k, l) in self.state.legs.clone() {
+                // A coin with a job in flight or moved since: read it next time.
+                if fresh(&l.coin, self) {
+                    continue;
+                }
                 if l.stop_oid.is_some_and(|o| !resting.contains(&o)) {
                     self.state.legs.remove(&k);
                     self.event(json!({"what": "stopped", "user": l.user, "coin": l.coin, "size_was": l.size, "stop_px": l.stop_px,
@@ -517,7 +769,8 @@ impl Live {
                 }
             }
         }
-        let coins: std::collections::HashSet<String> = self.state.legs.values().map(|l| l.coin.clone()).collect();
+        let coins: std::collections::HashSet<String> = self.state.legs.values().map(|l| l.coin.clone())
+            .filter(|c| !fresh(c, self)).collect();
         for coin in coins {
             let held = positions.get(&coin).copied().unwrap_or(0.0);
             let legs: Vec<(String, Leg)> = self.state.in_coin(&coin).map(|(k, l)| (k.clone(), l.clone())).collect();
@@ -525,7 +778,7 @@ impl Live {
             if held == 0.0 || legs.iter().any(|(_, l)| held.signum() != l.dir) {
                 for (k, l) in legs {
                     if let Some(oid) = l.stop_oid.filter(|_| held != 0.0) {
-                        self.cancel(&coin, oid).await;
+                        self.venue.cancel(&coin, oid).await;
                     }
                     self.state.legs.remove(&k);
                     self.event(json!({"what": "gone", "user": l.user, "coin": coin, "size_was": l.size, "stop_px": l.stop_px}));
@@ -541,18 +794,20 @@ impl Live {
             }
         }
         if resting.is_some() {
-            for k in self.state.legs.iter().filter(|(_, l)| l.stop_oid.is_none()).map(|(k, _)| k.clone()).collect::<Vec<_>>() {
+            for k in self.state.legs.iter().filter(|(_, l)| l.stop_oid.is_none() && !fresh(&l.coin, self))
+                .map(|(k, _)| k.clone()).collect::<Vec<_>>() {
                 self.restop(&k).await;
                 changed = true;
             }
         }
         if changed {
-            self.save().await;
+            self.save();
         }
         let coins_held: std::collections::HashSet<&String> = self.state.legs.values().map(|l| &l.coin).collect();
         let other = positions.keys().filter(|c| !coins_held.contains(c)).count();
         *self.status.lock().unwrap() = json!({"equity": (equity * 100.0).round() / 100.0, "positions": self.state.legs.len(),
             "coins": coins_held.len(), "other_positions": other, "skipped": self.state.skipped, "orders": self.state.orders});
+        self.publish_users();
     }
 }
 
@@ -562,12 +817,12 @@ impl Live {
 /// other way is skipped.
 pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
     let store = crate::store::open(cfg).await?;
-    let (tx, _) = start(cfg, store.clone(), true).await?.context("LIVE_KEY and LIVE_ACCOUNT are not set")?;
+    let (tx, _) = start(cfg, store.clone(), true, None).await?.context("LIVE_KEY and LIVE_ACCOUNT are not set")?;
     let account = std::env::var("LIVE_ACCOUNT")?.trim().to_lowercase();
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let info = Exchange::new(base, &std::env::var("LIVE_KEY")?)?;
     let send = |user: &str, dir: f64, frac: f64, entry: bool| {
-        tx.send(Update { user: format!("live-check-{user}"), coin: coin.into(), dir, frac, entry, golden: true })
+        tx.send(Update { user: format!("live-check-{user}"), coin: coin.into(), dir, frac, entry, golden: true, at: now() })
     };
     let show = |what: &'static str| {
         let (info, account, coin) = (&info, &account, coin);
@@ -583,7 +838,8 @@ pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
         }
     };
     let pause = |s| tokio::time::sleep(std::time::Duration::from_secs(s));
-    pause(3).await;
+    // After the start's own check and read (an entry sent before them would be late).
+    pause(12).await;
     send("a", 1.0, 1.0, true)?;
     send("b", 1.0, 1.0, true)?;
     send("c", -1.0, 1.0, true)?;

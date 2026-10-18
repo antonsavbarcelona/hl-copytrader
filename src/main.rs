@@ -58,7 +58,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let selection = store::load_selection(&cfg).await?;
     let picks = store::load_picks(&cfg).await?;
     let store = store::open(&cfg).await?;
-    let live = live::start(&cfg, store.clone(), false).await?;
+    let live = live::start(&cfg, store.clone(), false, Some(books.clone())).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

@@ -322,6 +322,9 @@ pub struct Engine {
     live: Option<(mpsc::UnboundedSender<crate::live::Update>, Arc<std::sync::Mutex<serde_json::Value>>)>,
     /// The portfolio whose picks the live account enters (`LIVE_PORTFOLIO`; None: the golden list).
     live_portfolio: Option<String>,
+    /// `LIVE_ONLY=1`: only the live portfolio's picks (and the accounts we hold copies of) are
+    /// followed, not the thousands on paper: the bot trades for real and nothing else.
+    live_only: bool,
 }
 
 #[derive(Default)]
@@ -373,6 +376,7 @@ impl Engine {
             load: Load::default(),
             live: None,
             live_portfolio: std::env::var("LIVE_PORTFOLIO").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
+            live_only: std::env::var("LIVE_ONLY").is_ok_and(|v| v.trim() == "1"),
             cfg,
         })
     }
@@ -501,11 +505,23 @@ impl Engine {
     fn refollow(&mut self) -> usize {
         let at = now();
         let out = |a: &String| self.traders.get(a).is_some_and(|t| t.trial.rejected_until > at);
-        let mut set: HashSet<String> = self.listed.iter().filter(|a| !out(a)).cloned().collect();
-        set.extend(self.picks.iter().cloned());
-        // Every trader the allocator can rank by the backtest: it needs their signals.
-        set.extend(self.seed.keys().cloned());
-        set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
+        let mut set: HashSet<String> = HashSet::new();
+        if self.live_only {
+            set.extend(self.live_picks());
+        } else {
+            set.extend(self.listed.iter().filter(|a| !out(a)).cloned());
+            set.extend(self.picks.iter().cloned());
+            // Every trader the allocator can rank by the backtest: it needs their signals.
+            set.extend(self.seed.keys().cloned());
+        }
+        if self.live_only {
+            // The accounts our live account holds legs of, to their exits (picked today or not).
+            if let Some((_, st)) = &self.live {
+                set.extend(st.lock().unwrap()["users"].as_array().into_iter().flatten().filter_map(|u| u.as_str().map(str::to_string)));
+            }
+        } else {
+            set.extend(self.traders.iter().filter(|(_, t)| !t.acct.liquidated && (t.golden || !t.acct.positions.is_empty())).map(|(a, _)| a.clone()));
+        }
         let n = set.len();
         *self.followed.write().unwrap() = set;
         n
@@ -715,7 +731,7 @@ impl Engine {
                 None => t.golden,
             };
             let _ = live.send(crate::live::Update { user: user.to_string(), coin: coin.to_string(), dir: theirs.signum(), frac,
-                entry: opened, golden: enter });
+                entry: opened, golden: enter, at: first.as_ref().map(|p| p.recv).unwrap_or_else(now) });
         }
         if entry && target.abs() > 0.0 {
             *t.coins.entry(coin.to_string()).or_default() += 1;
@@ -1048,6 +1064,7 @@ impl Engine {
             let summary = self.alloc.rerank(&stats, at);
             log!("allocator: ranked, {summary}");
             self.write(json!({"kind": "allocator_rank", "summary": summary}));
+            self.enroll_live_picks();
         }
         let b = self.books.read().unwrap();
         let marks = |c: &str| b.get(c).and_then(Book::mid);
@@ -1070,6 +1087,30 @@ impl Engine {
             });
         }
         status
+    }
+
+    /// The live portfolio's picks enrolled at once (their positions read, held ones not entered),
+    /// not on their first fill: an entry in several fills would be read whole on enrolment and
+    /// taken for a position held before.
+    fn enroll_live_picks(&mut self) {
+        let Some(name) = self.live_portfolio.clone() else { return };
+        if self.live_only {
+            let n = self.refollow();
+            log!("live only: {n} traders followed");
+        }
+        let picks: Vec<String> = self.live_picks().into_iter().filter(|a| !self.traders.contains_key(a)).collect();
+        if !picks.is_empty() {
+            log!("live: enrolling {} picks of {name} ahead of their fills", picks.len());
+        }
+        for a in picks {
+            self.read_account(&a, "enroll");
+        }
+    }
+
+    /// The traders the live portfolio picks today (none without one).
+    fn live_picks(&self) -> Vec<String> {
+        let Some(name) = &self.live_portfolio else { return Vec::new() };
+        self.alloc.portfolios.iter().find(|p| &p.name == name).map(|p| p.picked.keys().cloned().collect()).unwrap_or_default()
     }
 
     /// Our stop: closes our position in `coin` at the book and stays out of its position.

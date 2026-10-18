@@ -111,12 +111,15 @@ pub fn address(key: &SigningKey) -> String {
     format!("0x{}", hex::encode(&hash[12..]))
 }
 
+/// Cloned freely: the clones share the connection pool and the nonces (orders in flight at once
+/// on several coins still get distinct ones).
+#[derive(Clone)]
 pub struct Exchange {
     http: reqwest::Client,
     base: String,
     key: SigningKey,
     mainnet: bool,
-    last_nonce: u64,
+    last_nonce: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Exchange {
@@ -124,7 +127,7 @@ impl Exchange {
         let bytes = hex::decode(key_hex.trim().trim_start_matches("0x")).context("key is not hex")?;
         let key = SigningKey::from_slice(&bytes).context("not a private key")?;
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build()?;
-        Ok(Self { http, base: base.trim_end_matches('/').to_string(), key, mainnet: base.contains("api.hyperliquid.xyz"), last_nonce: 0 })
+        Ok(Self { http, base: base.trim_end_matches('/').to_string(), key, mainnet: base.contains("api.hyperliquid.xyz"), last_nonce: Default::default() })
     }
 
     pub fn mainnet(&self) -> bool {
@@ -146,11 +149,11 @@ impl Exchange {
     }
 
     /// Signs and sends `action`; the reply's `response` (an error if it is not "ok").
-    pub async fn act(&mut self, action: &Action) -> Result<Value> {
-        let nonce = (crate::api::now() * 1000.0) as u64;
+    pub async fn act(&self, action: &Action) -> Result<Value> {
+        use std::sync::atomic::Ordering;
         // Nonces must differ: two actions in one millisecond get consecutive ones.
-        let nonce = nonce.max(self.last_nonce + 1);
-        self.last_nonce = nonce;
+        let now = (crate::api::now() * 1000.0) as u64;
+        let nonce = self.last_nonce.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(now.max(l + 1))).map(|l| now.max(l + 1)).unwrap_or(now);
         let signature = sign(&self.key, action, nonce, self.mainnet)?;
         let body = json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": null, "expiresAfter": null});
         let r = self.http.post(format!("{}/exchange", self.base)).json(&body).send().await?;

@@ -219,7 +219,7 @@ impl Venue {
 /// the same account's entry the other way), done in order by the coin's job.
 #[derive(Debug)]
 enum Step {
-    Open { key: String, user: String, coin: String, dir: f64, full: f64, size: f64, equity: f64 },
+    Open { key: String, user: String, coin: String, dir: f64, full: f64, size: f64, equity: f64, wait_ms: u64 },
     Follow { key: String, leg: Leg, delta: f64, reduce: bool },
     Close { key: String, leg: Leg, why: &'static str },
 }
@@ -227,9 +227,9 @@ enum Step {
 /// What a step did, for the state.
 #[derive(Debug)]
 enum Done {
-    Opened { key: String, leg: Leg, equity: f64 },
-    Moved { key: String, leg: Leg, got: f64, px: f64, reduce: bool },
-    Closed { key: String, leg: Leg, got: f64, px: f64, why: &'static str },
+    Opened { key: String, leg: Leg, equity: f64, ms: Value },
+    Moved { key: String, leg: Leg, got: f64, px: f64, reduce: bool, ms: Value },
+    Closed { key: String, leg: Leg, got: f64, px: f64, why: &'static str, ms: Value },
     Failed { user: String, coin: String, error: String },
 }
 
@@ -245,8 +245,10 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
         };
         let r: Result<Done> = async {
             Ok(match s {
-                Step::Open { key, user, coin, dir, full, size, equity } => {
+                Step::Open { key, user, coin, dir, full, size, equity, wait_ms } => {
+                    let t0 = std::time::Instant::now();
                     let (got, px, _) = v.market(&coin, size, false).await?;
+                    let order_ms = t0.elapsed().as_millis() as u64;
                     if got == 0.0 {
                         bail!("nothing filled");
                     }
@@ -258,10 +260,13 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
                             None
                         }
                     };
-                    Done::Opened { key, leg: Leg { coin, user, dir, full, size: got, entry_px: px, stop_px, stop_oid, opened: now() }, equity }
+                    let ms = json!({"wait": wait_ms, "order": order_ms, "stop": t0.elapsed().as_millis() as u64 - order_ms});
+                    Done::Opened { key, leg: Leg { coin, user, dir, full, size: got, entry_px: px, stop_px, stop_oid, opened: now() }, equity, ms }
                 }
                 Step::Follow { key, mut leg, delta, reduce } => {
+                    let t0 = std::time::Instant::now();
                     let (got, px, _) = v.market(&leg.coin, delta, reduce).await?;
+                    let order_ms = t0.elapsed().as_millis() as u64;
                     leg.size += got;
                     let old = leg.stop_oid;
                     let (new, _) = tokio::join!(v.stop(&leg.coin, leg.dir, leg.size, leg.stop_px), async {
@@ -270,7 +275,8 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
                         }
                     });
                     leg.stop_oid = new.ok();
-                    Done::Moved { key, leg, got, px, reduce }
+                    let ms = json!({"order": order_ms, "stop": t0.elapsed().as_millis() as u64 - order_ms});
+                    Done::Moved { key, leg, got, px, reduce, ms }
                 }
                 Step::Close { key, leg, why } => {
                     let close = async {
@@ -281,9 +287,11 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
                             v.cancel(&leg.coin, o).await;
                         }
                     };
+                    let t0 = std::time::Instant::now();
                     let (r, _) = tokio::join!(close, cancel);
                     let (got, px) = r?;
-                    Done::Closed { key, leg, got, px, why }
+                    let ms = json!({"order": t0.elapsed().as_millis() as u64});
+                    Done::Closed { key, leg, got, px, why, ms }
                 }
             })
         }.await;
@@ -633,26 +641,27 @@ impl Live {
         let size = u.dir * full * u.frac.min(1.0);
         // In the view as held: the limits count it for the moves after it.
         view.insert(k.clone(), Leg { coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size, ..Default::default() });
-        steps.push(Step::Open { key: k, user: u.user.clone(), coin: u.coin.clone(), dir: u.dir, full, size, equity });
+        steps.push(Step::Open { key: k, user: u.user.clone(), coin: u.coin.clone(), dir: u.dir, full, size, equity,
+            wait_ms: (late.max(0.0) * 1000.0) as u64 });
     }
 
     /// A job's results into the state; the coin's moves that came meanwhile next.
     fn done(&mut self, coin: String, done: Vec<Done>, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
         for d in done {
             match d {
-                Done::Opened { key, leg, equity } => {
+                Done::Opened { key, leg, equity, ms } => {
                     self.event(json!({"what": "open", "user": leg.user, "coin": leg.coin, "size": leg.size, "px": leg.entry_px,
-                        "notional": leg.size.abs() * leg.entry_px, "equity": equity, "stop_px": leg.stop_px, "stop_oid": leg.stop_oid}));
+                        "notional": leg.size.abs() * leg.entry_px, "equity": equity, "stop_px": leg.stop_px, "stop_oid": leg.stop_oid, "ms": ms}));
                     self.state.legs.insert(key, leg);
                 }
-                Done::Moved { key, leg, got, px, reduce } => {
+                Done::Moved { key, leg, got, px, reduce, ms } => {
                     self.event(json!({"what": if reduce { "reduce" } else { "add" }, "user": leg.user, "coin": leg.coin, "size": got, "px": px,
-                        "pos_after": leg.size, "stop_oid": leg.stop_oid}));
+                        "pos_after": leg.size, "stop_oid": leg.stop_oid, "ms": ms}));
                     self.state.legs.insert(key, leg);
                 }
-                Done::Closed { key, leg, got, px, why } => {
+                Done::Closed { key, leg, got, px, why, ms } => {
                     self.event(json!({"what": "close", "why": why, "user": leg.user, "coin": leg.coin, "size": got, "px": px,
-                        "pnl_approx": -got * (px - leg.entry_px)}));
+                        "pnl_approx": -got * (px - leg.entry_px), "ms": ms}));
                     self.state.legs.remove(&key);
                 }
                 Done::Failed { user, coin, error } => self.event(json!({"what": "error", "user": user, "coin": coin, "error": error})),

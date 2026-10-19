@@ -28,6 +28,16 @@
 //! one trader (`LIVE_CAP_TRADER_PCT`, 20), two legs a coin; no entries once the account is
 //! `LIVE_MAX_DD_PCT` below its peak (off at 0), its legs followed out.
 //!
+//! The mix of the walk-forward of 2026-10-19 (on the real-price copies: +88% over 14 months at 1%
+//! against +69% without it, no reinvestment), each off unless set:
+//!   - `LIVE_RANK_WEIGHT=1`: an entry's risk is `LIVE_RISK_PCT` times its trader's weight by his
+//!     place among the portfolio's picks (`rank_weight`: the first 1.6x, the last 0.4x, the
+//!     same on average); the limits count each leg's own risk;
+//!   - `LIVE_EXIT_LIMIT_S` (e.g. 15): a trader's exit is followed by a post-only order at the
+//!     book's best price on our side (a sell at the best ask), in the background (the coin's
+//!     next moves do not wait for it); what it has not filled in that many seconds is sold at
+//!     market. Flips and stops stay market.
+//!
 //! At every start a health check runs first: a small market buy ($15) of BTC (else ETH,
 //! SOL: a coin we hold no position in), sold at once; its result goes to `live_checks`. A
 //! failed check is recorded and logged; the live trader runs on regardless.
@@ -84,6 +94,19 @@ pub struct Update {
     pub golden: bool,
     /// When its fill reached the engine (unix s): a late entry is not taken.
     pub at: f64,
+    /// Its trader's weight by his place among the picks (`rank_weight`; 1 without one).
+    pub weight: f64,
+}
+
+/// The weight of the pick at `rank` (1: the first) of `n`: from 2 down by 1.5 over the picks, at
+/// least 0.5, over its mean (the risk on average as set). The walk-forward of 2026-10-19: the
+/// better a trader's place by our real-price copy's Sharpe, the better his next months.
+pub fn rank_weight(rank: usize, n: usize) -> f64 {
+    if n == 0 || rank == 0 || rank > n {
+        return 1.0;
+    }
+    let w = |i: usize| (2.0 - i as f64 * 1.5 / n as f64).max(0.5);
+    w(rank - 1) / ((0..n).map(w).sum::<f64>() / n as f64)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -99,6 +122,15 @@ pub struct Leg {
     pub stop_px: f64,
     pub stop_oid: Option<u64>,
     pub opened: f64,
+    /// Its stop order is being placed (in the background, after the entry's fill).
+    #[serde(skip)]
+    pub stop_pending: bool,
+    /// The risk it got at entry (% of the account's equity; 0: saved before, `LIVE_RISK_PCT`).
+    #[serde(default)]
+    pub risk: f64,
+    /// It is being closed by a post-only order in the background (`LIVE_EXIT_LIMIT_S`).
+    #[serde(default)]
+    pub closing: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -146,6 +178,8 @@ struct Venue {
     books: Option<crate::ws::Books>,
     /// Every coin's mid, read in the background (`MIDS_EVERY_S`): where the books have none.
     mids: Arc<std::sync::RwLock<HashMap<String, f64>>>,
+    /// Our account (its orders' status).
+    account: String,
 }
 
 impl Venue {
@@ -213,15 +247,115 @@ impl Venue {
             log!("live: cancel {coin} {oid}: {e:#}");
         }
     }
+
+    /// The book's best price an order to `buy` rests at without crossing: the best bid for a
+    /// buy, the best ask for a sell (mainnet's books; None without one).
+    fn best(&self, coin: &str, buy: bool) -> Option<f64> {
+        if !self.ex.mainnet() {
+            return None;
+        }
+        let books = self.books.as_ref()?.read().unwrap();
+        let b = books.get(coin)?;
+        (if buy { b.bids.first() } else { b.asks.first() }).map(|x| x.0)
+    }
+
+    /// A reduce-only post-only order for `size` (signed) at the book's best price on its side:
+    /// its id and price; None when it does not rest (no book, or the book moved through it).
+    async fn post_only(&self, coin: &str, size: f64) -> Result<Option<(u64, f64)>> {
+        let (asset, dec) = self.coins[coin];
+        let buy = size > 0.0;
+        let Some(px) = self.best(coin, buy) else { return Ok(None) };
+        let px = round_px(px, dec);
+        let order = OrderWire { a: asset, b: buy, p: wire(px), s: wire(round_size(size.abs(), dec)), r: true, t: OrderType::Limit { tif: "Alo".into() } };
+        let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
+        Ok(r["data"]["statuses"][0]["resting"]["oid"].as_u64().map(|o| (o, px)))
+    }
+
+    /// An order's size filled so far, and whether it still rests.
+    async fn filled(&self, oid: u64) -> Result<(f64, bool)> {
+        let r = self.ex.info(json!({"type": "orderStatus", "user": self.account, "oid": oid})).await?;
+        let o = &r["order"];
+        if o.is_null() {
+            bail!("order {oid}: no status ({r})");
+        }
+        Ok((num(&o["order"]["origSz"]) - num(&o["order"]["sz"]), o["status"] == "open"))
+    }
+}
+
+/// A leg out by a post-only order at the book's best price, what it has not filled in `secs` at
+/// market (see the module): the size traded (signed), its average price, the post-only order's
+/// share of it. The leg's stop is cancelled once the leg is out (else it guards the rest).
+async fn close_limit(v: &Venue, leg: &Leg, secs: f64) -> Result<(f64, f64, f64)> {
+    let want = -leg.size;
+    let (mut got, mut paid, mut maker) = (0.0, 0.0, 0.0);
+    if let Some((oid, px)) = v.post_only(&leg.coin, want).await? {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let open = v.filled(oid).await.map(|x| x.1).unwrap_or(true);
+            if !open || std::time::Instant::now() >= until {
+                if open {
+                    v.cancel(&leg.coin, oid).await;
+                }
+                // What it filled, read after the cancel (a fill may come in before it).
+                let f = v.filled(oid).await.map(|x| x.0).unwrap_or(0.0);
+                maker = f;
+                got = f * want.signum();
+                paid = f * px;
+                break;
+            }
+        }
+    }
+    let left = want - got;
+    if round_size(left.abs(), v.coins[&leg.coin].1) > 0.0 {
+        match v.market(&leg.coin, left, true).await {
+            Ok((g, p, _)) => {
+                got += g;
+                paid += g.abs() * p;
+            }
+            // The post-only order filled part: the rest (under the minimum, say) to the stop.
+            Err(e) if got != 0.0 => log!("live: {} rest of the exit not sold, left to its stop: {e:#}", leg.coin),
+            Err(e) => return Err(e),
+        }
+    }
+    if (got - want).abs() <= 1e-9 * want.abs().max(1.0) {
+        if let Some(o) = leg.stop_oid {
+            v.cancel(&leg.coin, o).await;
+        }
+    }
+    Ok((got, if got != 0.0 { paid / got.abs() } else { 0.0 }, if got != 0.0 { maker / got.abs() } else { 0.0 }))
 }
 
 /// One coin's next moves, planned at once from the state (and from each other: a close before
 /// the same account's entry the other way), done in order by the coin's job.
 #[derive(Debug)]
 enum Step {
-    Open { key: String, user: String, coin: String, dir: f64, full: f64, size: f64, equity: f64, wait_ms: u64 },
+    Open { key: String, user: String, coin: String, dir: f64, full: f64, size: f64, risk: f64, equity: f64, wait_ms: u64 },
     Follow { key: String, leg: Leg, delta: f64, reduce: bool },
     Close { key: String, leg: Leg, why: &'static str },
+    /// Out by a post-only order in the background (`close_limit`), waiting up to `secs`.
+    CloseLimit { key: String, leg: Leg, why: &'static str, secs: f64 },
+    /// The leg's stop order for its size now (placed after the entry's, for its size then).
+    Restop { key: String, leg: Leg },
+}
+
+/// A stop order placed in the background for a leg's entry: its id (None: not placed) and size.
+#[derive(Debug)]
+struct StopPlaced {
+    key: String,
+    coin: String,
+    oid: Option<u64>,
+    size: f64,
+}
+
+/// A leg out by `close_limit` in the background: what it traded (Err: what went wrong).
+#[derive(Debug)]
+struct LimitClosed {
+    key: String,
+    leg: Leg,
+    why: &'static str,
+    out: Result<(f64, f64, f64), String>,
+    ms: u64,
 }
 
 /// What a step did, for the state.
@@ -230,22 +364,28 @@ enum Done {
     Opened { key: String, leg: Leg, equity: f64, ms: Value },
     Moved { key: String, leg: Leg, got: f64, px: f64, reduce: bool, ms: Value },
     Closed { key: String, leg: Leg, got: f64, px: f64, why: &'static str, ms: Value },
+    Restopped { key: String, coin: String, oid: Option<u64> },
+    /// Its post-only exit is on (`LimitClosed` when it is done).
+    Closing { key: String },
     Failed { user: String, coin: String, error: String },
 }
 
-/// A coin's steps against the venue, in order: an entry's stop placed after its fill; a move's
-/// stop replaced (the new one placed and the old one cancelled at once); a close's stop cancelled
-/// with the close (the exchange drops a reduce-only order without a position anyway).
-async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
+/// A coin's steps against the venue, in order: an entry's stop placed in the background after
+/// its fill (`stx`: the coin's next moves do not wait for it); a move's stop replaced (the new one
+/// placed and the old one cancelled at once; while the entry's is still being placed, it is put
+/// right once that one is in); a close's stop cancelled with the close (the exchange drops a
+/// reduce-only order without a position anyway).
+async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>, stx: mpsc::UnboundedSender<StopPlaced>,
+    ctx: mpsc::UnboundedSender<LimitClosed>) -> Vec<Done> {
     let mut out = Vec::new();
     for s in steps {
         let (user, coin) = match &s {
             Step::Open { user, coin, .. } => (user.clone(), coin.clone()),
-            Step::Follow { leg, .. } | Step::Close { leg, .. } => (leg.user.clone(), leg.coin.clone()),
+            Step::Follow { leg, .. } | Step::Close { leg, .. } | Step::CloseLimit { leg, .. } | Step::Restop { leg, .. } => (leg.user.clone(), leg.coin.clone()),
         };
         let r: Result<Done> = async {
             Ok(match s {
-                Step::Open { key, user, coin, dir, full, size, equity, wait_ms } => {
+                Step::Open { key, user, coin, dir, full, size, risk, equity, wait_ms } => {
                     let t0 = std::time::Instant::now();
                     let (got, px, _) = v.market(&coin, size, false).await?;
                     let order_ms = t0.elapsed().as_millis() as u64;
@@ -253,28 +393,36 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
                         bail!("nothing filled");
                     }
                     let stop_px = px * (1.0 - dir * stop_pct / 100.0);
-                    let stop_oid = match v.stop(&coin, dir, got, stop_px).await {
-                        Ok(o) => Some(o),
-                        Err(e) => {
-                            log!("live: {coin} stop not placed (the next check places it): {e:#}");
-                            None
-                        }
-                    };
-                    let ms = json!({"wait": wait_ms, "order": order_ms, "stop": t0.elapsed().as_millis() as u64 - order_ms});
-                    Done::Opened { key, leg: Leg { coin, user, dir, full, size: got, entry_px: px, stop_px, stop_oid, opened: now() }, equity, ms }
+                    let (v2, stx, k2, c2) = (v.clone(), stx.clone(), key.clone(), coin.clone());
+                    tokio::spawn(async move {
+                        let oid = match v2.stop(&c2, dir, got, stop_px).await {
+                            Ok(o) => Some(o),
+                            Err(e) => {
+                                log!("live: {c2} stop not placed (the next check places it): {e:#}");
+                                None
+                            }
+                        };
+                        let _ = stx.send(StopPlaced { key: k2, coin: c2, oid, size: got });
+                    });
+                    let ms = json!({"wait": wait_ms, "order": order_ms});
+                    Done::Opened { key, leg: Leg { coin, user, dir, full, size: got, entry_px: px, stop_px, stop_oid: None, opened: now(), stop_pending: true,
+                        risk, closing: false }, equity, ms }
                 }
                 Step::Follow { key, mut leg, delta, reduce } => {
                     let t0 = std::time::Instant::now();
                     let (got, px, _) = v.market(&leg.coin, delta, reduce).await?;
                     let order_ms = t0.elapsed().as_millis() as u64;
                     leg.size += got;
-                    let old = leg.stop_oid;
-                    let (new, _) = tokio::join!(v.stop(&leg.coin, leg.dir, leg.size, leg.stop_px), async {
-                        if let Some(o) = old {
-                            v.cancel(&leg.coin, o).await;
-                        }
-                    });
-                    leg.stop_oid = new.ok();
+                    // The entry's stop still being placed: put right when it is in (`stop_placed`).
+                    if !leg.stop_pending {
+                        let old = leg.stop_oid;
+                        let (new, _) = tokio::join!(v.stop(&leg.coin, leg.dir, leg.size, leg.stop_px), async {
+                            if let Some(o) = old {
+                                v.cancel(&leg.coin, o).await;
+                            }
+                        });
+                        leg.stop_oid = new.ok();
+                    }
                     let ms = json!({"order": order_ms, "stop": t0.elapsed().as_millis() as u64 - order_ms});
                     Done::Moved { key, leg, got, px, reduce, ms }
                 }
@@ -292,6 +440,25 @@ async fn run_steps(v: Venue, stop_pct: f64, steps: Vec<Step>) -> Vec<Done> {
                     let (got, px) = r?;
                     let ms = json!({"order": t0.elapsed().as_millis() as u64});
                     Done::Closed { key, leg, got, px, why, ms }
+                }
+                Step::CloseLimit { key, leg, why, secs } => {
+                    let (v2, ctx) = (v.clone(), ctx.clone());
+                    let k2 = key.clone();
+                    tokio::spawn(async move {
+                        let t0 = std::time::Instant::now();
+                        let out = close_limit(&v2, &leg, secs).await.map_err(|e| format!("{e:#}"));
+                        let _ = ctx.send(LimitClosed { key: k2, leg, why, out, ms: t0.elapsed().as_millis() as u64 });
+                    });
+                    Done::Closing { key }
+                }
+                Step::Restop { key, leg } => {
+                    let old = leg.stop_oid;
+                    let (new, _) = tokio::join!(v.stop(&leg.coin, leg.dir, leg.size, leg.stop_px), async {
+                        if let Some(o) = old {
+                            v.cancel(&leg.coin, o).await;
+                        }
+                    });
+                    Done::Restopped { key, coin: leg.coin.clone(), oid: new.ok() }
                 }
             })
         }.await;
@@ -319,6 +486,12 @@ pub struct Live {
     busy: std::collections::HashSet<String>,
     /// When each coin's last job was done: a read begun before it is stale for the coin.
     touched: HashMap<String, f64>,
+    /// Legs whose stop is to be put right for their size (by their coin's next job).
+    restop: std::collections::HashSet<String>,
+    /// The background stops' results.
+    stx: mpsc::UnboundedSender<StopPlaced>,
+    /// The background post-only exits' results.
+    ctx: mpsc::UnboundedSender<LimitClosed>,
 }
 
 /// The entries' limits (env, see the module's doc), in % of the account's equity.
@@ -330,13 +503,22 @@ struct Limits {
     trader: f64,
     per_coin: usize,
     max_dd: f64,
+    /// `LIVE_RANK_WEIGHT`, `LIVE_EXIT_LIMIT_S` (0: off).
+    rank_weight: bool,
+    exit_limit_s: f64,
 }
 
 impl Limits {
     fn from_env(cfg: &Config) -> Self {
         let pct = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(d);
         Limits { risk: pct("LIVE_RISK_PCT", cfg.risk_pct), total: pct("LIVE_CAP_TOTAL_PCT", 100.0), dir: pct("LIVE_CAP_DIR_PCT", 50.0),
-            trader: pct("LIVE_CAP_TRADER_PCT", 20.0), per_coin: 2, max_dd: pct("LIVE_MAX_DD_PCT", 0.0) }
+            trader: pct("LIVE_CAP_TRADER_PCT", 20.0), per_coin: 2, max_dd: pct("LIVE_MAX_DD_PCT", 0.0),
+            rank_weight: pct("LIVE_RANK_WEIGHT", 0.0) == 1.0, exit_limit_s: pct("LIVE_EXIT_LIMIT_S", 0.0).max(0.0) }
+    }
+
+    /// A leg's risk: its own, or (saved before it had one) the entries'.
+    fn of(&self, l: &Leg) -> f64 {
+        if l.risk > 0.0 { l.risk } else { self.risk }
     }
 }
 
@@ -368,15 +550,24 @@ pub async fn start(cfg: &Config, store: Store, force: bool, books: Option<crate:
     log!("live: {} account {} (signer {}{}), {} coins, {} legs held", if base == MAINNET { "MAINNET" } else { "testnet" },
         account, ex.signer(), if unified { ", unified" } else { "" }, coins.len(), state.legs.len());
     let status = Arc::new(Mutex::new(json!({})));
-    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default() };
-    let mut live = Live { venue, account, unified, state, cfg: cfg.clone(), store, status: status.clone(), limits: Limits::from_env(cfg),
-        equity: (0.0, 0.0), pending: HashMap::new(), busy: Default::default(), touched: HashMap::new() };
+    let (stx, mut srx) = mpsc::unbounded_channel::<StopPlaced>();
+    let (ctx, mut crx) = mpsc::unbounded_channel::<LimitClosed>();
+    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account: account.clone() };
+    let limits = Limits::from_env(cfg);
+    log!("live: entries {}% each{}; exits {}", limits.risk, if limits.rank_weight { " times the trader's weight by his place" } else { "" },
+        if limits.exit_limit_s > 0.0 { format!("post-only, at market after {} s", limits.exit_limit_s) } else { "at market".into() });
+    let mut live = Live { venue, account, unified, state, cfg: cfg.clone(), store, status: status.clone(), limits,
+        equity: (0.0, 0.0), pending: HashMap::new(), busy: Default::default(), touched: HashMap::new(), restop: Default::default(), stx, ctx };
     let (tx, mut rx) = mpsc::unbounded_channel::<Update>();
     let (dtx, mut drx) = mpsc::unbounded_channel::<(String, Vec<Done>)>();
     let (etx, mut erx) = mpsc::unbounded_channel::<f64>();
     tokio::spawn(async move {
         live.health().await;
         live.reconcile().await;
+        // Post-only exits a restart cut off: out again (their trader is flat).
+        for l in live.state.legs.values_mut().filter(|l| l.closing).map(|l| { l.closing = false; l.clone() }).collect::<Vec<_>>() {
+            live.queue(Update { user: l.user, coin: l.coin, dir: l.dir, frac: 0.0, entry: false, golden: false, at: now(), weight: 1.0 }, &dtx);
+        }
         // The equity in the background: entries size on it without a request of their own.
         let (venue, account, unified) = (live.venue.clone(), live.account.clone(), live.unified);
         tokio::spawn(async move {
@@ -410,6 +601,8 @@ pub async fn start(cfg: &Config, store: Store, force: bool, books: Option<crate:
                     None => break,
                 },
                 Some((coin, done)) = drx.recv() => live.done(coin, done, &dtx),
+                Some(sp) = srx.recv() => live.stop_placed(sp, &dtx),
+                Some(c) = crx.recv() => live.limit_closed(c),
                 Some(e) = erx.recv() => live.equity = (e, now()),
                 Some(r) = rrx.recv() => live.reconcile_with(r).await,
                 _ = every.tick() => {
@@ -515,7 +708,11 @@ impl Live {
 
     /// Plans the coin's pending moves and starts its job.
     fn launch(&mut self, coin: &str, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
-        let Some(us) = self.pending.remove(coin) else { return };
+        let us = self.pending.remove(coin).unwrap_or_default();
+        let restops: Vec<String> = self.restop.iter().filter(|k| self.state.legs.get(*k).is_some_and(|l| l.coin == coin)).cloned().collect();
+        if us.is_empty() && restops.is_empty() {
+            return;
+        }
         // Each account's moves together: its last state; an entry if any was one (the first's time).
         let mut merged: Vec<Update> = Vec::new();
         for u in us {
@@ -528,6 +725,12 @@ impl Live {
             }
         }
         let mut steps = Vec::new();
+        for k in restops {
+            self.restop.remove(&k);
+            if let Some(l) = self.state.legs.get(&k) {
+                steps.push(Step::Restop { key: k.clone(), leg: l.clone() });
+            }
+        }
         // The legs as they will be after the steps planned so far.
         let mut view = self.state.legs.clone();
         for u in merged {
@@ -538,9 +741,9 @@ impl Live {
         }
         self.state.orders += steps.len() as u64;
         self.busy.insert(coin.to_string());
-        let (v, stop_pct, dtx, coin) = (self.venue.clone(), self.cfg.stop_pct, dtx.clone(), coin.to_string());
+        let (v, stop_pct, dtx, coin, stx, ctx) = (self.venue.clone(), self.cfg.stop_pct, dtx.clone(), coin.to_string(), self.stx.clone(), self.ctx.clone());
         tokio::spawn(async move {
-            let done = run_steps(v, stop_pct, steps).await;
+            let done = run_steps(v, stop_pct, steps, stx, ctx).await;
             let _ = dtx.send((coin, done));
         });
     }
@@ -549,6 +752,19 @@ impl Live {
     fn plan(&mut self, u: &Update, view: &mut HashMap<String, Leg>, steps: &mut Vec<Step>) {
         let k = key(&u.coin, &u.user);
         match view.get(&k).cloned() {
+            // Its post-only exit still on: the trader's moves meanwhile are not followed.
+            Some(leg) if leg.closing => {
+                if u.entry && u.golden && u.frac > 0.0 {
+                    self.skip(u, "our exit of the last one still on");
+                }
+            }
+            Some(leg) if u.frac <= 0.0 && self.limits.exit_limit_s > 0.0 => {
+                // Held in the view (its risk counted) until it is out.
+                if let Some(l) = view.get_mut(&k) {
+                    l.closing = true;
+                }
+                steps.push(Step::CloseLimit { key: k, leg, why: "exit", secs: self.limits.exit_limit_s });
+            }
             Some(leg) if u.frac <= 0.0 || u.dir != leg.dir => {
                 view.remove(&k);
                 steps.push(Step::Close { key: k, leg, why: if u.frac <= 0.0 { "exit" } else { "flip" } });
@@ -599,14 +815,15 @@ impl Live {
             self.skip(u, "other way from the coin's legs");
             return;
         }
-        // The portfolio's limits: each open leg holds `risk` of the account at its entry.
+        // The portfolio's limits: each open leg holds its risk of the account at its entry.
         let lim = self.limits.clone();
-        let legs = |f: &dyn Fn(&Leg) -> bool| view.values().filter(|l| f(l)).count() as f64 * lim.risk;
-        let why = if legs(&|_| true) + lim.risk > lim.total + 1e-9 {
+        let risk = lim.risk * if lim.rank_weight { u.weight } else { 1.0 };
+        let legs = |f: &dyn Fn(&Leg) -> bool| view.values().filter(|l| f(l)).map(|l| lim.of(l)).sum::<f64>();
+        let why = if legs(&|_| true) + risk > lim.total + 1e-9 {
             Some("total risk")
-        } else if legs(&|l| l.dir == u.dir) + lim.risk > lim.dir + 1e-9 {
+        } else if legs(&|l| l.dir == u.dir) + risk > lim.dir + 1e-9 {
             Some("risk in one direction")
-        } else if legs(&|l| l.user == u.user) + lim.risk > lim.trader + 1e-9 {
+        } else if legs(&|l| l.user == u.user) + risk > lim.trader + 1e-9 {
             Some("risk of one trader")
         } else if view.values().filter(|l| l.coin == u.coin).count() >= lim.per_coin {
             Some("legs in the coin")
@@ -632,7 +849,7 @@ impl Live {
             return;
         };
         let dec = self.venue.coins[&u.coin].1;
-        let full = round_size(lim.risk / self.cfg.stop_pct * equity / mid, dec);
+        let full = round_size(risk / self.cfg.stop_pct * equity / mid, dec);
         if full * mid < MIN_ORDER_USD {
             self.event(json!({"what": "too small", "user": u.user, "coin": u.coin, "equity": equity, "size": full}));
             return;
@@ -640,8 +857,8 @@ impl Live {
         let k = key(&u.coin, &u.user);
         let size = u.dir * full * u.frac.min(1.0);
         // In the view as held: the limits count it for the moves after it.
-        view.insert(k.clone(), Leg { coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size, ..Default::default() });
-        steps.push(Step::Open { key: k, user: u.user.clone(), coin: u.coin.clone(), dir: u.dir, full, size, equity,
+        view.insert(k.clone(), Leg { coin: u.coin.clone(), user: u.user.clone(), dir: u.dir, full, size, risk, ..Default::default() });
+        steps.push(Step::Open { key: k, user: u.user.clone(), coin: u.coin.clone(), dir: u.dir, full, size, risk, equity,
             wait_ms: (late.max(0.0) * 1000.0) as u64 });
     }
 
@@ -651,7 +868,7 @@ impl Live {
             match d {
                 Done::Opened { key, leg, equity, ms } => {
                     self.event(json!({"what": "open", "user": leg.user, "coin": leg.coin, "size": leg.size, "px": leg.entry_px,
-                        "notional": leg.size.abs() * leg.entry_px, "equity": equity, "stop_px": leg.stop_px, "stop_oid": leg.stop_oid, "ms": ms}));
+                        "notional": leg.size.abs() * leg.entry_px, "equity": equity, "risk_pct": leg.risk, "stop_px": leg.stop_px, "stop_oid": leg.stop_oid, "ms": ms}));
                     self.state.legs.insert(key, leg);
                 }
                 Done::Moved { key, leg, got, px, reduce, ms } => {
@@ -664,6 +881,20 @@ impl Live {
                         "pnl_approx": -got * (px - leg.entry_px), "ms": ms}));
                     self.state.legs.remove(&key);
                 }
+                Done::Restopped { key, coin, oid } => match self.state.legs.get_mut(&key) {
+                    Some(l) => l.stop_oid = oid,
+                    None => {
+                        if let Some(o) = oid {
+                            let v = self.venue.clone();
+                            tokio::spawn(async move { v.cancel(&coin, o).await });
+                        }
+                    }
+                },
+                Done::Closing { key } => {
+                    if let Some(l) = self.state.legs.get_mut(&key) {
+                        l.closing = true;
+                    }
+                }
                 Done::Failed { user, coin, error } => self.event(json!({"what": "error", "user": user, "coin": coin, "error": error})),
             }
         }
@@ -671,8 +902,50 @@ impl Live {
         self.touched.insert(coin.clone(), now());
         self.publish_users();
         self.save();
-        if self.pending.contains_key(&coin) {
+        if self.pending.contains_key(&coin) || self.restop.iter().any(|k| self.state.legs.get(k).is_some_and(|l| l.coin == coin)) {
             self.launch(&coin, dtx);
+        }
+    }
+
+    /// A post-only exit done: the leg out (on an error too: the next check reads what is held).
+    fn limit_closed(&mut self, c: LimitClosed) {
+        let LimitClosed { key, leg, why, out, ms } = c;
+        self.state.legs.remove(&key);
+        self.touched.insert(leg.coin.clone(), now());
+        match out {
+            Ok((got, px, maker)) => self.event(json!({"what": "close", "why": why, "user": leg.user, "coin": leg.coin, "size": got, "px": px,
+                "post_only_share": (maker * 1000.0).round() / 1000.0, "pnl_approx": -got * (px - leg.entry_px), "ms": {"order": ms}})),
+            Err(e) => self.event(json!({"what": "error", "user": leg.user, "coin": leg.coin, "error": format!("post-only exit: {e}")})),
+        }
+        self.publish_users();
+        self.save();
+    }
+
+    /// An entry's stop, placed in the background: on its leg; for the leg's size now if it moved
+    /// meanwhile (by the coin's next job); cancelled if the leg is gone already.
+    fn stop_placed(&mut self, sp: StopPlaced, dtx: &mpsc::UnboundedSender<(String, Vec<Done>)>) {
+        let StopPlaced { key, coin, oid, size } = sp;
+        match self.state.legs.get_mut(&key) {
+            Some(l) => {
+                l.stop_pending = false;
+                l.stop_oid = oid;
+                let off = oid.is_some() && (l.size - size).abs() > 1e-12 * l.size.abs().max(1.0);
+                let ev = json!({"what": "stop", "user": l.user, "coin": coin, "stop_px": l.stop_px, "stop_oid": oid, "resize": off});
+                self.event(ev);
+                if off {
+                    self.restop.insert(key);
+                    if !self.busy.contains(&coin) {
+                        self.launch(&coin, dtx);
+                    }
+                }
+                self.save();
+            }
+            None => {
+                if let Some(o) = oid {
+                    let v = self.venue.clone();
+                    tokio::spawn(async move { v.cancel(&coin, o).await });
+                }
+            }
         }
     }
 
@@ -762,7 +1035,8 @@ impl Live {
     async fn reconcile_with(&mut self, r: Read) {
         let Read { at, equity, positions, resting } = r;
         self.equity = (equity, now());
-        let fresh = |c: &String, s: &Self| s.busy.contains(c) || s.pending.contains_key(c) || s.touched.get(c).is_some_and(|t| *t >= at - 1.0);
+        let fresh = |c: &String, s: &Self| s.busy.contains(c) || s.pending.contains_key(c) || s.touched.get(c).is_some_and(|t| *t >= at - 1.0)
+            || s.state.in_coin(c).any(|(_, l)| l.closing);
         let mut changed = false;
         if let Some(resting) = &resting {
             for (k, l) in self.state.legs.clone() {
@@ -803,7 +1077,7 @@ impl Live {
             }
         }
         if resting.is_some() {
-            for k in self.state.legs.iter().filter(|(_, l)| l.stop_oid.is_none() && !fresh(&l.coin, self))
+            for k in self.state.legs.iter().filter(|(_, l)| l.stop_oid.is_none() && !l.stop_pending && !fresh(&l.coin, self))
                 .map(|(k, _)| k.clone()).collect::<Vec<_>>() {
                 self.restop(&k).await;
                 changed = true;
@@ -831,7 +1105,7 @@ pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let info = Exchange::new(base, &std::env::var("LIVE_KEY")?)?;
     let send = |user: &str, dir: f64, frac: f64, entry: bool| {
-        tx.send(Update { user: format!("live-check-{user}"), coin: coin.into(), dir, frac, entry, golden: true, at: now() })
+        tx.send(Update { user: format!("live-check-{user}"), coin: coin.into(), dir, frac, entry, golden: true, at: now(), weight: 1.0 })
     };
     let show = |what: &'static str| {
         let (info, account, coin) = (&info, &account, coin);
@@ -870,6 +1144,27 @@ pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_weights_fall_with_the_place_and_keep_the_mean() {
+        let w: Vec<f64> = (1..=20).map(|r| rank_weight(r, 20)).collect();
+        assert!((w.iter().sum::<f64>() / 20.0 - 1.0).abs() < 1e-9);
+        assert!(w.windows(2).all(|p| p[0] >= p[1]) && w[0] > 1.5 && w[19] < 0.5);
+        // Not among the picks, or no picks: as set.
+        assert_eq!((rank_weight(0, 20), rank_weight(21, 20), rank_weight(1, 0)), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn legs_saved_before_risk_and_closing_load_with_the_defaults() {
+        let v = json!({"legs": {"BTC|0xa": {"coin": "BTC", "user": "0xa", "dir": 1.0, "full": 0.1, "size": 0.1, "entry_px": 1.0,
+            "stop_px": 0.8, "stop_oid": 7, "opened": 0.0}}, "skipped": 0, "orders": 2});
+        let s = serde_json::from_value::<State>(v).unwrap();
+        let l = &s.legs["BTC|0xa"];
+        assert!(l.risk == 0.0 && !l.closing);
+        let lim = Limits { risk: 1.0, total: 100.0, dir: 50.0, trader: 20.0, per_coin: 2, max_dd: 0.0, rank_weight: true, exit_limit_s: 15.0 };
+        assert_eq!(lim.of(l), 1.0);
+        assert_eq!(lim.of(&Leg { risk: 1.4, ..l.clone() }), 1.4);
+    }
 
     #[test]
     fn legs_saved_by_coin_get_keys_per_account() {

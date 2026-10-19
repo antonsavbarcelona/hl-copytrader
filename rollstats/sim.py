@@ -167,7 +167,7 @@ class Slip:
 
 # ---------------------------------------------------------------- backtest of our copy
 
-def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
+def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0, price=None):
     """Our copy of the trader over [t_from, t_to): copy trips. Positions it held at t_from are not
     entered. Each entry = 10% of the copy's equity at the trader's first price + our slippage;
     reduces follow its decisions in proportion to its peak in the position; the stop is 20%
@@ -176,10 +176,15 @@ def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
     add_max > 1: the trader's adds are followed too, our size the trader's over its size at our
     entry, up to add_max x our entry's (2: up to 4% risk); the entry re-averaged, the stop 20%
     from it; reduces then cut our size at its peak in proportion to the trader's from its peak.
-    (Funding on an add is counted from the position's start: a small approximation.)"""
+    (Funding on an add is counted from the position's start: a small approximation.)
+    price(coin, t, side, kind) -> our fill price at the decision of time t (side +1 a buy, -1 a
+    sell; kind 'entry' / 'exit' / 'partial'), or None: the slippage model against the trader's."""
     equity = START_USD
     legs, out = {}, []
     sl = (lambda b, k: slip.draw(b, k)) if mode == 'draw' else (lambda b, k: slip.mean(b, k))
+    def fill(d, b, side, kind, ref):
+        p = price(d['coin'], d['t0'], side, kind) if price else None
+        return p if p else d[ref] * (1 + side * sl(b, kind) / 1e4)
     held_before = set()
     seen = set()
     for d in decs:
@@ -209,10 +214,10 @@ def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
         if d['type'] in ('open', 'flip'):
             held_before.discard(c)
             if leg:  # a flip: our leg closes with it
-                px = d['vwap'] * (1 - leg['dir'] * sl(b, 'exit') / 1e4)
+                px = fill(d, b, -leg['dir'], 'exit', 'vwap')
                 close_leg(out, legs, c, leg, px, d['t0'], 'flip', mkt); equity += out[-1]['pnl']
             direction = 1 if d['after'] > 0 else -1
-            px = d['px0'] * (1 + direction * sl(b, 'entry') / 1e4)
+            px = fill(d, b, direction, 'entry', 'px0')
             notional = ENTRY_PCT * max(equity, 0.0)
             if notional < MIN_ORDER:
                 continue
@@ -228,7 +233,7 @@ def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
             if add_max > 1 and leg['pos0'] > 0:
                 target = leg['full'] * min(abs(d['after']) / leg['pos0'], add_max)
                 more = target - leg['size']
-                px = d['px0'] * (1 + leg['dir'] * sl(b, 'entry') / 1e4)
+                px = fill(d, b, leg['dir'], 'entry', 'px0')
                 if more * px >= MIN_ORDER:
                     leg['entry'] = (leg['entry'] * leg['size'] + px * more) / target
                     leg['size'] = target
@@ -243,7 +248,7 @@ def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
             if target >= leg['size']:
                 continue
             cut = leg['size'] - target
-            px = d['vwap'] * (1 - leg['dir'] * sl(b, 'partial') / 1e4)
+            px = fill(d, b, -leg['dir'], 'partial', 'vwap')
             if cut * px < MIN_ORDER:
                 continue
             leg['funding'] += mkt.funding_paid(c, -leg['dir'], cut * leg['entry'], leg['t0'], d['t0'])
@@ -252,7 +257,7 @@ def backtest(decs, mkt, slip, t_from, t_to, mode='draw', add_max=1.0):
             leg['size'] = target
             continue
         if d['type'] == 'close':
-            px = d['vwap'] * (1 - leg['dir'] * sl(b, 'exit') / 1e4)
+            px = fill(d, b, -leg['dir'], 'exit', 'vwap')
             close_leg(out, legs, c, leg, px, d['t0'], 'exit', mkt); equity += out[-1]['pnl']
     for c, leg in list(legs.items()):
         hit = mkt.stop_hit(c, leg['dir'], leg['chk'], t_to, leg['stop'])

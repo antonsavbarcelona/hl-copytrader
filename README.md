@@ -249,6 +249,15 @@ run the bot with `ROLLSTATS=0`. Market makers (mostly maker in an hour of 500+ f
 2025-05 .. 2026-10, the paper as its check): the copy's Sharpe over 90 days was the one score in
 profit both on the months it was chosen on and on the months after.
 
+The copy is priced as we really fill (since 2026-10-19), not by the paper's slippage model, which
+the live fills showed ~10 bp a trip too kind, most of it on scalpers who move a thin book
+themselves: our fill is the worst price for us of the tape's last block at or before 0.8 s after
+the trader's fill (`LAG_MS`; the bot's median lag from Singapore is 0.87 s), after his own block,
+plus 2 bp (`EXEC`); on the live fills this rule was the closest (mean error 4 bp). A block's fills
+share one time in no price order, so no single "last trade" of it is ours. Traders whose copy
+trips last under 30 s on average (`HOLD_MIN_MS`) are left out. The first run after the change
+extracts the 120 days again (each fill gets the block it would be copied in).
+
 ## Live
 
 With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,
@@ -263,6 +272,18 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
   one direction, `LIVE_CAP_TRADER_PCT` (20) of one trader, two legs a coin; with
   `LIVE_MAX_DD_PCT` (off at 0) no entries once the account is that far below its peak (its legs
   are followed out).
+- The mix (the walk-forward of 2026-10-19 on the real-price copies, `SHARPE_20_R1_D20`: +88% over
+  14 months against +69% without it, no reinvestment; entries size on the equity, so a live
+  account reinvests: +135%), each off unless set:
+  `LIVE_RANK_WEIGHT=1`: an entry's risk is `LIVE_RISK_PCT` times its trader's weight by his place
+  among the portfolio's picks (the first 1.6x, the last 0.4x, the same on average; the limits
+  count each leg's own risk);
+  `LIVE_EXIT_LIMIT_S=15`: a trader's exit is followed by a reduce-only post-only order at the
+  book's best price on our side, in the background; what it has not filled in that many seconds
+  is sold at market (on the tape 67% fill in 15 s; the maker fee and no spread: ~5 bp a trip).
+  Flips and stops stay market.
+- An entry's stop is placed in the background after its fill (the coin's next moves do not
+  wait for it; a move meanwhile resizes it once it is in).
 - `LIVE_ONLY=1`: only the live portfolio's picks and the accounts the live account holds legs
   of are followed, nothing on paper beyond them (no trial, no selection's thousands). The picks
   are enrolled as soon as they are picked (their positions read), not on their first fill: an

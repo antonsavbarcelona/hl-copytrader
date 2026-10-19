@@ -726,12 +726,16 @@ impl Engine {
         if let Some((live, _)) = &self.live {
             let peak = t.legs.get(coin).map(|l| l.peak).unwrap_or(0.0);
             let frac = if peak > 0.0 { theirs.abs() / peak } else { 0.0 };
-            let enter = match &self.live_portfolio {
-                Some(name) => self.alloc.portfolios.iter().any(|p| &p.name == name && p.picked.contains_key(user)),
-                None => t.golden,
+            // Its place among the portfolio's picks: its weight (`live::rank_weight`).
+            let (enter, weight) = match &self.live_portfolio {
+                Some(name) => match self.alloc.portfolios.iter().find(|p| &p.name == name).and_then(|p| Some((p.picked.get(user)?.0, p.picked.len()))) {
+                    Some((rank, n)) => (true, crate::live::rank_weight(rank, n)),
+                    None => (false, 1.0),
+                },
+                None => (t.golden, 1.0),
             };
             let _ = live.send(crate::live::Update { user: user.to_string(), coin: coin.to_string(), dir: theirs.signum(), frac,
-                entry: opened, golden: enter, at: first.as_ref().map(|p| p.recv).unwrap_or_else(now) });
+                entry: opened, golden: enter, at: first.as_ref().map(|p| p.recv).unwrap_or_else(now), weight });
         }
         if entry && target.abs() > 0.0 {
             *t.coins.entry(coin.to_string()).or_default() += 1;

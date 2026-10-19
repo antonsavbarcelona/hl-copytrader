@@ -12,9 +12,13 @@ the bot with ROLLSTATS=0).
      kept. A wallet-hour of more than HEAVY fills, mostly maker, is a market maker's: left out,
      and the wallet with it. Hours older than the window deleted.
   2. Funding from the archive's asset contexts (s3://hyperliquid-archive/asset_ctxs).
-  3. Every wallet's copy over the window (rollstats' sim.py, our 20% stop on the minute bars),
+  3. Every wallet's copy over the window (rollstats' sim.py, our 20% stop on the minute bars)
+     at the prices we would really get (LAG_MS, EXEC: the tape after the trader's fill, our
+     spread; the live check of 2026-10-19: the paper's slippage model was ~10 bp a trip too
+     kind, most of it on the traders who move a thin book themselves and are out in seconds);
      its statistics over the last 90 days (rollstats' metrics.py: over the whole window); HFT
-     (by its decisions) and market makers left out.
+     (by its decisions), market makers and the traders whose copy trips last under HOLD_MIN_MS
+     on average left out.
   4. Rows for the day (upserted): the bot's universe (`trader_fills`) with copy trips, and the
      TOP of the exchange by Sharpe (ties: the LCB) among those with 10+ closed trips and a profit.
 
@@ -24,7 +28,7 @@ ARCHIVE_PROCS (8); ARCHIVE_TOP (500); ARCHIVE_RAW: a local copy of the raw archi
 (D:/hl-archive); ARCHIVE_DRY=1: the rows only saved (ARCHIVE_DIR/rows_<day>.json), not written;
 ARCHIVE_UPLOAD=1: the saved rows of today written, nothing computed.
 Run each morning: archive/run_daily.ps1 (it reads the repo's .env)."""
-import datetime as dt, glob, json, os, shutil, struct, sys, time, zlib
+import bisect, datetime as dt, glob, json, os, shutil, struct, sys, time, zlib
 from array import array
 from collections import Counter
 from multiprocessing import Pool
@@ -41,6 +45,16 @@ DAYS = int(os.environ.get('ARCHIVE_DAYS', 120)); WIN = 90
 PROCS = int(os.environ.get('ARCHIVE_PROCS', 8)); TOP = int(os.environ.get('ARCHIVE_TOP', 500))
 NB, SUB, HEAVY = 16, 32, 500
 FILLS, CTX = 'hl-mainnet-node-data', 'hyperliquid-archive'
+# Our real copy (the live check of 2026-10-19 against the archive's tape): our fill is the worst
+# price for us (a buy: the highest) of the tape's last block at or before LAG_MS after the
+# trader's fill (the bot's median lag from Singapore is 0.87 s) but after his own block (none in
+# between: the next one), and our spread EXEC bp on it; not the paper's model of our slippage
+# against the trader's own price (it misses how far he moves a thin book himself). A block's
+# fills share a time and come in no price order, so no single "last trade" of it is ours.
+LAG_MS, EXEC = 800, 2.0
+# A trader whose copy trips last under this on average over the window is left out: we cannot
+# follow him (his move is over before we are in).
+HOLD_MIN_MS = 30_000
 _s3 = {}
 
 
@@ -54,14 +68,23 @@ def ymd(ms): return time.strftime('%Y%m%d', time.gmtime(ms / 1000))
 
 # ---------------------------------------------------------------- 1. the hours
 
+def extracted(day, h):
+    """The hour is extracted, with our price LAG_MS after each fill (an older extraction is not)."""
+    p = os.path.join(DIR, 'slim', day, f'{h}.meta.json')
+    return os.path.exists(p) and orjson.loads(open(p, 'rb').read()).get('copy_px') == [LAG_MS, 2]
+
+
 def hour(key):
-    """One hourly file: downloaded, extracted, dropped. Returns the key, or None if it was there."""
+    """One hourly file: downloaded, extracted, dropped. Returns the key, or None if it was there.
+    Each slim fill gets a 12th and 13th field: the highest and the lowest price of the block we
+    would fill in LAG_MS after it (see LAG_MS; at the hour's end, with no block after his in the
+    hour: his own)."""
     day, h = key.split('/')[-2], key.split('/')[-1].split('.')[0]
     od = os.path.join(DIR, 'slim', day)
-    if os.path.exists(os.path.join(od, f'{h}.meta.json')): return None
+    if extracted(day, h): return None
     local = os.path.join(os.environ.get('ARCHIVE_RAW', 'D:/hl-archive'), key)
     raw = open(local, 'rb').read() if os.path.exists(local) else s3('ap-northeast-1').get_object(Bucket=FILLS, Key=key, RequestPayer='requester')['Body'].read()
-    users, bars, vol = {}, {}, {}
+    users, bars, vol, tape = {}, {}, {}, {}
     for line in lz4.frame.decompress(raw).split(b'\n'):
         if not line: continue
         o = orjson.loads(line)
@@ -76,8 +99,29 @@ def hour(key):
                 if px > x[1]: x[1] = px
                 x[2] = px
             vol[c] = vol.get(c, 0.0) + px * sz / 2
+            tape.setdefault(c, []).append((t, px))
             users.setdefault(u, []).append([c, f['side'], px, sz, t, float(f['startPosition']), float(f['closedPnl']), float(f['fee']),
-                                            bool(f['crossed']), f['oid'], f.get('dir', '')])
+                                            bool(f['crossed']), f['oid'], f.get('dir', ''), px, px])
+    # Each coin's blocks: their times, highest and lowest price.
+    blocks = {}
+    for c, v in tape.items():
+        b = {}
+        for t, px in v:
+            x = b.get(t)
+            if x is None: b[t] = [px, px]
+            elif px > x[0]: x[0] = px
+            elif px < x[1]: x[1] = px
+        ts = sorted(b); blocks[c] = (ts, [b[t] for t in ts])
+    later = {}
+    for v in users.values():
+        for f in v:
+            k = (f[0], f[4]); p = later.get(k)
+            if p is None:
+                ts, hl = blocks[f[0]]
+                i = bisect.bisect_right(ts, f[4] + LAG_MS) - 1
+                if ts[i] <= f[4] and i + 1 < len(ts): i += 1
+                p = later[k] = hl[i]
+            f[11], f[12] = p
     heavy = [u for u, v in users.items() if len(v) > HEAVY and sum(1 for f in v if not f[8]) >= len(v) / 2]
     hs = set(heavy); parts = [{} for _ in range(NB)]
     for u, v in users.items():
@@ -86,7 +130,7 @@ def hour(key):
     for b, p in enumerate(parts):
         open(os.path.join(od, f'{h}.{b}.lz4'), 'wb').write(lz4.frame.compress(orjson.dumps(p)))
     open(os.path.join(od, f'{h}.bars.json'), 'wb').write(orjson.dumps({c: {str(m): x for m, x in b.items()} for c, b in bars.items()}))
-    open(os.path.join(od, f'{h}.meta.json'), 'wb').write(orjson.dumps(dict(heavy=heavy, vol=vol)))
+    open(os.path.join(od, f'{h}.meta.json'), 'wb').write(orjson.dumps(dict(heavy=heavy, vol=vol, copy_px=[LAG_MS, 2])))
     return key
 
 
@@ -97,7 +141,7 @@ def sync(first, end):
         kw = dict(Bucket=FILLS, Prefix=f'node_fills_by_block/hourly/{day}/', RequestPayer='requester')
         r = s3('ap-northeast-1').list_objects_v2(**kw)
         keys += [o['Key'] for o in r.get('Contents', [])]
-    keys = [k for k in keys if not os.path.exists(os.path.join(DIR, 'slim', k.split('/')[-2], k.split('/')[-1].split('.')[0] + '.meta.json'))]
+    keys = [k for k in keys if not extracted(k.split('/')[-2], k.split('/')[-1].split('.')[0])]
     print(f'archive: {len(keys)} hours to fetch of {len(days)} days', flush=True)
     t0 = time.time()
     with Pool(PROCS) as p:
@@ -190,13 +234,19 @@ def bucket(b):
             if st == 'hft' and not (sm['decisions_per_day'] > 100 and (sm['hold_med_h'] or 0) < 0.1):
                 st = 'no_trips' if sm['hold_med_h'] is None else 'scalper' if sm['hold_med_h'] < 1 else 'directional'
             if st in ('hft', 'market_maker', 'inactive', 'no_trips'): continue
+            # Our fill at a decision: the worst for us of the block LAG_MS after its first fill, and our spread.
+            later = {(f[0], f[4]): (f[11], f[12]) for f in F}
+            def price(c, t, side, kind):
+                p = later.get((c, t))
+                return p[0 if side > 0 else 1] * (1 + side * EXEC / 1e4) if p else None
             try:
-                tr = sim.backtest(decs, G['mkt'], G['slip'], G['t_from'], G['end'], mode='mean')
+                tr = sim.backtest(decs, G['mkt'], G['slip'], G['t_from'], G['end'], mode='mean', price=price)
             except Exception:
                 continue
             tr = [t for t in tr if t['why'] != 'open_at_end' and t['t1'] >= lo]
             known = u in G['universe']
             if not tr or (len(tr) < 10 and not known): continue
+            if sum(t['t1'] - t['t0'] for t in tr) / len(tr) < HOLD_MIN_MS: continue
             m = metrics(tr, lo, G['end'])
             if m['pnl'] <= 0 and not known: continue
             rows.append((u, m, sum(t['slip_in'] for t in tr) / len(tr), dict(Counter(t['coin'] for t in tr)), known))

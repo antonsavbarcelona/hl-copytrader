@@ -28,8 +28,8 @@
 //! one trader (`LIVE_CAP_TRADER_PCT`, 20), two legs a coin; no entries once the account is
 //! `LIVE_MAX_DD_PCT` below its peak (off at 0), its legs followed out.
 //!
-//! The mix of the walk-forward of 2026-10-19 (on the real-price copies: +88% over 14 months at 1%
-//! against +69% without it, no reinvestment), each off unless set:
+//! The mix of the walk-forward of 2026-10-19 (on the real-price copies, 14 months, no
+//! reinvestment: SHARPE_20_R2_D20 +40% against +6% without it), each off unless set:
 //!   - `LIVE_RANK_WEIGHT=1`: an entry's risk is `LIVE_RISK_PCT` times its trader's weight by his
 //!     place among the portfolio's picks (`rank_weight`: the first 1.6x, the last 0.4x, the
 //!     same on average); the limits count each leg's own risk;

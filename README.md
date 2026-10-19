@@ -272,9 +272,10 @@ testnet (`api.hyperliquid-testnet.xyz`) unless `LIVE_NET=mainnet` (`src/live.rs`
   one direction, `LIVE_CAP_TRADER_PCT` (20) of one trader, two legs a coin; with
   `LIVE_MAX_DD_PCT` (off at 0) no entries once the account is that far below its peak (its legs
   are followed out).
-- The mix (the walk-forward of 2026-10-19 on the real-price copies, `SHARPE_20_R1_D20`: +88% over
-  14 months against +69% without it, no reinvestment; entries size on the equity, so a live
-  account reinvests: +135%), each off unless set:
+- The mix (the walk-forward of 2026-10-19 on the real-price copies, 14 months, no reinvestment:
+  `SHARPE_20_R2_D20` +40% against +6% without it, max drawdown 28%, 7 months of 15 up;
+  `SHARPE_20_R1_D20` +3% against -9%: the copy is about break-even at our 0.8 s, the mix is what
+  lifts it; entries size on the equity, so a live account reinvests), each off unless set:
   `LIVE_RANK_WEIGHT=1`: an entry's risk is `LIVE_RISK_PCT` times its trader's weight by his place
   among the portfolio's picks (the first 1.6x, the last 0.4x, the same on average; the limits
   count each leg's own risk);

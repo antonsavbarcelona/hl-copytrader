@@ -15,7 +15,10 @@
 //! a moment later): best bid / ask, the spread, the depth on our side within 0.5 / 1 / 2%, the
 //! VWAP our whole order would fill at by the book, the fill's price, the slippage against the mid,
 //! the best price and that VWAP, the delays (the signal minute's end to our decision, the order's
-//! round trip, the book's age); the exits the same (`close`).
+//! round trip, the book's age); the exits the same (`close`). And the market's regime then
+//! (`regime`, logged only: V1 does not use it): the share of the liquid coins ($5M+ a day, the
+//! signal's coin left out) down 3%+ over 15 min (the breadth) now and 5 / 10 / 30 / 60 s before,
+//! their equal-weighted 15 min return (the index), the coin's return against it, BTC's.
 //!
 //! The archive research of 2026-10-20 (2025-05 .. 2026-10, the raw tape: our buy at the worst
 //! price of the first block a second after the signal, the taker fee both ways): +199 bp a trade
@@ -51,6 +54,9 @@ const MIN_ORDER_USD: f64 = 10.0;
 const BOOK_STALE_S: f64 = 30.0;
 /// The day volumes are read this often (s).
 const VOLUME_EVERY_S: f64 = 300.0;
+/// The regime's coins: $5M+ a day; a coin down this much over 15 min counts in the breadth.
+const REGIME_MIN_VOL: f64 = 5e6;
+const REGIME_FALL: f64 = 0.03;
 
 #[derive(Clone, Debug)]
 struct Params {
@@ -140,6 +146,8 @@ struct Dip {
     positions: HashMap<String, f64>,
     equity: f64,
     books: crate::ws::Books,
+    /// The breadth and the index (all the liquid coins), a sample a second, the last 70 s.
+    regime_hist: VecDeque<(f64, f64, f64)>,
 }
 
 /// Starts the dip-buy if `DIP_ENABLED` is "1" and the live account is set (see the module).
@@ -165,7 +173,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
         p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, p.risk * 100.0, p.risk / p.stop * 100.0, p.max_open));
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
-        positions: HashMap::new(), equity: 0.0, books: books.clone() };
+        positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new() };
     tokio::spawn(async move {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut vol_at = 0.0;
@@ -206,7 +214,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
             }
             // The minute's close so far: each coin's mid now.
             let minute = (t / 60.0).floor() as i64;
-            let keep = d.p.window as usize + 3;
+            // The window and the regime's 15 minutes, whichever is longer.
+            let keep = d.p.window.max(15) as usize + 3;
             {
                 let b = books.read().unwrap();
                 for (c, book) in b.iter() {
@@ -216,6 +225,13 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
                     if let Some(m) = book.mid() {
                         d.closes.update(c, minute, m, keep);
                     }
+                }
+            }
+            if d.regime_hist.back().is_none_or(|x| t - x.0 >= 1.0) {
+                let (b, i, _) = d.breadth(None, minute);
+                d.regime_hist.push_back((t, b, i));
+                while d.regime_hist.front().is_some_and(|x| t - x.0 > 70.0) {
+                    d.regime_hist.pop_front();
                 }
             }
             if minute > last_minute {
@@ -239,6 +255,35 @@ impl Dip {
             crate::notify::send(m);
         }
         self.store.event(ev);
+    }
+
+    /// The breadth and the index now over the liquid coins (`except` left out): each coin's mid
+    /// against its close 15 minutes before; and how many coins counted.
+    fn breadth(&self, except: Option<&str>, minute: i64) -> (f64, f64, usize) {
+        let (mut down, mut sum, mut n) = (0usize, 0.0, 0usize);
+        for c in self.closes.0.keys() {
+            if Some(c.as_str()) == except || self.volume.get(c).copied().unwrap_or(0.0) < REGIME_MIN_VOL {
+                continue;
+            }
+            let (Some(now_px), Some(then)) = (self.closes.at(c, i64::MAX), self.closes.at(c, minute - 15)) else { continue };
+            if then <= 0.0 { continue; }
+            let r = now_px / then - 1.0;
+            n += 1;
+            sum += r;
+            if r <= -REGIME_FALL { down += 1; }
+        }
+        if n == 0 { (f64::NAN, f64::NAN, 0) } else { (down as f64 / n as f64, sum / n as f64, n) }
+    }
+
+    /// The regime at a signal in `coin` (logged with it).
+    fn regime(&self, coin: &str, fall: f64, btc: f64) -> Value {
+        let minute = (now() / 60.0).floor() as i64;
+        let (b, idx, n) = self.breadth(Some(coin), minute);
+        let t = now();
+        let ago = |s: f64| self.regime_hist.iter().rev().find(|x| t - x.0 >= s).map(|x| x.1);
+        let f = |x: f64| if x.is_finite() { json!((x * 1e4).round() / 1e4) } else { Value::Null };
+        json!({"breadth": f(b), "index_r15": f(idx), "rel_r15": f(fall - idx), "btc_r15": f(btc), "n_liquid": n,
+            "breadth_5s_ago": ago(5.0).map(f), "breadth_10s_ago": ago(10.0).map(f), "breadth_30s_ago": ago(30.0).map(f), "breadth_60s_ago": ago(60.0).map(f)})
     }
 
     fn health_ready(&self) -> bool {
@@ -308,7 +353,7 @@ impl Dip {
             if let Some(why) = why {
                 let size = self.order_size(&coin);
                 self.event(json!({"what": "skipped", "coin": coin, "fall": fall, "btc": btc, "why": why, "signal_delay_ms": delay_ms,
-                    "book": self.book(&coin, true, size)}));
+                    "book": self.book(&coin, true, size), "regime": self.regime(&coin, fall, btc)}));
                 continue;
             }
             self.enter(&coin, fall, btc, delay_ms).await;
@@ -335,26 +380,27 @@ impl Dip {
         let Some(mid) = self.closes.at(coin, i64::MAX) else { return };
         let size = self.order_size(coin);
         let book = self.book(coin, true, size);
+        let regime = self.regime(coin, fall, btc);
         if size * mid < MIN_ORDER_USD {
-            self.event(json!({"what": "too small", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book}));
+            self.event(json!({"what": "too small", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
             return;
         }
         if self.p.dry {
             // The cooldown as if bought: one signal a coin a fall.
             self.state.last_entry.insert(coin.to_string(), now());
             self.event(json!({"what": "signal", "coin": coin, "fall": fall, "btc": btc, "mid": mid, "size": size, "notional": size * mid, "equity": self.equity,
-                "signal_delay_ms": delay_ms, "book": book}));
+                "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
             return;
         }
         let t0 = std::time::Instant::now();
         let (got, px, oid) = match self.venue.market(coin, size, false).await {
             Ok(x) if x.0 > 0.0 => x,
             Ok(_) => {
-                self.event(json!({"what": "error", "coin": coin, "error": "nothing filled", "signal_delay_ms": delay_ms, "book": book}));
+                self.event(json!({"what": "error", "coin": coin, "error": "nothing filled", "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
                 return;
             }
             Err(e) => {
-                self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}"), "signal_delay_ms": delay_ms, "book": book}));
+                self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}"), "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
                 return;
             }
         };
@@ -375,7 +421,7 @@ impl Dip {
         self.event(json!({"what": "open", "coin": coin, "fall": fall, "btc": btc, "size": got, "px": px, "notional": got * px,
             "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "oid": oid, "signal_mid": mid,
             "fee_est": got * px * TAKER_FEE, "slippage": slippage(&book, px, true, mid),
-            "delays_ms": {"signal_to_decision": delay_ms, "order": order_ms, "book_age": book["age_ms"]}, "book": book}));
+            "delays_ms": {"signal_to_decision": delay_ms, "order": order_ms, "book_age": book["age_ms"]}, "book": book, "regime": regime}));
         self.fills(coin, oid, "open");
         self.save();
     }

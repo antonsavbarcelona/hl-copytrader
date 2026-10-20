@@ -9,6 +9,7 @@ mod account;
 mod alloc;
 mod api;
 mod config;
+mod dip;
 mod engine;
 mod exchange;
 mod liq;
@@ -59,6 +60,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let picks = store::load_picks(&cfg).await?;
     let store = store::open(&cfg).await?;
     let live = live::start(&cfg, store.clone(), false, Some(books.clone())).await?;
+    // The dip-buy on the same account (off unless DIP_ENABLED=1): its own positions, on the books.
+    dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

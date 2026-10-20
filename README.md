@@ -258,6 +258,26 @@ share one time in no price order, so no single "last trade" of it is ours. Trade
 trips last under 30 s on average (`HOLD_MIN_MS`) are left out. The first run after the change
 extracts the 120 days again (each fill gets the block it would be copied in).
 
+## Dip-buy
+
+`src/dip.rs`, on the live account (`DIP_ENABLED=1`, with `LIVE_KEY`, `LIVE_ACCOUNT`,
+`LIVE_NET=mainnet`; off by default): a perp with $20M+ traded over 24 h (`DIP_MIN_VOL_USD`) whose
+mid fell 8%+ (`DIP_DROP_PCT`) over the last 15 minutes (`DIP_WINDOW_MIN`, by the minutes' closes on
+the bot's books) while BTC moved under 2% (`DIP_BTC_MAX_PCT`) is bought at market as its minute
+closes, held 60 min (`DIP_HOLD_MIN`) and sold at market, with a resting stop 20% under the fill
+(`DIP_STOP_PCT`); the size makes the stop lose 5% of the equity (`DIP_RISK_PCT`: 25% of it a
+trade); at most 3 open (`DIP_MAX_OPEN`), one a coin, a coin not again for 240 min
+(`DIP_COOLDOWN_MIN`); a coin the account holds otherwise is left alone. `DIP_DRY=1`: the signals
+only (events `signal`), no orders. State: the store's doc `dip`; events of kind `dip`.
+
+The research behind it (2026-10-20, the archive 2025-05 .. 2026-10, the raw tape: our buy at the
+worst price of the first block a second after the signal, the taker fee both ways): +199 bp a
+trade over 198 such falls; at these settings +85% over 16 months without reinvestment, +125% with
+it, max drawdown 10%, 13 months of 16 up, the halves alike; every neighbouring setting (5-8%,
+5-15 min, 1-4 h) in profit, a walk-forward choice of the setting too (+30% / 14 months at 20% a
+trade). Copy trading on the same data was about break-even at our 0.8 s: past winners did not
+persist (the first half's best copies lost in the second).
+
 ## Live
 
 With `LIVE_ENABLED=1`, `LIVE_ACCOUNT` (the account's address) and `LIVE_KEY` (its private key,

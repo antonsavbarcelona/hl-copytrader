@@ -170,20 +170,20 @@ impl State {
 /// The venue and what its orders need, shared by the coins' jobs (each runs on its own: one
 /// coin's orders do not wait for another's).
 #[derive(Clone)]
-struct Venue {
-    ex: Exchange,
+pub(crate) struct Venue {
+    pub(crate) ex: Exchange,
     /// Coin -> (asset index, size decimals) on the live venue.
-    coins: Arc<HashMap<String, (u32, u32)>>,
+    pub(crate) coins: Arc<HashMap<String, (u32, u32)>>,
     /// The engine's live books (mainnet's): a mid without a request. None: read from the API.
     books: Option<crate::ws::Books>,
     /// Every coin's mid, read in the background (`MIDS_EVERY_S`): where the books have none.
     mids: Arc<std::sync::RwLock<HashMap<String, f64>>>,
     /// Our account (its orders' status).
-    account: String,
+    pub(crate) account: String,
 }
 
 impl Venue {
-    async fn mid(&self, coin: &str) -> Result<f64> {
+    pub(crate) async fn mid(&self, coin: &str) -> Result<f64> {
         if self.ex.mainnet() {
             if let Some(m) = self.books.as_ref().and_then(|b| b.read().unwrap().get(coin).and_then(crate::ws::Book::mid)) {
                 return Ok(m);
@@ -199,7 +199,7 @@ impl Venue {
 
     /// A market order (IOC through the mid): the size filled (signed), its average price and
     /// its order id.
-    async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
+    pub(crate) async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
         let (asset, dec) = self.coins[coin];
         let mid = self.mid(coin).await?;
         let buy = size > 0.0;
@@ -228,7 +228,7 @@ impl Venue {
     }
 
     /// Our stop: a reduce-only stop-market order for `size` at `trigger`; its order id.
-    async fn stop(&self, coin: &str, dir: f64, size: f64, trigger: f64) -> Result<u64> {
+    pub(crate) async fn stop(&self, coin: &str, dir: f64, size: f64, trigger: f64) -> Result<u64> {
         let (asset, dec) = self.coins[coin];
         let trigger = round_px(trigger, dec);
         let px = round_px(trigger * (1.0 - dir * STOP_SLIPPAGE), dec);
@@ -241,7 +241,7 @@ impl Venue {
         st["resting"]["oid"].as_u64().with_context(|| format!("{coin} stop not placed: {st}"))
     }
 
-    async fn cancel(&self, coin: &str, oid: u64) {
+    pub(crate) async fn cancel(&self, coin: &str, oid: u64) {
         let a = self.coins[coin].0;
         if let Err(e) = self.ex.act(&Action::Cancel { cancels: vec![CancelWire { a, o: oid }] }).await {
             log!("live: cancel {coin} {oid}: {e:#}");
@@ -522,6 +522,25 @@ impl Limits {
     }
 }
 
+/// The live account's venue from the env (`LIVE_KEY`, `LIVE_ACCOUNT`, `LIVE_NET`), for another
+/// strategy on the account (`dip`): the venue and whether the account is unified; None without them.
+pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Option<(Venue, bool)>> {
+    let (Ok(key), Ok(account)) = (std::env::var("LIVE_KEY"), std::env::var("LIVE_ACCOUNT")) else { return Ok(None) };
+    if key.trim().is_empty() || account.trim().is_empty() {
+        return Ok(None);
+    }
+    let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
+    let ex = Exchange::new(base, &key)?;
+    let account = account.trim().to_lowercase();
+    let meta = ex.info(json!({"type": "meta"})).await.context("meta")?;
+    let coins = meta["universe"].as_array().into_iter().flatten().enumerate()
+        .filter(|(_, u)| u["isDelisted"] != true)
+        .filter_map(|(i, u)| Some((u["name"].as_str()?.to_string(), (i as u32, u["szDecimals"].as_u64()? as u32))))
+        .collect::<HashMap<_, _>>();
+    let unified = ex.info(json!({"type": "userAbstraction", "user": account})).await.map(|v| v == "unifiedAccount").unwrap_or(false);
+    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account }, unified)))
+}
+
 /// Starts the live trader if `LIVE_ENABLED` is "1" (or `force`, for `live-check`) and
 /// `LIVE_KEY` and `LIVE_ACCOUNT` are set: its sender, and its status (for `bot_status`).
 /// `books`: the engine's live books (mainnet's), its mids.
@@ -649,7 +668,7 @@ async fn read_account(ex: &Exchange, account: &str, unified: bool) -> Option<Rea
 
 /// Our account's equity: its perp account value, and on a unified account the spot USDC not
 /// held as perp margin (it backs the perps too); and its positions.
-async fn equity_of(ex: &Exchange, account: &str, unified: bool) -> Result<(f64, HashMap<String, f64>)> {
+pub(crate) async fn equity_of(ex: &Exchange, account: &str, unified: bool) -> Result<(f64, HashMap<String, f64>)> {
     let st = ex.info(json!({"type": "clearinghouseState", "user": account})).await?;
     let mut eq = num(&st["marginSummary"]["accountValue"]);
     if unified {

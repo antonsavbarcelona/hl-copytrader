@@ -9,6 +9,14 @@
 //! account holds otherwise (the copy's legs) is left alone. `DIP_DRY=1`: the signals only (events
 //! `signal`), no orders.
 //!
+//! DIP V1: these settings are frozen as of 2026-10-20 (no further fitting on the history; the
+//! live record is the independent check). Every signal is logged with the book and the fill
+//! (events `open` / `skipped` / `too small` / `error`, and `fill` with the exchange's fills and fees
+//! a moment later): best bid / ask, the spread, the depth on our side within 0.5 / 1 / 2%, the
+//! VWAP our whole order would fill at by the book, the fill's price, the slippage against the mid,
+//! the best price and that VWAP, the delays (the signal minute's end to our decision, the order's
+//! round trip, the book's age); the exits the same (`close`).
+//!
 //! The archive research of 2026-10-20 (2025-05 .. 2026-10, the raw tape: our buy at the worst
 //! price of the first block a second after the signal, the taker fee both ways): +199 bp a trade
 //! over 198 such falls; at these settings +85% over the 16 months without reinvestment (+125%
@@ -36,6 +44,8 @@ use crate::log;
 use crate::store::Store;
 
 const DOC: &str = "dip";
+const VERSION: &str = "V1";
+const TAKER_FEE: f64 = 0.00045;
 const MIN_ORDER_USD: f64 = 10.0;
 /// A book older than this (s) gives no close.
 const BOOK_STALE_S: f64 = 30.0;
@@ -129,6 +139,7 @@ struct Dip {
     volume: HashMap<String, f64>,
     positions: HashMap<String, f64>,
     equity: f64,
+    books: crate::ws::Books,
 }
 
 /// Starts the dip-buy if `DIP_ENABLED` is "1" and the live account is set (see the module).
@@ -143,7 +154,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     };
     let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let p = Params::from_env();
-    log!("dip: {}{} account {}, {} held; buys a fall of {:.0}% in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {:.1}% ({:.0}% of the equity a trade), at most {}",
+    log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {:.1}% ({:.0}% of the equity a trade), at most {}",
         if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.window, p.btc_max * 100.0,
         p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, p.risk * 100.0, p.risk / p.stop * 100.0, p.max_open);
     if std::env::var("LIVE_ENABLED").unwrap_or_default().trim() == "1" {
@@ -154,7 +165,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
         p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, p.risk * 100.0, p.risk / p.stop * 100.0, p.max_open));
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
-        positions: HashMap::new(), equity: 0.0 };
+        positions: HashMap::new(), equity: 0.0, books: books.clone() };
     tokio::spawn(async move {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut vol_at = 0.0;
@@ -222,6 +233,7 @@ impl Dip {
     fn event(&self, mut ev: Value) {
         ev["kind"] = json!("dip");
         ev["at"] = json!(now());
+        ev["version"] = json!(VERSION);
         log!("dip: {ev}");
         if let Some(m) = message(&ev) {
             crate::notify::send(m);
@@ -269,9 +281,8 @@ impl Dip {
     /// The falls of the minute that closed, biggest first, bought within the limits.
     async fn signals(&mut self, minute: i64) {
         let Some(btc) = self.closes.change("BTC", minute, self.p.window) else { return };
-        if btc.abs() >= self.p.btc_max {
-            return;
-        }
+        let decided = now();
+        let delay_ms = ((decided - (minute + 1) as f64 * 60.0) * 1000.0).max(0.0) as u64;
         let mut falls: Vec<(String, f64)> = self.closes.0.keys()
             .filter(|c| self.venue.coins.contains_key(*c) && self.volume.get(*c).copied().unwrap_or(0.0) >= self.p.min_vol)
             .filter_map(|c| Some((c.clone(), self.closes.change(c, minute, self.p.window)?)))
@@ -279,7 +290,9 @@ impl Dip {
         falls.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (coin, fall) in falls {
             let t = now();
-            let why = if self.state.open.len() >= self.p.max_open {
+            let why = if btc.abs() >= self.p.btc_max {
+                Some("btc moved")
+            } else if self.state.open.len() >= self.p.max_open {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
@@ -293,36 +306,55 @@ impl Dip {
                 None
             };
             if let Some(why) = why {
-                self.event(json!({"what": "skipped", "coin": coin, "fall": fall, "btc": btc, "why": why}));
+                let size = self.order_size(&coin);
+                self.event(json!({"what": "skipped", "coin": coin, "fall": fall, "btc": btc, "why": why, "signal_delay_ms": delay_ms,
+                    "book": self.book(&coin, true, size)}));
                 continue;
             }
-            self.enter(&coin, fall, btc).await;
+            self.enter(&coin, fall, btc, delay_ms).await;
         }
     }
 
-    async fn enter(&mut self, coin: &str, fall: f64, btc: f64) {
+    /// Our order's size in `coin` now (0 without a mid).
+    fn order_size(&self, coin: &str) -> f64 {
+        match (self.closes.at(coin, i64::MAX), self.venue.coins.get(coin)) {
+            (Some(mid), Some(&(_, dec))) if self.equity > 0.0 => round_size(self.p.risk / self.p.stop * self.equity / mid, dec),
+            _ => 0.0,
+        }
+    }
+
+    /// The book for an order of `size` to `buy` (else to sell): its best prices, spread, depth on
+    /// our side, the VWAP the whole order would fill at, its age.
+    fn book(&self, coin: &str, buy: bool, size: f64) -> Value {
+        let books = self.books.read().unwrap();
+        let Some(b) = books.get(coin) else { return Value::Null };
+        snapshot(b, buy, size, now())
+    }
+
+    async fn enter(&mut self, coin: &str, fall: f64, btc: f64, delay_ms: u64) {
         let Some(mid) = self.closes.at(coin, i64::MAX) else { return };
-        let dec = self.venue.coins[coin].1;
-        let size = round_size(self.p.risk / self.p.stop * self.equity / mid, dec);
+        let size = self.order_size(coin);
+        let book = self.book(coin, true, size);
         if size * mid < MIN_ORDER_USD {
-            self.event(json!({"what": "too small", "coin": coin, "equity": self.equity, "size": size}));
+            self.event(json!({"what": "too small", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book}));
             return;
         }
         if self.p.dry {
             // The cooldown as if bought: one signal a coin a fall.
             self.state.last_entry.insert(coin.to_string(), now());
-            self.event(json!({"what": "signal", "coin": coin, "fall": fall, "btc": btc, "mid": mid, "size": size, "notional": size * mid, "equity": self.equity}));
+            self.event(json!({"what": "signal", "coin": coin, "fall": fall, "btc": btc, "mid": mid, "size": size, "notional": size * mid, "equity": self.equity,
+                "signal_delay_ms": delay_ms, "book": book}));
             return;
         }
         let t0 = std::time::Instant::now();
-        let (got, px, _) = match self.venue.market(coin, size, false).await {
+        let (got, px, oid) = match self.venue.market(coin, size, false).await {
             Ok(x) if x.0 > 0.0 => x,
             Ok(_) => {
-                self.event(json!({"what": "error", "coin": coin, "error": "nothing filled"}));
+                self.event(json!({"what": "error", "coin": coin, "error": "nothing filled", "signal_delay_ms": delay_ms, "book": book}));
                 return;
             }
             Err(e) => {
-                self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")}));
+                self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}"), "signal_delay_ms": delay_ms, "book": book}));
                 return;
             }
         };
@@ -341,8 +373,39 @@ impl Dip {
         self.state.entries += 1;
         self.positions.insert(coin.to_string(), got);
         self.event(json!({"what": "open", "coin": coin, "fall": fall, "btc": btc, "size": got, "px": px, "notional": got * px,
-            "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "order_ms": order_ms, "signal_mid": mid}));
+            "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "oid": oid, "signal_mid": mid,
+            "fee_est": got * px * TAKER_FEE, "slippage": slippage(&book, px, true, mid),
+            "delays_ms": {"signal_to_decision": delay_ms, "order": order_ms, "book_age": book["age_ms"]}, "book": book}));
+        self.fills(coin, oid, "open");
         self.save();
+    }
+
+    /// The exchange's fills of order `oid` (their price, size, fees), a moment after it: event `fill`.
+    fn fills(&self, coin: &str, oid: u64, of: &'static str) {
+        let (v, store, coin) = (self.venue.clone(), self.store.clone(), coin.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let since = ((now() - 600.0) * 1000.0) as u64;
+            let r = v.ex.info(json!({"type": "userFillsByTime", "user": v.account, "startTime": since})).await;
+            let mut ev = match r {
+                Ok(list) => {
+                    let fs: Vec<&Value> = list.as_array().into_iter().flatten().filter(|f| f["oid"].as_u64() == Some(oid)).collect();
+                    let n = |f: &Value, k: &str| f[k].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+                    let sz: f64 = fs.iter().map(|f| n(f, "sz")).sum();
+                    let ntl: f64 = fs.iter().map(|f| n(f, "sz") * n(f, "px")).sum();
+                    let fee: f64 = fs.iter().map(|f| n(f, "fee")).sum();
+                    json!({"what": "fill", "of": of, "coin": coin, "oid": oid, "fills": fs.len(), "size": sz, "vwap": if sz > 0.0 { ntl / sz } else { 0.0 },
+                        "fee": fee, "fee_bp": if ntl > 0.0 { fee / ntl * 1e4 } else { 0.0 },
+                        "first_ms": fs.iter().filter_map(|f| f["time"].as_u64()).min(), "crossed": fs.iter().all(|f| f["crossed"] == true)})
+                }
+                Err(e) => json!({"what": "fill", "of": of, "coin": coin, "oid": oid, "error": format!("{e:#}")}),
+            };
+            ev["kind"] = json!("dip");
+            ev["at"] = json!(now());
+            ev["version"] = json!(VERSION);
+            log!("dip: {ev}");
+            store.event(ev);
+        });
     }
 
     /// The positions whose hold is over: out at market, their stops cancelled.
@@ -350,15 +413,22 @@ impl Dip {
         let t = now();
         let due: Vec<(String, Pos)> = self.state.open.iter().filter(|(_, p)| t - p.opened >= self.p.hold_s).map(|(c, p)| (c.clone(), p.clone())).collect();
         for (coin, p) in due {
+            let book = self.book(&coin, false, p.size);
+            let mid = self.closes.at(&coin, i64::MAX).unwrap_or(0.0);
+            let t0 = std::time::Instant::now();
             match self.venue.market(&coin, -p.size, true).await {
-                Ok((got, px, _)) => {
+                Ok((got, px, oid)) => {
+                    let order_ms = t0.elapsed().as_millis() as u64;
                     if let Some(o) = p.stop_oid {
                         self.venue.cancel(&coin, o).await;
                     }
                     self.state.open.remove(&coin);
                     self.positions.remove(&coin);
                     self.event(json!({"what": "close", "why": "hold", "coin": coin, "size": got, "px": px, "entry_px": p.entry_px,
-                        "pnl_approx": p.size * (px - p.entry_px), "ret_pct": (px / p.entry_px - 1.0) * 100.0, "held_min": (t - p.opened) / 60.0}));
+                        "pnl_approx": p.size * (px - p.entry_px), "ret_pct": (px / p.entry_px - 1.0) * 100.0, "held_min": (t - p.opened) / 60.0,
+                        "fee_est": got.abs() * px * TAKER_FEE, "slippage": slippage(&book, px, false, mid), "delays_ms": {"order": order_ms, "book_age": book["age_ms"]},
+                        "oid": oid, "book": book}));
+                    self.fills(&coin, oid, "close");
                     self.save();
                 }
                 Err(e) => {
@@ -408,6 +478,42 @@ impl Dip {
     }
 }
 
+/// A book for an order of `size` (`buy`: against the asks): best bid / ask, the spread (bp), the
+/// $ depth on our side within 0.5 / 1 / 2% of the best price, on the other side within 1%, the
+/// top 5 levels of our side, the VWAP the whole order would fill at by these levels (`filled`:
+/// the share of the order the levels hold), its age.
+fn snapshot(b: &crate::ws::Book, buy: bool, size: f64, at: f64) -> Value {
+    let (ours, theirs) = if buy { (&b.asks, &b.bids) } else { (&b.bids, &b.asks) };
+    let (Some(bid), Some(ask)) = (b.bids.first().map(|x| x.0), b.asks.first().map(|x| x.0)) else { return Value::Null };
+    let best = if buy { ask } else { bid };
+    let within = |side: &Vec<(f64, f64)>, from: f64, pct: f64| side.iter().filter(|(px, _)| (px / from - 1.0).abs() <= pct + 1e-9).map(|(px, sz)| px * sz).sum::<f64>();
+    let (mut left, mut ntl, mut levels) = (size, 0.0, 0);
+    for (px, sz) in ours {
+        if left <= 0.0 { break; }
+        let take = left.min(*sz);
+        ntl += take * px;
+        left -= take;
+        levels += 1;
+    }
+    let filled = if size > 0.0 { (size - left.max(0.0)) / size } else { 0.0 };
+    let mid = (bid + ask) / 2.0;
+    json!({"bid": bid, "ask": ask, "mid": mid, "spread_bp": (ask / bid - 1.0) * 1e4,
+        "depth_usd": {"0.5%": within(ours, best, 0.005), "1%": within(ours, best, 0.01), "2%": within(ours, best, 0.02), "other_side_1%": within(theirs, if buy { bid } else { ask }, 0.01)},
+        "top5": ours.iter().take(5).map(|(px, sz)| json!([px, sz])).collect::<Vec<_>>(),
+        "order_size": size, "vwap_expected": if size - left.max(0.0) > 0.0 { ntl / (size - left.max(0.0)) } else { 0.0 }, "levels_used": levels, "filled": filled,
+        "age_ms": ((at - b.time_ms as f64 / 1000.0) * 1000.0).max(0.0) as u64})
+}
+
+/// Our fill's slippage (bp, +: worse for us) against the mid at the signal, the book's best price
+/// on our side and the VWAP the book promised for the whole order.
+fn slippage(book: &Value, px: f64, buy: bool, signal_mid: f64) -> Value {
+    let s = if buy { 1.0 } else { -1.0 };
+    let bp = |r: f64| if r > 0.0 { json!((s * (px / r - 1.0) * 1e4 * 10.0).round() / 10.0) } else { Value::Null };
+    let best = book[if buy { "ask" } else { "bid" }].as_f64().unwrap_or(0.0);
+    json!({"vs_signal_mid": bp(signal_mid), "vs_book_mid": bp(book["mid"].as_f64().unwrap_or(0.0)), "vs_best": bp(best),
+        "vs_vwap_expected": bp(book["vwap_expected"].as_f64().unwrap_or(0.0))})
+}
+
 /// An event as a chat message (None: not sent).
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
@@ -422,6 +528,7 @@ fn message(ev: &Value) -> Option<String> {
         "stopped" => format!("🛑 СТОП {coin}: {} -> {}, примерно {}", f("entry_px"), f("stop_px"), usd(f("pnl_approx"))),
         "error" => format!("⚠️ {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("👀 сигнал (без сделки) {coin}: упала на {:.1}% (BTC {:+.1}%), цена {}, купил бы на ${:.0}", f("fall") * 100.0, f("btc") * 100.0, f("mid"), f("notional")),
+        "skipped" if ev["why"] == "btc moved" => return None,
         "skipped" => format!("⏭ {coin} упала на {:.1}%, не купил: {}", f("fall") * 100.0, match ev["why"].as_str().unwrap_or("") {
             "at most open" => "уже открыто максимум позиций",
             "held" => "уже держим эту монету",
@@ -456,6 +563,21 @@ mod tests {
             c.update("X", m, 9.0, 20);
         }
         assert_eq!(c.0["X"].len(), 20);
+    }
+
+    #[test]
+    fn the_book_walked_for_our_order() {
+        let b = crate::ws::Book { bids: vec![(99.0, 5.0), (98.0, 5.0)], asks: vec![(100.0, 1.0), (101.0, 2.0), (103.0, 10.0)], time_ms: 1_000_000 };
+        let s = snapshot(&b, true, 2.0, 1000.5);
+        assert_eq!(s["levels_used"], 2);
+        assert!((s["vwap_expected"].as_f64().unwrap() - 100.5).abs() < 1e-9 && s["filled"] == 1.0);
+        assert!((s["depth_usd"]["1%"].as_f64().unwrap() - 302.0).abs() < 1e-9 && s["age_ms"] == 500);
+        let sl = slippage(&s, 100.5, true, 100.0);
+        assert_eq!(sl["vs_best"], 50.0);
+        assert_eq!(sl["vs_vwap_expected"], 0.0);
+        // More than the book holds: the share it fills.
+        assert!((snapshot(&b, true, 26.0, 1000.0)["filled"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        assert!(message(&json!({"what": "skipped", "coin": "X", "why": "btc moved"})).is_none());
     }
 
     #[test]

@@ -50,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cfg: config::Config) -> anyhow::Result<()> {
+    // The start, to the chat (when it is set): the deploy's commit on Railway.
+    let commit = std::env::var("RAILWAY_GIT_COMMIT_SHA").ok().map(|c| c.chars().take(7).collect::<String>());
+    notify::send(format!("🚀 бот запущен{}", commit.map(|c| format!(", версия {c}")).unwrap_or_default()));
     let api = api::Api::new(cfg.weight_per_min)?;
     let (coins, _) = api.meta().await?;
     log!("{} perp coins", coins.len());

@@ -162,9 +162,19 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         // The day's note to the chat: alive, the equity, what it did.
         let (mut day_at, mut day_entries) = (now(), d.state.entries);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+        // The start's health check to the chat: once the books, the volumes and the equity are in
+        // (or what is missing after 2 min).
+        let started = now();
+        let mut checked = false;
         loop {
             tick.tick().await;
             let t = now();
+            if !checked && (d.health_ready() || t - started > 120.0) {
+                checked = true;
+                let h = d.health();
+                log!("dip: {}", h.replace('\n', " | "));
+                crate::notify::send(h);
+            }
             if t - vol_at >= VOLUME_EVERY_S {
                 match api.meta().await {
                     Ok((_, ctx)) => {
@@ -217,6 +227,34 @@ impl Dip {
             crate::notify::send(m);
         }
         self.store.event(ev);
+    }
+
+    fn health_ready(&self) -> bool {
+        self.equity > 0.0 && !self.volume.is_empty() && self.closes.0.len() >= 50 && self.closes.at("BTC", i64::MAX).is_some()
+    }
+
+    /// The start's check: what it sees, or what is missing.
+    fn health(&self) -> String {
+        let liquid = self.closes.0.keys().filter(|c| self.volume.get(*c).copied().unwrap_or(0.0) >= self.p.min_vol).count();
+        let mut missing = Vec::new();
+        if self.closes.0.len() < 50 { missing.push(format!("стаканы: видно только {} монет", self.closes.0.len())); }
+        if self.volume.is_empty() { missing.push("обороты монет не прочитаны".to_string()); }
+        if self.equity <= 0.0 { missing.push("депозит не прочитан (ключ / аккаунт?)".to_string()); }
+        if self.closes.at("BTC", i64::MAX).is_none() { missing.push("нет цены BTC".to_string()); }
+        let head = if missing.is_empty() { "✅ health check: всё работает" } else { "⚠️ health check: есть проблемы" };
+        let mut m = format!("{head}
+режим: {}{}
+монет в стаканах: {}, ликвидных (от ${:.0}M): {}
+депозит: ${:.2}, BTC: {}
+открыто позиций: {}, первый сигнал возможен через ~{} мин (нужна история цен)",
+            if self.p.dry { "только сигналы (DIP_DRY=1)" } else { "живая торговля" }, if self.venue.ex.mainnet() { ", mainnet" } else { ", TESTNET" },
+            self.closes.0.len(), self.p.min_vol / 1e6, liquid, self.equity, self.closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into()),
+            self.state.open.len(), self.p.window + 1);
+        for x in missing {
+            m.push_str(&format!("
+• {x}"));
+        }
+        m
     }
 
     fn save(&self) {

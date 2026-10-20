@@ -269,6 +269,9 @@ closes, held 60 min (`DIP_HOLD_MIN`) and sold at market, with a resting stop 20%
 trade); at most 3 open (`DIP_MAX_OPEN`), one a coin, a coin not again for 240 min
 (`DIP_COOLDOWN_MIN`); a coin the account holds otherwise is left alone. `DIP_DRY=1`: the signals
 only (events `signal`), no orders. State: the store's doc `dip`; events of kind `dip`.
+With `TELEGRAM_BOT_TOKEN` (a bot from @BotFather) and `TELEGRAM_CHAT_ID` each buy, sale, stop,
+error and skipped fall is a message in that chat (`src/notify.rs`), with one a day: the equity,
+the positions open, the buys of the day.
 
 The research behind it (2026-10-20, the archive 2025-05 .. 2026-10, the raw tape: our buy at the
 worst price of the first block a second after the signal, the taker fee both ways): +199 bp a

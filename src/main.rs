@@ -14,6 +14,7 @@ mod engine;
 mod exchange;
 mod liq;
 mod live;
+mod notify;
 mod report;
 mod rollstats;
 mod stable;

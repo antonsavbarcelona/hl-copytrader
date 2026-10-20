@@ -18,7 +18,9 @@
 //!
 //! Its state is the store's doc `dip` (the positions it holds, the coins' last entries): a restart
 //! keeps their timers. Every minute the account's positions are read: a position gone (its stop
-//! filled, a liquidation) ends ours. Events: kind `dip`.
+//! filled, a liquidation) ends ours. Events: kind `dip`; with `TELEGRAM_BOT_TOKEN` and
+//! `TELEGRAM_CHAT_ID` each entry, exit, stop, error and skipped fall goes to the chat too, and a
+//! note a day (`notify`).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -147,12 +149,18 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     if std::env::var("LIVE_ENABLED").unwrap_or_default().trim() == "1" {
         log!("dip: LIVE_ENABLED is on too: the copy's coins are left alone (one position a coin on the account)");
     }
+    crate::notify::send(format!("🤖 покупка падений запущена{} ({}), открыто {}
+сигнал: падение {:.0}% за {} мин (BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {:.1}% на сделку ({:.0}% депозита), до {} позиций",
+        if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
+        p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, p.risk * 100.0, p.risk / p.stop * 100.0, p.max_open));
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
         positions: HashMap::new(), equity: 0.0 };
     tokio::spawn(async move {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut vol_at = 0.0;
         let mut read_at = 0.0;
+        // The day's note to the chat: alive, the equity, what it did.
+        let (mut day_at, mut day_entries) = (now(), d.state.entries);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             tick.tick().await;
@@ -169,6 +177,11 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
             if t - read_at >= 60.0 {
                 read_at = t;
                 d.reconcile().await;
+            }
+            if t - day_at >= 86_400.0 && d.equity > 0.0 {
+                crate::notify::send(format!("📊 покупка падений работает: депозит ${:.2}, открыто {}, покупок за сутки {}",
+                    d.equity, d.state.open.len(), d.state.entries - day_entries));
+                (day_at, day_entries) = (t, d.state.entries);
             }
             // The minute's close so far: each coin's mid now.
             let minute = (t / 60.0).floor() as i64;
@@ -200,6 +213,9 @@ impl Dip {
         ev["kind"] = json!("dip");
         ev["at"] = json!(now());
         log!("dip: {ev}");
+        if let Some(m) = message(&ev) {
+            crate::notify::send(m);
+        }
         self.store.event(ev);
     }
 
@@ -354,6 +370,33 @@ impl Dip {
     }
 }
 
+/// An event as a chat message (None: not sent).
+fn message(ev: &Value) -> Option<String> {
+    let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
+    let coin = ev["coin"].as_str().unwrap_or("?");
+    let usd = |x: f64| if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) };
+    Some(match ev["what"].as_str()? {
+        "open" => format!("🟢 КУПИЛ {coin}: упала на {:.1}% (BTC {:+.1}%)
+цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
+            f("fall") * 100.0, f("btc") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
+        "close" => format!("{} ПРОДАЛ {coin} через {:.0} мин: {} -> {} ({:+.2}%), {}",
+            if f("pnl_approx") >= 0.0 { "✅" } else { "🔻" }, f("held_min"), f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_approx"))),
+        "stopped" => format!("🛑 СТОП {coin}: {} -> {}, примерно {}", f("entry_px"), f("stop_px"), usd(f("pnl_approx"))),
+        "error" => format!("⚠️ {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" => format!("👀 сигнал (без сделки) {coin}: упала на {:.1}% (BTC {:+.1}%), цена {}, купил бы на ${:.0}", f("fall") * 100.0, f("btc") * 100.0, f("mid"), f("notional")),
+        "skipped" => format!("⏭ {coin} упала на {:.1}%, не купил: {}", f("fall") * 100.0, match ev["why"].as_str().unwrap_or("") {
+            "at most open" => "уже открыто максимум позиций",
+            "held" => "уже держим эту монету",
+            "cooldown" => "по этой монете пауза после прошлой покупки",
+            "the account holds it otherwise" => "на аккаунте уже есть другая позиция в этой монете",
+            "equity not read yet" => "депозит ещё не прочитан",
+            x => x,
+        }),
+        "too small" => format!("⏭ {coin}: размер меньше минимума $10 (депозит ${:.0})", f("equity")),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +418,12 @@ mod tests {
             c.update("X", m, 9.0, 20);
         }
         assert_eq!(c.0["X"].len(), 20);
+    }
+
+    #[test]
+    fn events_read_as_messages() {
+        let m = message(&json!({"what": "close", "coin": "ZEC", "entry_px": 100.0, "px": 103.0, "ret_pct": 3.0, "pnl_approx": 7.5, "held_min": 60.0})).unwrap();
+        assert!(m.contains("ZEC") && m.contains("+3.00%") && m.contains("+$7.50") && m.contains("ПРОДАЛ"));
+        assert!(message(&json!({"what": "stop", "coin": "ZEC"})).is_none());
     }
 }

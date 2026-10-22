@@ -1,6 +1,7 @@
 //! Paper copy-trading of Hyperliquid accounts that make money steadily (picked daily, see
 //! `stable`), $1000 copy account each, following their trades against the live books with a
-//! 2% risk per entry to a 20% stop (see `engine`).
+//! 2% risk per entry to a 20% stop (see `engine`). Only with `PAPER_ENABLED=1` (off since
+//! 2026-10-22); without it `run` is the dip-buy alone (see `dip`).
 //!
 //!     hl-copytrader run    [--data DIR] [--start 1000] [--risk 2] [--stop 20] [--delay-ms 0] [--weight 400]
 //!     hl-copytrader report [--data DIR] [--min-fills 10] [--top 30]
@@ -58,6 +59,18 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     log!("{} perp coins", coins.len());
     let names: Vec<String> = coins.iter().map(|c| c.name.clone()).collect();
     let books: ws::Books = Default::default();
+    spawn_clock_sync(api.clone());
+    // The paper copy (the traders' copy accounts, the allocator's portfolios, and the live copy that
+    // rides on them) only with PAPER_ENABLED=1: switched off 2026-10-22, the dip-buy trades alone.
+    if std::env::var("PAPER_ENABLED").unwrap_or_default().trim() != "1" {
+        log!("paper: the paper copy is off (PAPER_ENABLED=1 to run it); the dip-buy only");
+        let store = store::open(&cfg).await?;
+        dip::start(&cfg, store, api.clone(), books.clone()).await?;
+        tokio::spawn(ws::run_books(names, books));
+        shutdown_signal().await;
+        log!("stopped");
+        return Ok(());
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     let traders = store::load(&cfg).await?;
     let selection = store::load_selection(&cfg).await?;
@@ -78,19 +91,6 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let followed = engine.followed.clone();
     rollstats::spawn(cfg.clone(), tx.clone());
 
-    // Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
-    {
-        let api = api.clone();
-        tokio::spawn(async move {
-            loop {
-                match api.sync_clock().await {
-                    Ok((offset, rtt)) => log!("clock: exchange {offset:+.3} s vs ours, API round trip {:.0} ms", rtt * 1000.0),
-                    Err(e) => log!("clock sync failed: {e}"),
-                }
-                tokio::time::sleep(Duration::from_secs(600)).await;
-            }
-        });
-    }
     // Leaderboard now and every 6 h: round 1 from it (the saved list until then), and the
     // larger accounts for the liquidation research (off unless LIQ_ENABLED=1: switched off
     // 2026-10-14, all four strategies at a loss on its ~54 touches).
@@ -177,19 +177,37 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     {
         let tx = tx.clone();
         tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             let _ = tx.send(engine::Msg::Shutdown);
         });
     }
     engine.run(rx).await;
     Ok(())
+}
+
+/// Our clock against the exchange's, now and every 10 min (lags are measured on its clock).
+fn spawn_clock_sync(api: api::Api) {
+    tokio::spawn(async move {
+        loop {
+            match api.sync_clock().await {
+                Ok((offset, rtt)) => log!("clock: exchange {offset:+.3} s vs ours, API round trip {:.0} ms", rtt * 1000.0),
+                Err(e) => log!("clock sync failed: {e}"),
+            }
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
+    });
+}
+
+/// Ctrl-C, or SIGTERM (docker stop, systemd, a Railway redeploy).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }

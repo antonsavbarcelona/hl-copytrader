@@ -198,7 +198,7 @@ fn spawn_clock_sync(api: api::Api) {
     });
 }
 
-/// Ctrl-C, or SIGTERM (docker stop, systemd, a Railway redeploy).
+/// Ctrl-C, or SIGTERM (docker stop, systemd, a Railway redeploy): the process exits cleanly.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {

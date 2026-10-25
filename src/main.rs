@@ -13,6 +13,7 @@ mod config;
 mod dip;
 mod engine;
 mod exchange;
+mod hip3;
 mod liq;
 mod live;
 mod notify;
@@ -65,7 +66,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     if std::env::var("PAPER_ENABLED").unwrap_or_default().trim() != "1" {
         log!("paper: the paper copy is off (PAPER_ENABLED=1 to run it); the dip-buy only");
         let store = store::open(&cfg).await?;
-        dip::start(&cfg, store, api.clone(), books.clone()).await?;
+        dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
+        hip3::start(&cfg, store, api.clone()).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
         log!("stopped");
@@ -79,6 +81,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let live = live::start(&cfg, store.clone(), false, Some(books.clone())).await?;
     // The dip-buy on the same account (off unless DIP_ENABLED=1): its own positions, on the books.
     dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
+    hip3::start(&cfg, store.clone(), api.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

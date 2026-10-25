@@ -179,6 +179,28 @@ impl Api {
         Ok((coins, ctx))
     }
 
+    /// The HIP-3 perp dexes' names (the main dex left out).
+    pub async fn dexes(&self) -> Result<Vec<String>> {
+        let v = self.info(json!({"type": "perpDexs"}), 20).await?;
+        Ok(v.as_array().into_iter().flatten().filter_map(|d| d["name"].as_str().map(String::from)).collect())
+    }
+
+    /// Every coin's mid on a dex ("" for the main one).
+    pub async fn mids(&self, dex: &str) -> Result<HashMap<String, f64>> {
+        let body = if dex.is_empty() { json!({"type": "allMids"}) } else { json!({"type": "allMids", "dex": dex}) };
+        let v = self.info(body, 2).await?;
+        Ok(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect())
+    }
+
+    /// A HIP-3 dex's coins and their day volume ($).
+    pub async fn dex_volumes(&self, dex: &str) -> Result<HashMap<String, f64>> {
+        let v = self.info(json!({"type": "metaAndAssetCtxs", "dex": dex}), 20).await?;
+        let universe = v[0]["universe"].as_array().cloned().unwrap_or_default();
+        let ctxs = v[1].as_array().cloned().unwrap_or_default();
+        Ok(universe.iter().zip(ctxs.iter()).filter(|(u, _)| !u["isDelisted"].as_bool().unwrap_or(false))
+            .filter_map(|(u, c)| Some((u["name"].as_str()?.to_string(), num(&c["dayNtlVlm"])))).collect())
+    }
+
     pub async fn account(&self, user: &str) -> Result<AccountState> {
         let v = self.info(json!({"type": "clearinghouseState", "user": user}), 2).await?;
         let mut positions = HashMap::new();

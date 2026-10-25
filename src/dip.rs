@@ -29,6 +29,18 @@
 //! neighbouring setting (5-8%, 5-15 min, 1-4 h) in profit, and a walk-forward choice of the
 //! setting too. Fading rises the same way loses: their tails are fatal.
 //!
+//! The same family's other side (`PUMP_ENABLED=1`, off by default; DIP V1 above is untouched by
+//! it): a perp with `PUMP_MIN_VOL_USD` (10M) or more a day, traded `PUMP_MIN_AGE_DAYS` (14)+, whose
+//! mid rose `PUMP_RISE_PCT` (20) or more over the same window is shorted at market; out at market
+//! `PUMP_HOLD_MIN` (120) later, no take, a resting stop `PUMP_STOP_PCT` (50) above our fill, sized
+//! so that it loses `PUMP_RISK_PCT` (10) of the equity (a short of 20%); at most `PUMP_MAX_OPEN`
+//! (3), a coin not again for 240 min after its move of the rise either way. The archive research
+//! of 2026-10-25 (the raw tape, the short at the worst price of the first block a second after):
+//! ~34 such pumps over 16 months, +6.7% a trade over 2 h, ~+47% reinvested at that risk, the
+//! drawdown with the open ~16%; the worst ran +139% against (the stop's case). `PUMP_DRY=1`: the
+//! signals only (event `pump_signal`, and `pump_dry_result` 2 h and 4 h later with the short's
+//! result at the mid).
+//!
 //! Its state is the store's doc `dip` (the positions it holds, the coins' last entries): a restart
 //! keeps their timers. Every minute the account's positions are read: a position gone (its stop
 //! filled, a liquidation) ends ours. Events: kind `dip`; with `TELEGRAM_BOT_TOKEN` and
@@ -72,15 +84,34 @@ struct Params {
     max_open: usize,
     cooldown_s: f64,
     dry: bool,
+    pump: PumpParams,
+}
+
+/// The pump short's settings (see the module).
+#[derive(Clone, Debug)]
+struct PumpParams {
+    enabled: bool,
+    dry: bool,
+    rise: f64,
+    min_vol: f64,
+    min_age_days: f64,
+    hold_s: f64,
+    stop: f64,
+    risk: f64,
+    max_open: usize,
 }
 
 impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let on = |k: &str| std::env::var(k).unwrap_or_default().trim() == "1";
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
             min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 60.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
-            dry: std::env::var("DIP_DRY").unwrap_or_default().trim() == "1" }
+            dry: on("DIP_DRY"),
+            pump: PumpParams { enabled: on("PUMP_ENABLED"), dry: on("PUMP_DRY"), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
+                min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 120.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
+                risk: v("PUMP_RISK_PCT", 10.0) / 100.0, max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
     }
 }
 
@@ -91,8 +122,22 @@ struct Pos {
     opened: f64,
     stop_px: f64,
     stop_oid: Option<u64>,
-    /// The fall that triggered it (a fraction, negative).
+    /// The fall that triggered it (a fraction, negative); for a pump short, the rise (positive).
     fall: f64,
+    /// A pump short (its size negative, its stop above, its own hold).
+    #[serde(default)]
+    pump: bool,
+}
+
+/// A pump signal of `PUMP_DRY=1`: its result is logged 2 h and 4 h on.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DryPump {
+    coin: String,
+    at: f64,
+    mid: f64,
+    rise: f64,
+    /// The results logged so far (1: 2 h, 2: 2 h and 4 h).
+    done: u8,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -104,6 +149,11 @@ struct State {
     /// A coin's last move of `drop`+ either way (the minute) that started a cooldown: see `cooled`.
     #[serde(default)]
     last_move: HashMap<String, i64>,
+    /// The same for the pump short's rise (its own threshold).
+    #[serde(default)]
+    last_pump_move: HashMap<String, i64>,
+    #[serde(default)]
+    dry_pumps: Vec<DryPump>,
 }
 
 /// The archive research's cooldown (`moves.py`, the 198 falls of V1): a coin's move of the drop or
@@ -165,6 +215,8 @@ struct Dip {
     books: crate::ws::Books,
     /// The breadth and the index (all the liquid coins), a sample a second, the last 70 s.
     regime_hist: VecDeque<(f64, f64, f64)>,
+    /// Whether a coin has traded `PUMP_MIN_AGE_DAYS`+ (its daily candles), read at its first pump.
+    old_enough: HashMap<String, bool>,
 }
 
 /// Starts the dip-buy if `DIP_ENABLED` is "1" and the live account is set (see the module).
@@ -189,8 +241,19 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
 сигнал: падение {:.0}% за {} мин (BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {:.1}% на сделку ({:.0}% депозита), до {} позиций",
         if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
         p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, p.risk * 100.0, p.risk / p.stop * 100.0, p.max_open));
+    let q = &p.pump;
+    if q.enabled {
+        log!("dip: the pump short is on{}: a rise of {:.0}% in {} min (${:.0}M+ a day, {:.0}+ days traded), {:.0} min hold, stop {:.0}%, risk {:.1}% ({:.0}% of the equity a trade), at most {}",
+            if q.dry { " (DRY: signals only)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0, q.risk * 100.0, q.risk / q.stop * 100.0, q.max_open);
+        crate::notify::send(format!("🔻 шорт пампов запущен{}
+сигнал: рост {:.0}% за {} мин (оборот от ${:.0}M, монете {:.0}+ дней), держим {:.0} мин, без тейка, стоп +{:.0}%, риск {:.1}% на сделку ({:.0}% депозита), до {} позиций",
+            if q.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0,
+            q.risk * 100.0, q.risk / q.stop * 100.0, q.max_open));
+    } else {
+        log!("dip: the pump short is off (PUMP_ENABLED=1 to run it)");
+    }
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
-        positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new() };
+        positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new() };
     tokio::spawn(async move {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut vol_at = 0.0;
@@ -324,6 +387,10 @@ impl Dip {
             if self.p.dry { "только сигналы (DIP_DRY=1)" } else { "живая торговля" }, if self.venue.ex.mainnet() { ", mainnet" } else { ", TESTNET" },
             self.closes.0.len(), self.p.min_vol / 1e6, liquid, self.equity, self.closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into()),
             self.state.open.len(), self.p.window + 1);
+        if self.p.pump.enabled {
+            m.push_str(&format!("
+шорт пампов: {}", if self.p.pump.dry { "только сигналы (PUMP_DRY=1)" } else { "живая торговля" }));
+        }
         for x in missing {
             m.push_str(&format!("
 • {x}"));
@@ -365,7 +432,7 @@ impl Dip {
             let t = now();
             let why = if btc.abs() >= self.p.btc_max {
                 Some("btc moved")
-            } else if self.state.open.len() >= self.p.max_open {
+            } else if self.state.open.values().filter(|p| !p.pump).count() >= self.p.max_open {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
@@ -385,6 +452,155 @@ impl Dip {
                 continue;
             }
             self.enter(&coin, fall, btc, delay_ms).await;
+        }
+        if self.p.pump.enabled {
+            self.pumps(minute, delay_ms).await;
+        }
+    }
+
+    /// The pump short (see the module): the rises of the minute that closed, biggest first,
+    /// shorted within its own limits (its own cooldown and count; the dip's untouched).
+    async fn pumps(&mut self, minute: i64, delay_ms: u64) {
+        let q = self.p.pump.clone();
+        let cooldown_min = (self.p.cooldown_s / 60.0).round() as i64;
+        let movers: Vec<String> = self.closes.0.keys()
+            .filter(|c| self.closes.change(c, minute, self.p.window).is_some_and(|r| r.abs() >= q.rise))
+            .cloned().collect();
+        let in_cooldown: std::collections::HashSet<String> = movers.into_iter()
+            .filter(|c| cooled(&mut self.state.last_pump_move, c, minute, cooldown_min)).collect();
+        if self.state.last_pump_move.values().any(|m| *m == minute) {
+            self.state.last_pump_move.retain(|_, m| minute - *m < cooldown_min);
+            self.save();
+        }
+        let mut rises: Vec<(String, f64)> = self.closes.0.keys()
+            .filter(|c| self.venue.coins.contains_key(*c) && self.volume.get(*c).copied().unwrap_or(0.0) >= q.min_vol)
+            .filter_map(|c| Some((c.clone(), self.closes.change(c, minute, self.p.window)?)))
+            .filter(|(_, r)| *r >= q.rise).collect();
+        rises.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (coin, rise) in rises {
+            let open_pumps = self.state.open.values().filter(|p| p.pump).count();
+            let why = if open_pumps >= q.max_open {
+                Some("at most open")
+            } else if self.state.open.contains_key(&coin) {
+                Some("held")
+            } else if in_cooldown.contains(&coin) {
+                Some("cooldown")
+            } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
+                Some("the account holds it otherwise")
+            } else if self.equity <= 0.0 {
+                Some("equity not read yet")
+            } else if !self.old_enough(&coin, q.min_age_days).await {
+                Some("too new")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                let size = self.pump_size(&coin);
+                self.event(json!({"what": "pump_skipped", "family": "pump", "coin": coin, "rise": rise, "why": why, "signal_delay_ms": delay_ms,
+                    "book": self.book(&coin, false, size)}));
+                continue;
+            }
+            self.enter_pump(&coin, rise, delay_ms).await;
+        }
+    }
+
+    /// Whether `coin` has daily candles `days` or more back (cached once true).
+    async fn old_enough(&mut self, coin: &str, days: f64) -> bool {
+        if self.old_enough.get(coin) == Some(&true) {
+            return true;
+        }
+        let t = now();
+        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
+            "startTime": ((t - (days + 10.0) * 86_400.0) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
+        let ok = match r {
+            Ok(v) => v.as_array().and_then(|a| a.first()).and_then(|c| c["t"].as_f64()).is_some_and(|first| first / 1000.0 <= t - days * 86_400.0),
+            Err(e) => {
+                log!("dip: {coin} candles not read (the pump skipped): {e:#}");
+                false
+            }
+        };
+        self.old_enough.insert(coin.to_string(), ok);
+        ok
+    }
+
+    /// The pump short's size in `coin` now (positive; 0 without a mid): its stop loses `PUMP_RISK_PCT`.
+    fn pump_size(&self, coin: &str) -> f64 {
+        match (self.closes.at(coin, i64::MAX), self.venue.coins.get(coin)) {
+            (Some(mid), Some(&(_, dec))) if self.equity > 0.0 => round_size(self.p.pump.risk / self.p.pump.stop * self.equity / mid, dec),
+            _ => 0.0,
+        }
+    }
+
+    async fn enter_pump(&mut self, coin: &str, rise: f64, delay_ms: u64) {
+        let Some(mid) = self.closes.at(coin, i64::MAX) else { return };
+        let q = self.p.pump.clone();
+        let size = self.pump_size(coin);
+        let book = self.book(coin, false, size);
+        if size * mid < MIN_ORDER_USD {
+            self.event(json!({"what": "too small", "family": "pump", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book}));
+            return;
+        }
+        if q.dry {
+            self.state.dry_pumps.push(DryPump { coin: coin.to_string(), at: now(), mid, rise, done: 0 });
+            self.event(json!({"what": "pump_signal", "family": "pump", "coin": coin, "rise": rise, "mid": mid, "size": size, "notional": size * mid,
+                "equity": self.equity, "signal_delay_ms": delay_ms, "book": book}));
+            self.save();
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let (got, px, oid) = match self.venue.market(coin, -size, false).await {
+            Ok(x) if x.0 < 0.0 => x,
+            Ok(_) => {
+                self.event(json!({"what": "error", "family": "pump", "coin": coin, "error": "nothing filled", "signal_delay_ms": delay_ms, "book": book}));
+                return;
+            }
+            Err(e) => {
+                self.event(json!({"what": "error", "family": "pump", "coin": coin, "error": format!("{e:#}"), "signal_delay_ms": delay_ms, "book": book}));
+                return;
+            }
+        };
+        let order_ms = t0.elapsed().as_millis() as u64;
+        let stop_px = px * (1.0 + q.stop);
+        let stop_oid = match self.venue.stop(coin, -1.0, got.abs(), stop_px).await {
+            Ok(o) => Some(o),
+            Err(e) => {
+                log!("dip: {coin} the pump short's stop not placed (the next check places it): {e:#}");
+                None
+            }
+        };
+        let t = now();
+        self.state.open.insert(coin.to_string(), Pos { size: got, entry_px: px, opened: t, stop_px, stop_oid, fall: rise, pump: true });
+        self.positions.insert(coin.to_string(), got);
+        self.event(json!({"what": "pump_open", "family": "pump", "coin": coin, "rise": rise, "size": got, "px": px, "notional": got.abs() * px,
+            "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "oid": oid, "signal_mid": mid,
+            "fee_est": got.abs() * px * TAKER_FEE, "slippage": slippage(&book, px, false, mid),
+            "delays_ms": {"signal_to_decision": delay_ms, "order": order_ms, "book_age": book["age_ms"]}, "book": book}));
+        self.fills(coin, oid, "pump_open");
+        self.save();
+    }
+
+    /// The `PUMP_DRY=1` signals' results at the mid, one hold and two holds on.
+    fn dry_results(&mut self) {
+        let (t, hold) = (now(), self.p.pump.hold_s);
+        let mut changed = false;
+        let mut evs = Vec::new();
+        for d in self.state.dry_pumps.iter_mut() {
+            if d.done >= 2 || t - d.at < hold * (d.done + 1) as f64 {
+                continue;
+            }
+            d.done += 1;
+            changed = true;
+            if let Some(m) = self.closes.at(&d.coin, i64::MAX) {
+                evs.push(json!({"what": "pump_dry_result", "family": "pump", "coin": d.coin, "rise": d.rise, "mid_signal": d.mid, "mid": m,
+                    "after_min": (t - d.at) / 60.0, "ret_pct": (1.0 - m / d.mid) * 100.0}));
+            }
+        }
+        if changed {
+            self.state.dry_pumps.retain(|d| d.done < 2);
+            for ev in evs {
+                self.event(ev);
+            }
+            self.save();
         }
     }
 
@@ -442,7 +658,7 @@ impl Dip {
             }
         };
         let t = now();
-        self.state.open.insert(coin.to_string(), Pos { size: got, entry_px: px, opened: t, stop_px, stop_oid, fall });
+        self.state.open.insert(coin.to_string(), Pos { size: got, entry_px: px, opened: t, stop_px, stop_oid, fall, pump: false });
         self.state.last_entry.insert(coin.to_string(), t);
         self.state.entries += 1;
         self.positions.insert(coin.to_string(), got);
@@ -485,9 +701,14 @@ impl Dip {
     /// The positions whose hold is over: out at market, their stops cancelled.
     async fn exits(&mut self) {
         let t = now();
-        let due: Vec<(String, Pos)> = self.state.open.iter().filter(|(_, p)| t - p.opened >= self.p.hold_s).map(|(c, p)| (c.clone(), p.clone())).collect();
+        if !self.state.dry_pumps.is_empty() {
+            self.dry_results();
+        }
+        let due: Vec<(String, Pos)> = self.state.open.iter().filter(|(_, p)| t - p.opened >= if p.pump { self.p.pump.hold_s } else { self.p.hold_s })
+            .map(|(c, p)| (c.clone(), p.clone())).collect();
         for (coin, p) in due {
-            let book = self.book(&coin, false, p.size);
+            // A long sells into the bids; a pump short buys back from the asks.
+            let book = self.book(&coin, p.pump, p.size.abs());
             let mid = self.closes.at(&coin, i64::MAX).unwrap_or(0.0);
             let t0 = std::time::Instant::now();
             match self.venue.market(&coin, -p.size, true).await {
@@ -498,10 +719,14 @@ impl Dip {
                     }
                     self.state.open.remove(&coin);
                     self.positions.remove(&coin);
-                    self.event(json!({"what": "close", "why": "hold", "coin": coin, "size": got, "px": px, "entry_px": p.entry_px,
-                        "pnl_approx": p.size * (px - p.entry_px), "ret_pct": (px / p.entry_px - 1.0) * 100.0, "held_min": (t - p.opened) / 60.0,
-                        "fee_est": got.abs() * px * TAKER_FEE, "slippage": slippage(&book, px, false, mid), "delays_ms": {"order": order_ms, "book_age": book["age_ms"]},
-                        "oid": oid, "book": book}));
+                    let mut ev = json!({"what": "close", "why": "hold", "coin": coin, "size": got, "px": px, "entry_px": p.entry_px,
+                        "pnl_approx": p.size * (px - p.entry_px), "ret_pct": (px / p.entry_px - 1.0) * 100.0 * p.size.signum(), "held_min": (t - p.opened) / 60.0,
+                        "fee_est": got.abs() * px * TAKER_FEE, "slippage": slippage(&book, px, p.pump, mid), "delays_ms": {"order": order_ms, "book_age": book["age_ms"]},
+                        "oid": oid, "book": book});
+                    if p.pump {
+                        ev["family"] = json!("pump");
+                    }
+                    self.event(ev);
                     self.fills(&coin, oid, "close");
                     self.save();
                 }
@@ -532,13 +757,17 @@ impl Dip {
         let mut changed = false;
         for (coin, p) in self.state.open.clone() {
             let held = self.positions.get(&coin).copied().unwrap_or(0.0);
-            if held <= 0.0 {
+            if gone(held, p.size) {
                 self.state.open.remove(&coin);
-                self.event(json!({"what": "stopped", "coin": coin, "size_was": p.size, "entry_px": p.entry_px, "stop_px": p.stop_px,
-                    "pnl_approx": p.size * (p.stop_px - p.entry_px)}));
+                let mut ev = json!({"what": "stopped", "coin": coin, "size_was": p.size, "entry_px": p.entry_px, "stop_px": p.stop_px,
+                    "pnl_approx": p.size * (p.stop_px - p.entry_px)});
+                if p.pump {
+                    ev["family"] = json!("pump");
+                }
+                self.event(ev);
                 changed = true;
             } else if p.stop_oid.is_none() {
-                if let Ok(o) = self.venue.stop(&coin, 1.0, p.size.min(held), p.stop_px).await {
+                if let Ok(o) = self.venue.stop(&coin, p.size.signum(), p.size.abs().min(held.abs()), p.stop_px).await {
                     if let Some(x) = self.state.open.get_mut(&coin) {
                         x.stop_oid = Some(o);
                     }
@@ -550,6 +779,11 @@ impl Dip {
             self.save();
         }
     }
+}
+
+/// Our position of `size` (signed) gone from the account's `held` (a stop, a liquidation, closed).
+fn gone(held: f64, size: f64) -> bool {
+    held * size.signum() <= 0.0
 }
 
 /// A book for an order of `size` (`buy`: against the asks): best bid / ask, the spread (bp), the
@@ -597,9 +831,25 @@ fn message(ev: &Value) -> Option<String> {
         "open" => format!("🟢 КУПИЛ {coin}: упала на {:.1}% (BTC {:+.1}%)
 цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
             f("fall") * 100.0, f("btc") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
-        "close" => format!("{} ПРОДАЛ {coin} через {:.0} мин: {} -> {} ({:+.2}%), {}",
-            if f("pnl_approx") >= 0.0 { "✅" } else { "🔻" }, f("held_min"), f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_approx"))),
-        "stopped" => format!("🛑 СТОП {coin}: {} -> {}, примерно {}", f("entry_px"), f("stop_px"), usd(f("pnl_approx"))),
+        "close" => format!("{} {} {coin} через {:.0} мин: {} -> {} ({:+.2}%), {}",
+            if f("pnl_approx") >= 0.0 { "✅" } else { "🔻" }, if ev["family"] == "pump" { "ЗАКРЫЛ ШОРТ" } else { "ПРОДАЛ" },
+            f("held_min"), f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_approx"))),
+        "stopped" => format!("🛑 СТОП{} {coin}: {} -> {}, примерно {}", if ev["family"] == "pump" { " ШОРТА" } else { "" }, f("entry_px"), f("stop_px"), usd(f("pnl_approx"))),
+        "pump_open" => format!("🔴 ШОРТ {coin}: выросла на {:.1}% за 15 мин
+цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
+            f("rise") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
+        "pump_signal" => format!("👀 сигнал шорта (без сделки) {coin}: выросла на {:.1}%, цена {}, шортил бы на ${:.0}", f("rise") * 100.0, f("mid"), f("notional")),
+        "pump_dry_result" => format!("{} итог сигнала шорта {coin} через {:.0} мин: {} -> {} ({:+.2}% для шорта)",
+            if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),
+        "pump_skipped" if ev["why"] == "cooldown" => return None,
+        "pump_skipped" => format!("⏭ {coin} выросла на {:.1}%, не шортил: {}", f("rise") * 100.0, match ev["why"].as_str().unwrap_or("") {
+            "at most open" => "уже открыто максимум шортов",
+            "held" => "уже держим эту монету",
+            "the account holds it otherwise" => "на аккаунте уже есть другая позиция в этой монете",
+            "equity not read yet" => "депозит ещё не прочитан",
+            "too new" => "монета торгуется меньше 14 дней",
+            x => x,
+        }),
         "error" => format!("⚠️ {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("👀 сигнал (без сделки) {coin}: упала на {:.1}% (BTC {:+.1}%), цена {}, купил бы на ${:.0}", f("fall") * 100.0, f("btc") * 100.0, f("mid"), f("notional")),
         "skipped" if ev["why"] == "btc moved" => return None,
@@ -666,6 +916,20 @@ mod tests {
         // More than the book holds: the share it fills.
         assert!((snapshot(&b, true, 26.0, 1000.0)["filled"].as_f64().unwrap() - 0.5).abs() < 1e-9);
         assert!(message(&json!({"what": "skipped", "coin": "X", "why": "btc moved"})).is_none());
+    }
+
+    #[test]
+    fn a_pump_short_is_gone_or_held_by_its_sign() {
+        assert!(!gone(-5.0, -5.0) && !gone(-2.0, -5.0));      // the short still on (part of it)
+        assert!(gone(0.0, -5.0) && gone(3.0, -5.0));          // closed, or the account now long
+        assert!(!gone(5.0, 5.0) && gone(0.0, 5.0));           // a dip long as before
+        let p: Pos = serde_json::from_value(json!({"size": 1.0, "entry_px": 2.0, "opened": 0.0, "stop_px": 1.6, "stop_oid": null, "fall": -0.09})).unwrap();
+        assert!(!p.pump);                                     // the old state: a dip long
+        let m = message(&json!({"what": "pump_open", "coin": "XYZ", "rise": 0.23, "px": 1.5, "notional": 200.0, "equity": 1000.0, "stop_px": 2.25})).unwrap();
+        assert!(m.contains("ШОРТ XYZ") && m.contains("23.0%") && m.contains("20%"));
+        let m = message(&json!({"what": "close", "family": "pump", "coin": "XYZ", "entry_px": 1.5, "px": 1.35, "ret_pct": 10.0, "pnl_approx": 20.0, "held_min": 120.0})).unwrap();
+        assert!(m.contains("ЗАКРЫЛ ШОРТ") && m.contains("+10.00%"));
+        assert!(message(&json!({"what": "pump_skipped", "coin": "XYZ", "rise": 0.2, "why": "cooldown"})).is_none());
     }
 
     #[test]

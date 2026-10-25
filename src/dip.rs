@@ -5,8 +5,10 @@
 //! the market's), is bought at market as its minute closes; out at market `DIP_HOLD_MIN` (60)
 //! later, with a resting stop `DIP_STOP_PCT` (20) under our fill; sized so that the stop loses
 //! `DIP_RISK_PCT` (5) of the account's equity (the notional risk / stop: 25%); at most
-//! `DIP_MAX_OPEN` (3) open, one a coin, a coin not again for `DIP_COOLDOWN_MIN` (240); a coin the
-//! account holds otherwise (the copy's legs) is left alone. `DIP_DRY=1`: the signals only (events
+//! `DIP_MAX_OPEN` (3) open, one a coin, a coin not again for `DIP_COOLDOWN_MIN` (240) after its
+//! move of the drop or more either way (a rise, a fall on any volume: as in the research, see
+//! `cooled`; from 2026-10-25, before it only after our entries) or our entry; a coin the account
+//! holds otherwise (the copy's legs) is left alone. `DIP_DRY=1`: the signals only (events
 //! `signal`), no orders.
 //!
 //! DIP V1: these settings are frozen as of 2026-10-20 (no further fitting on the history; the
@@ -99,6 +101,21 @@ struct State {
     /// A coin's last entry (unix s): the cooldown.
     last_entry: HashMap<String, f64>,
     entries: u64,
+    /// A coin's last move of `drop`+ either way (the minute) that started a cooldown: see `cooled`.
+    #[serde(default)]
+    last_move: HashMap<String, i64>,
+}
+
+/// The archive research's cooldown (`moves.py`, the 198 falls of V1): a coin's move of the drop or
+/// more either way over the window (any volume, whatever BTC did) starts `cooldown_min` in which
+/// its falls are not bought; the moves inside it don't restart it. Whether `coin`, moving that
+/// much at `minute`, is in one (else this move starts one).
+fn cooled(last_move: &mut HashMap<String, i64>, coin: &str, minute: i64, cooldown_min: i64) -> bool {
+    if last_move.get(coin).is_some_and(|m| minute - m < cooldown_min) {
+        return true;
+    }
+    last_move.insert(coin.to_string(), minute);
+    false
 }
 
 /// Each coin's last minutes' closes (minute index, the last mid seen in it).
@@ -328,6 +345,17 @@ impl Dip {
         let Some(btc) = self.closes.change("BTC", minute, self.p.window) else { return };
         let decided = now();
         let delay_ms = ((decided - (minute + 1) as f64 * 60.0) * 1000.0).max(0.0) as u64;
+        // Every coin's move of the drop either way, before the filters: the research's cooldown.
+        let movers: Vec<String> = self.closes.0.keys()
+            .filter(|c| self.closes.change(c, minute, self.p.window).is_some_and(|r| r.abs() >= self.p.drop))
+            .cloned().collect();
+        let cooldown_min = (self.p.cooldown_s / 60.0).round() as i64;
+        let in_cooldown: std::collections::HashSet<String> = movers.into_iter()
+            .filter(|c| cooled(&mut self.state.last_move, c, minute, cooldown_min)).collect();
+        if !self.state.last_move.is_empty() && self.state.last_move.values().any(|m| *m == minute) {
+            self.state.last_move.retain(|_, m| minute - *m < cooldown_min);
+            self.save();
+        }
         let mut falls: Vec<(String, f64)> = self.closes.0.keys()
             .filter(|c| self.venue.coins.contains_key(*c) && self.volume.get(*c).copied().unwrap_or(0.0) >= self.p.min_vol)
             .filter_map(|c| Some((c.clone(), self.closes.change(c, minute, self.p.window)?)))
@@ -341,7 +369,7 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
-            } else if self.state.last_entry.get(&coin).is_some_and(|x| t - x < self.p.cooldown_s) {
+            } else if in_cooldown.contains(&coin) || self.state.last_entry.get(&coin).is_some_and(|x| t - x < self.p.cooldown_s) {
                 Some("cooldown")
             } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
                 Some("the account holds it otherwise")
@@ -609,6 +637,20 @@ mod tests {
             c.update("X", m, 9.0, 20);
         }
         assert_eq!(c.0["X"].len(), 20);
+    }
+
+    #[test]
+    fn a_move_either_way_cools_the_coin_down_from_its_first_minute() {
+        let mut last = HashMap::new();
+        assert!(!cooled(&mut last, "X", 1000, 240));        // a rise: starts the cooldown
+        assert!(cooled(&mut last, "X", 1001, 240));         // the fall a minute later: not bought
+        assert!(cooled(&mut last, "X", 1239, 240));         // still inside, and not restarted by the moves in it
+        assert!(!cooled(&mut last, "X", 1240, 240));        // 240 min after the first: a signal again
+        assert_eq!(last["X"], 1240);
+        assert!(!cooled(&mut last, "Y", 1001, 240));        // per coin
+        // The old state (no `last_move`) still reads.
+        let s: State = serde_json::from_value(json!({"open": {}, "last_entry": {}, "entries": 3})).unwrap();
+        assert!(s.last_move.is_empty() && s.entries == 3);
     }
 
     #[test]

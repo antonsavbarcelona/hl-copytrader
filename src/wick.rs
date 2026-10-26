@@ -1,7 +1,7 @@
 //! The wick bids (`WICK_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
-//! a resting buy `WICK_PCT` (8) under each liquid perp's anchor - the last minute's close, or its
+//! a resting buy `WICK_PCT` (7) under each liquid perp's anchor - the last minute's close, or its
 //! oracle when lower - on the `WICK_MAX_COINS` (20) coins with the most day volume of
-//! `WICK_MIN_VOL_USD` (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (5) under the
+//! `WICK_MIN_VOL_USD` (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the
 //! last minute's close on the `WICK_H3_MAX_COINS` (5; 0: none) with `WICK_H3_MIN_VOL_USD` (1M)+ (hyna,
 //! the crypto copies, left out). A bid moves when its level drifts `WICK_REPRICE_PCT` (2) or more
 //! (the address's rate limit: not every minute); the crypto bids come off while BTC moves 1%+ in a
@@ -16,6 +16,9 @@
 //! bid; maker in, the take maker, else taker out): crypto 8% $10M+ n 188 +328 bp a trade, halves
 //! +368 / +275; HIP-3 5% $1M+ n 309 +257 bp, t 7.4, 12 of 12 months up. Resting bids tie up margin
 //! (the HIP-3 ones isolated at 3x: a third of each bid's notional).
+//! The levels 2026-10-26 (the tape, the bot's trading at $20 risk, 2 slots): crypto 7% 13 trades a month
+//! +234 bp, $513 / 16 months (8%: 10, +273 bp, $428; 6% fails its first half); HIP-3 4% 43 a month
+//! +158 bp, $747 / 11 months, 12 of 12 months up (5%: 28, +257 bp, $784): more trades, the same $.
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -63,8 +66,8 @@ struct Params {
 impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
-        Params { pct: v("WICK_PCT", 8.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 20.0) as usize,
-            h3_pct: v("WICK_H3_PCT", 5.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 5.0) as usize,
+        Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 20.0) as usize,
+            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 5.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten() }

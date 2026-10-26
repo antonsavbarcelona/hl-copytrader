@@ -692,7 +692,14 @@ pub async fn save_live_check(cfg: &Config, rec: &Value) -> Result<()> {
 
 /// TLS when the URL asks for it (`sslmode=require` / `verify-ca` / `verify-full`, as hosted
 /// databases do), plain otherwise (e.g. Railway's private network).
+/// The longest a connect or a batch's write may take before it is given up and tried again.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn pg_connect(url: &str) -> Result<tokio_postgres::Client> {
+    tokio::time::timeout(WRITE_TIMEOUT, pg_connect_now(url)).await.unwrap_or_else(|_| Err(anyhow::anyhow!("connecting to postgres: no answer in {} s", WRITE_TIMEOUT.as_secs())))
+}
+
+async fn pg_connect_now(url: &str) -> Result<tokio_postgres::Client> {
     let wants_tls = ["sslmode=require", "sslmode=verify-ca", "sslmode=verify-full"].iter().any(|m| url.contains(m));
     let client = if wants_tls {
         let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
@@ -788,7 +795,14 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             };
         }
         let Some(c) = &client else { continue };
-        match write(c, &run, &events, &pending, &statuses, &inserts).await {
+        // A connection gone quiet (dropped on the way, not closed) would hang the write for good:
+        // given up after WRITE_TIMEOUT, the connection dropped (the server rolls the batch back),
+        // and written again on a new one.
+        let res = match tokio::time::timeout(WRITE_TIMEOUT, write(c, &run, &events, &pending, &statuses, &inserts)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!("no answer in {} s", WRITE_TIMEOUT.as_secs())),
+        };
+        match res {
             Ok(()) => {
                 events.clear();
                 statuses.clear();

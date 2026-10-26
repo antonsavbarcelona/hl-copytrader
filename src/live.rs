@@ -189,7 +189,12 @@ impl Venue {
                 return Ok(m);
             }
         }
-        let mids = self.ex.info(json!({"type": "allMids"})).await?;
+        // A HIP-3 coin ("dex:NAME"): its dex's mids.
+        let body = match coin.split_once(':') {
+            Some((dex, _)) => json!({"type": "allMids", "dex": dex}),
+            None => json!({"type": "allMids"}),
+        };
+        let mids = self.ex.info(body).await?;
         let m = num(&mids[coin]);
         if m <= 0.0 {
             bail!("no mid for {coin}");
@@ -271,8 +276,66 @@ impl Venue {
         Ok(r["data"]["statuses"][0]["resting"]["oid"].as_u64().map(|o| (o, px)))
     }
 
+    /// A limit order for `size` (signed) at `px` (`tif` "Gtc" / "Alo" / "Ioc"): what it did.
+    pub(crate) async fn limit(&self, coin: &str, size: f64, px: f64, reduce: bool, tif: &str) -> Result<Placed> {
+        let (asset, dec) = self.coins[coin];
+        let sz = round_size(size.abs(), dec);
+        if sz <= 0.0 {
+            bail!("{coin}: size {size} rounds to 0");
+        }
+        let order = OrderWire { a: asset, b: size > 0.0, p: wire(round_px(px, dec)), s: wire(sz), r: reduce, t: OrderType::Limit { tif: tif.into() } };
+        let r = self.ex.act(&Action::Order { orders: vec![order], grouping: "na".into() }).await?;
+        placed(coin, &r["data"]["statuses"][0], size > 0.0)
+    }
+
+    /// The account's leverage on `coin` (isolated unless `cross`).
+    pub(crate) async fn leverage(&self, coin: &str, leverage: u32, cross: bool) -> Result<()> {
+        let asset = self.coins[coin].0;
+        self.ex.act(&Action::UpdateLeverage { asset, is_cross: cross, leverage }).await.map(|_| ())
+    }
+
+    /// The same venue with the HIP-3 perps of the dexes margined in USDC too ("dex:NAME" -> their
+    /// asset ids: 100000 + the dex's index x 10000 + the coin's index in its meta) and each one's
+    /// max leverage.
+    pub(crate) async fn with_hip3(&self) -> Result<(Venue, HashMap<String, u32>)> {
+        let dexes = self.ex.info(json!({"type": "perpDexs"})).await.context("perpDexs")?;
+        let mut coins = (*self.coins).clone();
+        let mut max_lev = HashMap::new();
+        for (di, d) in dexes.as_array().into_iter().flatten().enumerate() {
+            let Some(name) = d["name"].as_str() else { continue };
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let meta = match self.ex.info(json!({"type": "meta", "dex": name})).await {
+                Ok(m) => m,
+                Err(e) => {
+                    log!("live: {name} meta not read: {e:#}");
+                    continue;
+                }
+            };
+            if meta["collateralToken"].as_u64() != Some(0) {
+                continue;
+            }
+            for (i, u) in meta["universe"].as_array().into_iter().flatten().enumerate() {
+                if u["isDelisted"] == true {
+                    continue;
+                }
+                let (Some(n), Some(dec)) = (u["name"].as_str(), u["szDecimals"].as_u64()) else { continue };
+                coins.insert(n.to_string(), (100_000 + di as u32 * 10_000 + i as u32, dec as u32));
+                max_lev.insert(n.to_string(), u["maxLeverage"].as_u64().unwrap_or(1) as u32);
+            }
+        }
+        Ok((Venue { coins: Arc::new(coins), ..self.clone() }, max_lev))
+    }
+
+    /// The account's positions on a HIP-3 dex (coin -> signed size).
+    pub(crate) async fn dex_positions(&self, dex: &str) -> Result<HashMap<String, f64>> {
+        let st = self.ex.info(json!({"type": "clearinghouseState", "user": self.account, "dex": dex})).await?;
+        Ok(st["assetPositions"].as_array().into_iter().flatten()
+            .filter_map(|p| Some((p["position"]["coin"].as_str()?.to_string(), num(&p["position"]["szi"]))))
+            .filter(|(_, x)| *x != 0.0).collect())
+    }
+
     /// An order's size filled so far, and whether it still rests.
-    async fn filled(&self, oid: u64) -> Result<(f64, bool)> {
+    pub(crate) async fn filled(&self, oid: u64) -> Result<(f64, bool)> {
         let r = self.ex.info(json!({"type": "orderStatus", "user": self.account, "oid": oid})).await?;
         let o = &r["order"];
         if o.is_null() {
@@ -280,6 +343,24 @@ impl Venue {
         }
         Ok((num(&o["order"]["origSz"]) - num(&o["order"]["sz"]), o["status"] == "open"))
     }
+}
+
+/// What a limit order did: rests (its id), or filled at once (the size, signed, its average price).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Placed {
+    Resting(u64),
+    Filled(f64, f64, u64),
+}
+
+fn placed(coin: &str, st: &Value, buy: bool) -> Result<Placed> {
+    if let Some(o) = st["resting"]["oid"].as_u64() {
+        return Ok(Placed::Resting(o));
+    }
+    if let Some(f) = st.get("filled") {
+        let got = num(&f["totalSz"]);
+        return Ok(Placed::Filled(if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
+    }
+    bail!("{coin} order not placed: {st}")
 }
 
 /// A leg out by a post-only order at the book's best price, what it has not filled in `secs` at

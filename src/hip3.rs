@@ -12,6 +12,12 @@
 //! at a 10% risk a trade with a 20% stop (half the equity a trade, 3 open, reinvested) +67% with
 //! an 11% drawdown with the open. The thin coins ($1M+) more often (146) but partly untradable.
 //!
+//! `HIP3_LIVE=1` (with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip): the signals traded
+//! too, on the dexes margined in USDC: bought at market, a resting stop `HIP3_STOP_PCT` (20) under,
+//! out at market `HIP3_HOLD_MIN` later, the stop losing `HIP3_RISK_USD` ($20; `FAMILY_RISK_PCT` of
+//! the equity when set), within `HIP3_MAX_OPEN` (3) and the family's cap, isolated at 3x (see
+//! `trades`); events `open` / `close` / `error`.
+//!
 //! Prices: every dex's mids (`allMids`) each `POLL_S`; volumes each 5 min; the dexes each hour.
 //! Its state is the store's doc `hip3` (the pending results, the coins' last moves).
 
@@ -41,13 +47,18 @@ struct Params {
     btc_max: f64,
     min_vol: f64,
     hold_s: f64,
+    live: bool,
+    risk_usd: f64,
+    stop: f64,
+    max_open: usize,
 }
 
 impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { drop: v("HIP3_DROP_PCT", 8.0) / 100.0, btc_max: v("HIP3_BTC_MAX_PCT", 2.0) / 100.0, min_vol: v("HIP3_MIN_VOL_USD", 10e6),
-            hold_s: v("HIP3_HOLD_MIN", 30.0) * 60.0 }
+            hold_s: v("HIP3_HOLD_MIN", 30.0) * 60.0, live: std::env::var("HIP3_LIVE").unwrap_or_default().trim() == "1",
+            risk_usd: v("HIP3_RISK_USD", 20.0), stop: v("HIP3_STOP_PCT", 20.0) / 100.0, max_open: v("HIP3_MAX_OPEN", 3.0) as usize }
     }
 }
 
@@ -69,6 +80,9 @@ struct State {
     last_move: HashMap<String, i64>,
     #[serde(default)]
     signals: u64,
+    /// The trades held (`HIP3_LIVE=1`).
+    #[serde(default)]
+    open: Vec<crate::trades::Trade>,
 }
 
 /// The falls of `minute` worth a signal: (coin, fall, window), biggest first. A coin's move of the
@@ -94,11 +108,19 @@ fn falls(closes: &Closes, volume: &HashMap<String, f64>, last_move: &mut HashMap
     out
 }
 
+fn usd(x: f64) -> String {
+    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
+}
+
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
     Some(match ev["what"].as_str()? {
         "signal" => format!("👀 HIP-3 сигнал (без сделки) {coin}: упала на {:.1}% за {} мин, цена {}, оборот ${:.0}M", f("fall") * 100.0, f("window"), f("mid"), f("volume") / 1e6),
+        "open" => format!("🟢 HIP-3 КУПИЛ {coin}: упала на {:.1}%, цена {}, на ${:.0}, стоп {}, выход через {:.0} мин", f("fall") * 100.0, f("px"), f("notional"), f("stop_px"), f("hold_min")),
+        "close" => format!("{} HIP-3 {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", _ => "ЗАКРЫЛ" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
+        "error" => format!("⚠️ HIP-3 {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "result" => format!("{} итог HIP-3 сигнала {coin} через {:.0} мин: {} -> {} ({:+.2}% для лонга, до комиссий)",
             if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),
         _ => return None,
@@ -115,8 +137,29 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
+    // The live venue with the HIP-3 perps (HIP3_LIVE=1): without it the signals only.
+    let mut venue: Option<(crate::live::Venue, HashMap<String, u32>)> = None;
+    if p.live {
+        match crate::live::venue_from_env(None).await {
+            Ok(Some((v, _))) => match v.with_hip3().await {
+                Ok(x) => venue = Some(x),
+                Err(e) => log!("hip3: the HIP-3 perps not read, signals only: {e:#}"),
+            },
+            Ok(None) => log!("hip3: LIVE_KEY / LIVE_ACCOUNT not set, signals only"),
+            Err(e) => log!("hip3: the venue not read, signals only: {e:#}"),
+        }
+    }
+    for tr in &state.open {
+        crate::trades::register(&tr.coin, "hip3");
+    }
+    if let Some((v, _)) = &venue {
+        log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held", v.account, crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.max_open, state.open.len());
+        crate::notify::send(format!("📈 HIP-3 покупка падений НА ДЕНЬГИ: риск {}, стоп {:.0}%, держим {:.0} мин, до {} позиций, плечо 3x изолированно; падение {:.0}% за 5 или 15 мин, оборот от ${:.0}M",
+            crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.hold_s / 60.0, p.max_open, p.drop * 100.0, p.min_vol / 1e6));
+    } else {
     crate::notify::send(format!("📈 HIP-3 покупка падений запущена БЕЗ СДЕЛОК (только сигналы)
 сигнал: падение {:.0}% за 5 или 15 мин (BTC меньше {:.0}%, оборот от ${:.0}M), итог через {:.0} мин", p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0));
+    }
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let mut closes = Closes::default();
@@ -125,6 +168,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut checked = false;
         let started = now();
+        let mut lev_set: std::collections::HashSet<String> = Default::default();
+        let mut pos_at = 0.0;
         let event = |store: &Store, mut ev: Value| {
             ev["kind"] = json!("hip3");
             ev["at"] = json!(now());
@@ -210,11 +255,82 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     event(&store, json!({"what": "signal", "coin": coin, "fall": fall, "window": w, "mid": mid, "volume": volume.get(&coin).copied().unwrap_or(0.0),
                         "btc": closes.change("BTC", minute - 1, w)}));
                     changed = true;
+                    // Traded (HIP3_LIVE=1): a coin of a USDC dex, within the limits.
+                    let Some((v, max_lev)) = &venue else { continue };
+                    if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin) {
+                        log!("hip3: {coin} not traded (not on a USDC dex, at most open or held)");
+                        continue;
+                    }
+                    let size = crate::trades::size_for(crate::trades::risk_usd(p.risk_usd), p.stop, mid);
+                    let r = async {
+                        crate::trades::h3_leverage(v, &coin, max_lev.get(&coin).copied().unwrap_or(1), &mut lev_set).await?;
+                        crate::trades::open_market(v, &coin, size, p.stop, None, p.hold_s).await
+                    }.await;
+                    match r {
+                        Ok(tr) => {
+                            event(&store, json!({"what": "open", "coin": coin, "fall": fall, "window": w, "mid": mid, "px": tr.entry_px, "size": tr.size,
+                                "notional": tr.size * tr.entry_px, "stop_px": tr.stop_px, "hold_min": p.hold_s / 60.0}));
+                            crate::trades::register(&coin, "hip3");
+                            state.open.push(tr);
+                        }
+                        Err(e) => event(&store, json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
+                    }
                 }
                 if changed {
                     save(&cfg, &state);
                 }
                 last_minute = minute;
+            }
+            // The trades: out on time; a position gone (its stop filled) ends its trade.
+            if let Some((v, _)) = &venue {
+                let mut changed = false;
+                let check = !state.open.is_empty() && t - pos_at >= 30.0;
+                let mut held: HashMap<String, f64> = HashMap::new();
+                let mut read: std::collections::HashSet<String> = Default::default();
+                if check {
+                    pos_at = t;
+                    let dexes_held: std::collections::HashSet<String> = state.open.iter().filter_map(|x| x.coin.split_once(':').map(|d| d.0.to_string())).collect();
+                    for d in dexes_held {
+                        match v.dex_positions(&d).await {
+                            Ok(x) => {
+                                held.extend(x);
+                                read.insert(d);
+                            }
+                            Err(e) => log!("hip3: {d} positions not read: {e:#}"),
+                        }
+                    }
+                }
+                let mut keep = Vec::new();
+                for tr in std::mem::take(&mut state.open) {
+                    let dex_ok = tr.coin.split_once(':').is_some_and(|d| read.contains(d.0));
+                    let out = if t >= tr.exit_at {
+                        match crate::trades::close(v, &tr).await {
+                            Ok(px) => Some(("time", px)),
+                            Err(e) => {
+                                event(&store, json!({"what": "error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
+                                None
+                            }
+                        }
+                    } else if check && dex_ok {
+                        crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0)).await
+                    } else {
+                        None
+                    };
+                    match out {
+                        Some((why, px)) => {
+                            let ret = tr.ret(px);
+                            event(&store, json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                                "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_min": (t - tr.at) / 60.0}));
+                            crate::trades::unregister(&tr.coin);
+                            changed = true;
+                        }
+                        None => keep.push(tr),
+                    }
+                }
+                state.open = keep;
+                if changed {
+                    save(&cfg, &state);
+                }
             }
             // The results due.
             let due: Vec<Pending> = state.pending.iter().filter(|x| t - x.at >= p.hold_s).cloned().collect();
@@ -238,7 +354,7 @@ mod tests {
 
     #[test]
     fn a_fall_over_either_window_with_btc_calm_and_volume() {
-        let p = Params { drop: 0.08, btc_max: 0.02, min_vol: 10e6, hold_s: 1800.0 };
+        let p = Params { drop: 0.08, btc_max: 0.02, min_vol: 10e6, hold_s: 1800.0, live: false, risk_usd: 20.0, stop: 0.2, max_open: 3 };
         let mut c = Closes::default();
         for m in 100..=116 {
             c.update("BTC", m, 100_000.0, 20);

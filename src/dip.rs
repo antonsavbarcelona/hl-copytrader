@@ -96,9 +96,11 @@ struct Params {
     pump: PumpParams,
 }
 
-/// The $ a trade's stop loses: `usd` when set, else `pct` of the equity.
+/// The $ a trade's stop loses: `FAMILY_RISK_PCT` of the equity when set (one deposit for the whole
+/// family, compounding; see `trades`), else `usd` when set, else `pct` of the equity.
 fn risk_dollars(pct: f64, usd: f64, equity: f64) -> f64 {
-    if usd > 0.0 { usd } else { pct * equity }
+    let family = std::env::var("FAMILY_RISK_PCT").ok().and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0);
+    if family > 0.0 && equity > 0.0 { family / 100.0 * equity } else if usd > 0.0 { usd } else { pct * equity }
 }
 
 /// The RSI (Wilder: the gains' and the losses' EMA at 1/n, from the first close) at the last of `closes`.
@@ -472,6 +474,8 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
+            } else if !crate::trades::can_open(&coin) {
+                Some("family cap")
             } else if in_cooldown.contains(&coin) || self.state.last_entry.get(&coin).is_some_and(|x| t - x < self.p.cooldown_s) {
                 Some("cooldown")
             } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
@@ -530,6 +534,8 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
+            } else if !crate::trades::can_open(&coin) {
+                Some("family cap")
             } else if in_cooldown.contains(&coin) {
                 Some("cooldown")
             } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
@@ -821,6 +827,8 @@ impl Dip {
             }
         };
         self.equity = equity;
+        crate::trades::set_equity(equity);
+        crate::trades::sync("dip", self.state.open.keys());
         self.positions = positions;
         let mut changed = false;
         for (coin, p) in self.state.open.clone() {
@@ -915,6 +923,7 @@ fn message(ev: &Value) -> Option<String> {
             "held" => "уже держим эту монету",
             "the account holds it otherwise" => "на аккаунте уже есть другая позиция в этой монете",
             "equity not read yet" => "депозит ещё не прочитан",
+            "family cap" => "общий лимит позиций семейства (FAMILY_MAX_OPEN) или монета занята другой стратегией",
             "too new" => "монета торгуется меньше 14 дней",
             x => x,
         }),
@@ -927,6 +936,7 @@ fn message(ev: &Value) -> Option<String> {
             "cooldown" => "по этой монете пауза после прошлой покупки",
             "the account holds it otherwise" => "на аккаунте уже есть другая позиция в этой монете",
             "equity not read yet" => "депозит ещё не прочитан",
+            "family cap" => "общий лимит позиций семейства (FAMILY_MAX_OPEN) или монета занята другой стратегией",
             "rsi" => return Some(format!("⏭ {coin} упала на {:.1}%, не купил: RSI 1ч {:.0} (фильтр: до {:.0})", f("fall") * 100.0, f("rsi"), f("rsi_max"))),
             x => x,
         }),

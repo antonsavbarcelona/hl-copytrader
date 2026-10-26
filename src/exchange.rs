@@ -46,6 +46,13 @@ pub struct CancelWire {
 pub enum Action {
     Order { orders: Vec<OrderWire>, grouping: String },
     Cancel { cancels: Vec<CancelWire> },
+    /// The leverage (and the margin mode) of an asset for the account.
+    UpdateLeverage {
+        asset: u32,
+        #[serde(rename = "isCross")]
+        is_cross: bool,
+        leverage: u32,
+    },
 }
 
 /// A number as the API wants it: up to 8 decimals, no trailing zeros (`float_to_wire`).
@@ -198,6 +205,9 @@ mod tests {
             grouping: "na".into(),
         };
         let cancel = Action::Cancel { cancels: vec![CancelWire { a: 12, o: 62246465112 }] };
+        let gtc = || OrderWire { a: 110005, b: true, p: "12.345".into(), s: "8.1".into(), r: false, t: OrderType::Limit { tif: "Gtc".into() } };
+        let gtc_order = Action::Order { orders: vec![gtc()], grouping: "na".into() };
+        let lev = Action::UpdateLeverage { asset: 110005, is_cross: false, leverage: 3 };
         let cases = [
             (&order, "08458109a06a62044f3c37e98c589bbe4d30bda32b2aa40e056da1e3841d86ec", false,
              "0x160e61a7191b20d63231960bd6442f3e4981d2edbe6f56d585d2914a84d51720", "0x479a6708b73ac578b303098d68ae3b3fca79557a013ea017e97ed665d26fba37", 27),
@@ -205,6 +215,10 @@ mod tests {
              "0x89b8027031cde3b909608982c1f72e9ce32a12d3ad44e673589296eef162693e", "0x19b1c5d0769ae9960523e64a48f2a6f69c83ce27f252a0fae9cf8b5d431742bf", 28),
             (&trigger, "5b8bb00905ad4ea5f1e2e0980577dbe30eb36b80b4b93b00e2b653ab41981e3c", false,
              "0xb35207f67a8a6c0df407ecb3e5bfec6a3d887617bd666e95ac1a67e960fc36fd", "0x3f859a44564d5329938cb02a4c20b250f22766b9fd080f27227ae0f5c2e6cfc2", 28),
+            (&gtc_order, "2084b3c02bc6b08557ff9a8cc52c517a7e9e06607ce2fd2291593e32d508f169", true,
+             "0xc5646d6a4399365f94d7801bf5c7f8a9dc0e45eaa60347e6151f1111b8724b53", "0x31413d8edf362c1bca1727c9856e1213efeda533c71eef49462f64ca751e1d70", 27),
+            (&lev, "27fbd2b5f40c2b8ac430fab527bd1d00e7b3c13deac23e39d752e46a4db3a4e1", true,
+             "0x4c8141cc9e7b8a52199501e80b1a91055f1ff7953a757b4b4798f1ea3187fd89", "0x1a7f948cc19cb5ad30f16cb0afd6f5c9fcd19ebaa21fb8c75156628a922acebb", 27),
             (&cancel, "f220594006ae723ef922ef6ef87aaf9fbb774fef0ca1c9f20b59ac15be10e66c", false,
              "0x4cf57a35df1d217496c89caf8d112871194c51f673b0401419e14ce402cd9e04", "0xf782832a27050f5c4edcf1977695f88afd883e1fb88c50a3f4ee9a72ff7c23d", 27),
         ];

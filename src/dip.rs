@@ -12,8 +12,9 @@
 //! `signal`), no orders. `DIP_RSI_MAX` (0: off, as V1): a fall is skipped when the coin's 1 h RSI14
 //! (Wilder; the closes of the completed hours from the candles and the mid now) is at or above it
 //! (event `skipped`, why `rsi`); the candles not read: bought as V1. The research of 2026-10-26 (the
-//! tape): at 8% / $20M the dips under RSI 50 +261 bp a trade (both halves), the rest +51; at $10M the
-//! rest -52 bp; at $20 risk the same $ with a third fewer trades, the drawdown -40%.
+//! tape): the dips under RSI 50 earn more a trade in every quarter, but with this module's cooldown
+//! at V1's $20M and $20 risk the filter lowers the $ and raises the drawdown ($138 / DD $40 -> $107 /
+//! $66 over 16 months): not for V1. It helps a $10M variant (DIP_MIN_VOL_USD=10e6: $55 / $66 -> $117 / $54).
 //!
 //! DIP V1: these settings are frozen as of 2026-10-20 (no further fitting on the history; the
 //! live record is the independent check). Every signal is logged with the book and the fill

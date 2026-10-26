@@ -9,7 +9,11 @@
 //! move of the drop or more either way (a rise, a fall on any volume: as in the research, see
 //! `cooled`; from 2026-10-25, before it only after our entries) or our entry; a coin the account
 //! holds otherwise (the copy's legs) is left alone. `DIP_DRY=1`: the signals only (events
-//! `signal`), no orders.
+//! `signal`), no orders. `DIP_RSI_MAX` (0: off, as V1): a fall is skipped when the coin's 1 h RSI14
+//! (Wilder; the closes of the completed hours from the candles and the mid now) is at or above it
+//! (event `skipped`, why `rsi`); the candles not read: bought as V1. The research of 2026-10-26 (the
+//! tape): at 8% / $20M the dips under RSI 50 +261 bp a trade (both halves), the rest +51; at $10M the
+//! rest -52 bp; at $20 risk the same $ with a third fewer trades, the drawdown -40%.
 //!
 //! DIP V1: these settings are frozen as of 2026-10-20 (no further fitting on the history; the
 //! live record is the independent check). Every signal is logged with the book and the fill
@@ -86,12 +90,29 @@ struct Params {
     max_open: usize,
     cooldown_s: f64,
     dry: bool,
+    /// `DIP_RSI_MAX` (0: off): skip a fall at or above this 1 h RSI14.
+    rsi_max: f64,
     pump: PumpParams,
 }
 
 /// The $ a trade's stop loses: `usd` when set, else `pct` of the equity.
 fn risk_dollars(pct: f64, usd: f64, equity: f64) -> f64 {
     if usd > 0.0 { usd } else { pct * equity }
+}
+
+/// The RSI (Wilder: the gains' and the losses' EMA at 1/n, from the first close) at the last of `closes`.
+fn rsi(closes: &[f64], n: usize) -> Option<f64> {
+    if closes.len() < 2 * n {
+        return None;
+    }
+    let a = 1.0 / n as f64;
+    let (mut up, mut dn) = (0.0, 0.0);
+    for w in closes.windows(2) {
+        let d = w[1] - w[0];
+        up += a * (d.max(0.0) - up);
+        dn += a * ((-d).max(0.0) - dn);
+    }
+    Some(100.0 - 100.0 / (1.0 + up / dn.max(1e-12)))
 }
 
 /// The risk as said in the chat and the log.
@@ -122,7 +143,7 @@ impl Params {
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
             min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 60.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
-            dry: on("DIP_DRY"),
+            dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0),
             pump: PumpParams { enabled: on("PUMP_ENABLED"), dry: on("PUMP_DRY"), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 120.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
@@ -465,6 +486,17 @@ impl Dip {
                     "book": self.book(&coin, true, size), "regime": self.regime(&coin, fall, btc)}));
                 continue;
             }
+            if self.p.rsi_max > 0.0 {
+                match self.rsi_1h(&coin).await {
+                    Some(r) if r >= self.p.rsi_max => {
+                        self.event(json!({"what": "skipped", "coin": coin, "fall": fall, "btc": btc, "why": "rsi", "rsi": r, "rsi_max": self.p.rsi_max,
+                            "signal_delay_ms": delay_ms}));
+                        continue;
+                    }
+                    Some(r) => log!("dip: {coin} RSI 1h {r:.1} under {:.0}: bought", self.p.rsi_max),
+                    None => log!("dip: {coin} RSI 1h not read: bought as V1"),
+                }
+            }
             self.enter(&coin, fall, btc, delay_ms).await;
         }
         if self.p.pump.enabled {
@@ -516,6 +548,26 @@ impl Dip {
             }
             self.enter_pump(&coin, rise, delay_ms).await;
         }
+    }
+
+    /// `coin`'s 1 h RSI14 now: the closes of its completed hours (the last 100) and its mid.
+    async fn rsi_1h(&self, coin: &str) -> Option<f64> {
+        let mid = self.closes.at(coin, i64::MAX)?;
+        let t = now();
+        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1h",
+            "startTime": ((t - 100.0 * 3600.0) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
+        let v = match r {
+            Ok(v) => v,
+            Err(e) => {
+                log!("dip: {coin} hour candles not read: {e:#}");
+                return None;
+            }
+        };
+        let mut closes: Vec<f64> = v.as_array()?.iter()
+            .filter(|c| c["T"].as_f64().is_some_and(|end| end / 1000.0 < t))
+            .filter_map(|c| c["c"].as_str()?.parse().ok()).collect();
+        closes.push(mid);
+        rsi(&closes, 14)
     }
 
     /// Whether `coin` has daily candles `days` or more back (cached once true).
@@ -874,6 +926,7 @@ fn message(ev: &Value) -> Option<String> {
             "cooldown" => "по этой монете пауза после прошлой покупки",
             "the account holds it otherwise" => "на аккаунте уже есть другая позиция в этой монете",
             "equity not read yet" => "депозит ещё не прочитан",
+            "rsi" => return Some(format!("⏭ {coin} упала на {:.1}%, не купил: RSI 1ч {:.0} (фильтр: до {:.0})", f("fall") * 100.0, f("rsi"), f("rsi_max"))),
             x => x,
         }),
         "too small" => format!("⏭ {coin}: размер меньше минимума $10 (депозит ${:.0})", f("equity")),
@@ -884,6 +937,18 @@ fn message(ev: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_rsi_as_in_the_research() {
+        // The research's RSI (v23_ev_lib.rsi, numpy) on the same closes: 65.89306344882871.
+        let c: Vec<f64> = (0..60).map(|i| 100.0 + 10.0 * (i as f64 / 3.0).sin() + i as f64 * 0.1).collect();
+        assert!((rsi(&c, 14).unwrap() - 65.89306344882871).abs() < 1e-9);
+        let up: Vec<f64> = (0..40).map(|i| i as f64).collect();
+        assert!(rsi(&up, 14).unwrap() > 99.9);
+        assert_eq!(rsi(&up[..20], 14), None);                // too few closes
+        let m = message(&json!({"what": "skipped", "coin": "X", "fall": -0.09, "why": "rsi", "rsi": 63.2, "rsi_max": 50.0})).unwrap();
+        assert!(m.contains("RSI 1ч 63") && m.contains("до 50"));
+    }
 
     #[test]
     fn a_fall_over_the_window_by_the_minutes_closes() {

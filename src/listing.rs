@@ -41,6 +41,8 @@ struct Params {
     hold_s: f64,
     risk_usd: f64,
     max_open: usize,
+    /// The trial (`LIST_ENABLED` unset): its live trades at most.
+    trial: Option<u32>,
 }
 
 impl Params {
@@ -48,7 +50,7 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { delay_days: v("LIST_DELAY_DAYS", 7.0), min_vol: v("LIST_MIN_VOL_USD", 5e6), stop: v("LIST_STOP_PCT", 25.0) / 100.0,
             take: v("LIST_TAKE_PCT", 20.0) / 100.0, hold_s: v("LIST_HOLD_DAYS", 14.0) * DAY, risk_usd: v("LIST_RISK_USD", 20.0),
-            max_open: v("LIST_MAX_OPEN", 3.0) as usize }
+            max_open: v("LIST_MAX_OPEN", 3.0) as usize, trial: trades::switch("LIST_ENABLED").flatten() }
     }
 }
 
@@ -62,6 +64,9 @@ struct State {
     done: Vec<String>,
     #[serde(default)]
     open: Vec<Trade>,
+    /// The live trades opened (the trial's count).
+    #[serde(default)]
+    opened: u32,
 }
 
 /// Whether a coin listed at `listed` is due a short at `t` (the delay passed, within a day of it).
@@ -82,6 +87,7 @@ fn message(ev: &Value) -> Option<String> {
         "close" => format!("{} шорт листинга {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
             match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ шорт листинга {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" => format!("🔻 сигнал шорта листинга {coin} по {} (проба окончена, без сделки)", f("px")),
         _ => return None,
     })
 }
@@ -174,6 +180,10 @@ impl Listing {
             }
             self.state.done.push(coin.clone());
             changed = true;
+            if !trades::trial_open(self.p.trial, self.state.opened) {
+                self.event(json!({"what": "signal", "coin": coin, "days_listed": (t - at) / DAY, "px": mid, "volume": v}));
+                continue;
+            }
             let size = trades::size_for(risk, self.p.stop, mid);
             match trades::open_market(&self.venue, &coin, -size, self.p.stop, Some(self.p.take), self.p.hold_s).await {
                 Ok(tr) => {
@@ -181,6 +191,7 @@ impl Listing {
                         "notional": tr.size.abs() * tr.entry_px, "take_px": tr.take_px, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "volume": v}));
                     trades::register(&coin, "listing", tr.risk());
                     self.state.open.push(tr);
+                    self.state.opened += 1;
                 }
                 Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
             }
@@ -242,8 +253,8 @@ impl Listing {
 
 /// Starts the listing short if `LIST_ENABLED` is "1" (see the module).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if std::env::var("LIST_ENABLED").unwrap_or_default().trim() != "1" {
-        log!("listing: off (LIST_ENABLED=1 to trade it)");
+    if trades::switch("LIST_ENABLED").is_none() {
+        log!("listing: off (LIST_ENABLED=0)");
         return Ok(());
     }
     let Some((venue, unified)) = crate::live::venue_from_env(None).await? else {
@@ -258,8 +269,9 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     log!("listing: account {}: a listing shorted {:.0} days on (${:.0}M+ a day), stop {:.0}%, take {:.0}%, {:.0} days, risk {}, at most {}; {} held, {} coins known",
         venue.account, p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,
         state.open.len(), state.listed.len());
-    crate::notify::send(format!("🔻 шорт листингов НА ДЕНЬГИ: через {:.0} дн. после листинга (оборот от ${:.0}M), стоп +{:.0}%, тейк −{:.0}%, держим {:.0} дн., риск {}, до {} позиций",
-        p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open));
+    crate::notify::send(format!("🔻 шорт листингов НА ДЕНЬГИ: через {:.0} дн. после листинга (оборот от ${:.0}M), стоп +{:.0}%, тейк −{:.0}%, держим {:.0} дн., риск {}, до {} позиций{}",
+        p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,
+        trades::trial_label(p.trial, state.opened)));
     let mut l = Listing { venue, unified, cfg: cfg.clone(), store, p, state };
     tokio::spawn(async move {
         let (mut look_at, mut check_at) = (0.0, 0.0);

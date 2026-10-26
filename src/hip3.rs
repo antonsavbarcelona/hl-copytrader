@@ -51,13 +51,15 @@ struct Params {
     risk_usd: f64,
     stop: f64,
     max_open: usize,
+    /// The trial (`HIP3_LIVE` unset): its live trades at most.
+    trial: Option<u32>,
 }
 
 impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { drop: v("HIP3_DROP_PCT", 8.0) / 100.0, btc_max: v("HIP3_BTC_MAX_PCT", 2.0) / 100.0, min_vol: v("HIP3_MIN_VOL_USD", 10e6),
-            hold_s: v("HIP3_HOLD_MIN", 30.0) * 60.0, live: std::env::var("HIP3_LIVE").unwrap_or_default().trim() == "1",
+            hold_s: v("HIP3_HOLD_MIN", 30.0) * 60.0, live: crate::trades::switch("HIP3_LIVE").is_some(), trial: crate::trades::switch("HIP3_LIVE").flatten(),
             risk_usd: v("HIP3_RISK_USD", 20.0), stop: v("HIP3_STOP_PCT", 20.0) / 100.0, max_open: v("HIP3_MAX_OPEN", 3.0) as usize }
     }
 }
@@ -83,6 +85,9 @@ struct State {
     /// The trades held (`HIP3_LIVE=1`).
     #[serde(default)]
     open: Vec<crate::trades::Trade>,
+    /// The live trades opened (the trial's count).
+    #[serde(default)]
+    opened: u32,
 }
 
 /// The falls of `minute` worth a signal: (coin, fall, window), biggest first. A coin's move of the
@@ -129,8 +134,8 @@ fn message(ev: &Value) -> Option<String> {
 
 /// Starts the HIP-3 dip's signals if `HIP3_ENABLED` is "1" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if std::env::var("HIP3_ENABLED").unwrap_or_default().trim() != "1" {
-        log!("hip3: off (HIP3_ENABLED=1 to run its signals)");
+    if crate::trades::switch("HIP3_ENABLED").is_none() {
+        log!("hip3: off (HIP3_ENABLED=0)");
         return Ok(());
     }
     let p = Params::from_env();
@@ -153,9 +158,11 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::trades::register(&tr.coin, "hip3", tr.risk());
     }
     if let Some((v, _)) = &venue {
-        log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held", v.account, crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.max_open, state.open.len());
-        crate::notify::send(format!("📈 HIP-3 покупка падений НА ДЕНЬГИ: риск {}, стоп {:.0}%, держим {:.0} мин, до {} позиций, плечо 3x изолированно; падение {:.0}% за 5 или 15 мин, оборот от ${:.0}M",
-            crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.hold_s / 60.0, p.max_open, p.drop * 100.0, p.min_vol / 1e6));
+        log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held, trial {:?} ({} opened)", v.account, crate::trades::sizing_label(p.risk_usd, p.stop),
+            p.stop * 100.0, p.max_open, state.open.len(), p.trial, state.opened);
+        crate::notify::send(format!("📈 HIP-3 покупка падений НА ДЕНЬГИ: риск {}, стоп {:.0}%, держим {:.0} мин, до {} позиций, плечо 3x изолированно; падение {:.0}% за 5 или 15 мин, оборот от ${:.0}M{}",
+            crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.hold_s / 60.0, p.max_open, p.drop * 100.0, p.min_vol / 1e6,
+            crate::trades::trial_label(p.trial, state.opened)));
     } else {
     crate::notify::send(format!("📈 HIP-3 покупка падений запущена БЕЗ СДЕЛОК (только сигналы)
 сигнал: падение {:.0}% за 5 или 15 мин (BTC меньше {:.0}%, оборот от ${:.0}M), итог через {:.0} мин", p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0));
@@ -257,6 +264,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     changed = true;
                     // Traded (HIP3_LIVE=1): a coin of a USDC dex, within the limits.
                     let Some((v, max_lev)) = &venue else { continue };
+                    if !crate::trades::trial_open(p.trial, state.opened) {
+                        log!("hip3: {coin} not traded (the trial's {} trades done)", state.opened);
+                        continue;
+                    }
                     let risk = crate::trades::risk_usd(p.risk_usd);
                     if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin, risk) {
                         log!("hip3: {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
@@ -273,6 +284,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                                 "notional": tr.size * tr.entry_px, "stop_px": tr.stop_px, "hold_min": p.hold_s / 60.0}));
                             crate::trades::register(&coin, "hip3", tr.risk());
                             state.open.push(tr);
+                            state.opened += 1;
+                            if !crate::trades::trial_open(p.trial, state.opened) {
+                                crate::notify::send(format!("🏁 HIP-3 покупка падений: проба окончена ({} сделки), дальше только сигналы", state.opened));
+                            }
                         }
                         Err(e) => event(&store, json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
                     }
@@ -355,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_fall_over_either_window_with_btc_calm_and_volume() {
-        let p = Params { drop: 0.08, btc_max: 0.02, min_vol: 10e6, hold_s: 1800.0, live: false, risk_usd: 20.0, stop: 0.2, max_open: 3 };
+        let p = Params { drop: 0.08, btc_max: 0.02, min_vol: 10e6, hold_s: 1800.0, live: false, risk_usd: 20.0, stop: 0.2, max_open: 3, trial: None };
         let mut c = Closes::default();
         for m in 100..=116 {
             c.update("BTC", m, 100_000.0, 20);

@@ -56,6 +56,8 @@ struct Params {
     risk_usd: f64,
     max_open: usize,
     h3_max_open: usize,
+    /// The trial (`WICK_ENABLED` unset): each side's live trades at most.
+    trial: Option<u32>,
 }
 
 impl Params {
@@ -65,7 +67,7 @@ impl Params {
             h3_pct: v("WICK_H3_PCT", 5.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 5.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
-            h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize }
+            h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten() }
     }
 }
 
@@ -84,6 +86,11 @@ struct State {
     open: Vec<Trade>,
     #[serde(default)]
     last_fill: HashMap<String, f64>,
+    /// The fills on each side (the trial's counts).
+    #[serde(default)]
+    opened: u32,
+    #[serde(default)]
+    h3_opened: u32,
 }
 
 /// A coin's dex ("" for the main one).
@@ -206,7 +213,7 @@ impl Wick {
             (Some(a), Some(b)) if b > 0.0 => (a / b - 1.0).abs() < BTC_MAX_MINUTE,
             _ => false,
         };
-        if btc_calm && n_crypto < self.p.max_open {
+        if btc_calm && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
             for c in pick(&self.volume, self.p.min_vol, self.p.max_coins, |c| c == "BTC" || !self.venue.coins.contains_key(c)) {
                 let (Some(close), o) = (self.closes.at(&c, minute - 1), self.oracle.get(&c).copied().unwrap_or(0.0)) else { continue };
                 if !free(&c) {
@@ -216,7 +223,7 @@ impl Wick {
                 out.insert(c, level(anchor, self.p.pct));
             }
         }
-        if self.p.h3_max_coins > 0 && n_h3 < self.p.h3_max_open {
+        if self.p.h3_max_coins > 0 && n_h3 < self.p.h3_max_open && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in pick(&self.h3_volume, self.p.h3_min_vol, self.p.h3_max_coins, |c| c.starts_with("hyna:") || !self.venue.coins.contains_key(c)) {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
                 if free(&c) {
@@ -293,6 +300,16 @@ impl Wick {
     async fn filled(&mut self, coin: &str, got: f64, px: f64) {
         self.state.bids.remove(coin);
         self.state.last_fill.insert(coin.to_string(), now());
+        let (side, n) = if coin.contains(':') {
+            self.state.h3_opened += 1;
+            ("HIP-3", self.state.h3_opened)
+        } else {
+            self.state.opened += 1;
+            ("крипта", self.state.opened)
+        };
+        if !trades::trial_open(self.p.trial, n) {
+            crate::notify::send(format!("🏁 проколы ({side}): проба окончена ({n} сделки), лимитки сняты"));
+        }
         let pct = if coin.contains(':') { self.p.h3_pct } else { self.p.pct };
         match trades::protect(&self.venue, coin, got, px, self.p.stop, Some(self.p.take), self.p.hold_s).await {
             Ok(tr) => {
@@ -408,8 +425,8 @@ impl Wick {
 
 /// Starts the wick bids if `WICK_ENABLED` is "1" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if std::env::var("WICK_ENABLED").unwrap_or_default().trim() != "1" {
-        log!("wick: off (WICK_ENABLED=1 to trade it)");
+    if trades::switch("WICK_ENABLED").is_none() {
+        log!("wick: off (WICK_ENABLED=0)");
         return Ok(());
     }
     let Some((core, unified)) = crate::live::venue_from_env(None).await? else {
@@ -443,7 +460,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         p.hold_s / 60.0, trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open, state.open.len());
     crate::notify::send(format!("🎣 проколы лимиток НА ДЕНЬГИ: крипта лимитка на {:.0}% ниже на {} монетах (оборот от ${:.0}M), HIP-3 на {:.0}% ниже на {} монетах; тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, риск {}, до {} + {} позиций (крипта + HIP-3)",
         p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.take * 100.0, p.stop * 100.0, p.hold_s / 60.0,
-        trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open));
+        trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open)
+        + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));
     let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new() };
     tokio::spawn(async move {

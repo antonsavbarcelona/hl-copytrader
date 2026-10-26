@@ -54,6 +54,27 @@ static EQUITY: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
 /// Coin -> (strategy, the trade's risk in $: its stop's loss).
 static OPEN: std::sync::Mutex<Option<std::collections::HashMap<String, (String, f64)>>> = std::sync::Mutex::new(None);
 
+/// A strategy's switch `var`: "1" on; unset (or empty) the trial: on for its first `TRIAL_TRADES`
+/// (3) live trades, then the signals only; anything else ("0") off. None off, Some(None) on,
+/// Some(Some(n)) the trial of n trades.
+pub(crate) fn switch(var: &str) -> Option<Option<u32>> {
+    match std::env::var(var).map(|x| x.trim().to_string()) {
+        Ok(x) if x == "1" => Some(None),
+        Ok(x) if !x.is_empty() => None,
+        _ => Some(Some(env_f("TRIAL_TRADES", 3.0) as u32)),
+    }
+}
+
+/// Whether one more live trade fits the trial (`used` opened so far; no trial: always).
+pub(crate) fn trial_open(trial: Option<u32>, used: u32) -> bool {
+    trial.is_none_or(|n| used < n)
+}
+
+/// The trial for the messages: "" without one.
+pub(crate) fn trial_label(trial: Option<u32>, used: u32) -> String {
+    trial.map(|n| format!(", ПРОБА: первые {n} сделки (было {used}), потом только сигналы")).unwrap_or_default()
+}
+
 fn env_f(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d)
 }

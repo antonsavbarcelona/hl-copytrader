@@ -128,6 +128,8 @@ fn risk_label(pct: f64, usd: f64, stop: f64) -> String {
 struct PumpParams {
     enabled: bool,
     dry: bool,
+    /// The trial (`PUMP_ENABLED` unset): its live trades at most, then the signals only.
+    trial: Option<u32>,
     rise: f64,
     min_vol: f64,
     min_age_days: f64,
@@ -147,7 +149,7 @@ impl Params {
             min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 60.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0),
-            pump: PumpParams { enabled: on("PUMP_ENABLED"), dry: on("PUMP_DRY"), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
+            pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 120.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
     }
@@ -192,6 +194,9 @@ struct State {
     last_pump_move: HashMap<String, i64>,
     #[serde(default)]
     dry_pumps: Vec<DryPump>,
+    /// The pump shorts opened (the trial's count).
+    #[serde(default)]
+    pumps_opened: u32,
 }
 
 /// The archive research's cooldown (`moves.py`, the 198 falls of V1): a coin's move of the drop or
@@ -286,9 +291,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         crate::notify::send(format!("🔻 шорт пампов запущен{}
 сигнал: рост {:.0}% за {} мин (оборот от ${:.0}M, монете {:.0}+ дней), держим {:.0} мин, без тейка, стоп +{:.0}%, риск {}, до {} позиций",
             if q.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0,
-            risk_label(q.risk, q.risk_usd, q.stop), q.max_open));
+            risk_label(q.risk, q.risk_usd, q.stop), q.max_open) + &crate::trades::trial_label(q.trial, state.pumps_opened));
     } else {
-        log!("dip: the pump short is off (PUMP_ENABLED=1 to run it)");
+        log!("dip: the pump short is off (PUMP_ENABLED=0)");
     }
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
         positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new() };
@@ -614,7 +619,7 @@ impl Dip {
             self.event(json!({"what": "too small", "family": "pump", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book}));
             return;
         }
-        if q.dry {
+        if q.dry || !crate::trades::trial_open(q.trial, self.state.pumps_opened) {
             self.state.dry_pumps.push(DryPump { coin: coin.to_string(), at: now(), mid, rise, done: 0 });
             self.event(json!({"what": "pump_signal", "family": "pump", "coin": coin, "rise": rise, "mid": mid, "size": size, "notional": size * mid,
                 "equity": self.equity, "signal_delay_ms": delay_ms, "book": book}));
@@ -644,6 +649,10 @@ impl Dip {
         };
         let t = now();
         self.state.open.insert(coin.to_string(), Pos { size: got, entry_px: px, opened: t, stop_px, stop_oid, fall: rise, pump: true });
+        self.state.pumps_opened += 1;
+        if !crate::trades::trial_open(q.trial, self.state.pumps_opened) {
+            crate::notify::send(format!("🏁 шорт пампов: проба окончена ({} сделки), дальше только сигналы", self.state.pumps_opened));
+        }
         self.positions.insert(coin.to_string(), got);
         self.event(json!({"what": "pump_open", "family": "pump", "coin": coin, "rise": rise, "size": got, "px": px, "notional": got.abs() * px,
             "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "oid": oid, "signal_mid": mid,

@@ -37,6 +37,11 @@ impl Trade {
         self.size.signum()
     }
 
+    /// The $ its stop loses.
+    pub(crate) fn risk(&self) -> f64 {
+        (self.size * (self.entry_px - self.stop_px)).abs()
+    }
+
     /// The return (as a fraction, signed for the side) at `px`.
     pub(crate) fn ret(&self, px: f64) -> f64 {
         if self.entry_px > 0.0 { self.dir() * (px / self.entry_px - 1.0) } else { 0.0 }
@@ -46,7 +51,8 @@ impl Trade {
 /// One deposit for the whole family: the account's equity (the last read by any strategy) and the
 /// family's open trades (coin -> strategy), shared by the strategies' tasks.
 static EQUITY: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
-static OPEN: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> = std::sync::Mutex::new(None);
+/// Coin -> (strategy, the trade's risk in $: its stop's loss).
+static OPEN: std::sync::Mutex<Option<std::collections::HashMap<String, (String, f64)>>> = std::sync::Mutex::new(None);
 
 fn env_f(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d)
@@ -70,26 +76,30 @@ pub(crate) fn risk_usd(usd: f64) -> f64 {
     if pct > 0.0 && eq > 0.0 { pct / 100.0 * eq } else { usd }
 }
 
-/// A strategy's coins held now: the registry's entries of `kind` set to them.
-pub(crate) fn sync<'a>(kind: &str, coins: impl Iterator<Item = &'a String>) {
+/// A strategy's trades held now (coin, risk $): the registry's entries of `kind` set to them.
+pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64)>) {
     let mut g = OPEN.lock().unwrap();
     let m = g.get_or_insert_with(Default::default);
-    m.retain(|_, k| k != kind);
-    for c in coins {
-        m.insert(c.clone(), kind.to_string());
+    m.retain(|_, k| k.0 != kind);
+    for (c, r) in trades {
+        m.insert(c, (kind.to_string(), r));
     }
 }
 
-/// Whether one more trade fits `FAMILY_MAX_OPEN` (8; 0: no cap) and the coin is free.
-pub(crate) fn can_open(coin: &str) -> bool {
-    let cap = env_f("FAMILY_MAX_OPEN", 8.0) as usize;
+/// Whether one more trade risking `risk` $ fits: the coin free, `FAMILY_MAX_OPEN` (12; 0: no cap)
+/// trades at once, and the open trades' risks with it within `FAMILY_RISK_CAP_PCT` (10; 0: no cap)
+/// of the equity (the deposit's simultaneous risk; each strategy keeps its own slots besides).
+pub(crate) fn can_open(coin: &str, risk: f64) -> bool {
+    let cap = env_f("FAMILY_MAX_OPEN", 12.0) as usize;
+    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 10.0) / 100.0;
+    let eq = equity();
     let g = OPEN.lock().unwrap();
-    let m = g.as_ref();
-    !m.is_some_and(|m| m.contains_key(coin)) && (cap == 0 || m.map_or(0, |m| m.len()) < cap)
+    let (n, open_risk, held) = g.as_ref().map_or((0, 0.0, false), |m| (m.len(), m.values().map(|x| x.1).sum::<f64>(), m.contains_key(coin)));
+    !held && (cap == 0 || n < cap) && (risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9)
 }
 
-pub(crate) fn register(coin: &str, kind: &str) {
-    OPEN.lock().unwrap().get_or_insert_with(Default::default).insert(coin.to_string(), kind.to_string());
+pub(crate) fn register(coin: &str, kind: &str, risk: f64) {
+    OPEN.lock().unwrap().get_or_insert_with(Default::default).insert(coin.to_string(), (kind.to_string(), risk));
 }
 
 pub(crate) fn unregister(coin: &str) {

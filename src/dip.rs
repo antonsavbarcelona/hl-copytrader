@@ -474,7 +474,7 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
-            } else if !crate::trades::can_open(&coin) {
+            } else if !crate::trades::can_open(&coin, risk_dollars(self.p.risk, self.p.risk_usd, self.equity)) {
                 Some("family cap")
             } else if in_cooldown.contains(&coin) || self.state.last_entry.get(&coin).is_some_and(|x| t - x < self.p.cooldown_s) {
                 Some("cooldown")
@@ -534,7 +534,7 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
-            } else if !crate::trades::can_open(&coin) {
+            } else if !crate::trades::can_open(&coin, risk_dollars(q.risk, q.risk_usd, self.equity)) {
                 Some("family cap")
             } else if in_cooldown.contains(&coin) {
                 Some("cooldown")
@@ -828,7 +828,7 @@ impl Dip {
         };
         self.equity = equity;
         crate::trades::set_equity(equity);
-        crate::trades::sync("dip", self.state.open.keys());
+        crate::trades::sync("dip", self.state.open.iter().map(|(c, p)| (c.clone(), (p.size * (p.entry_px - p.stop_px)).abs())));
         self.positions = positions;
         let mut changed = false;
         for (coin, p) in self.state.open.clone() {

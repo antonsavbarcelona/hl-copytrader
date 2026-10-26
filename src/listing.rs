@@ -167,18 +167,19 @@ impl Listing {
                 log!("listing: {coin} due but thin (${:.1}M a day) or not tradable", v / 1e6);
                 continue;
             }
-            if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin) {
+            let risk = trades::risk_usd(self.p.risk_usd);
+            if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, risk) {
                 log!("listing: {coin} due but at most open or held");
                 continue;
             }
             self.state.done.push(coin.clone());
             changed = true;
-            let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.stop, mid);
+            let size = trades::size_for(risk, self.p.stop, mid);
             match trades::open_market(&self.venue, &coin, -size, self.p.stop, Some(self.p.take), self.p.hold_s).await {
                 Ok(tr) => {
                     self.event(json!({"what": "open", "coin": coin, "days_listed": (t - at) / DAY, "px": tr.entry_px, "size": tr.size,
                         "notional": tr.size.abs() * tr.entry_px, "take_px": tr.take_px, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "volume": v}));
-                    trades::register(&coin, "listing");
+                    trades::register(&coin, "listing", tr.risk());
                     self.state.open.push(tr);
                 }
                 Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
@@ -252,7 +253,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     let p = Params::from_env();
     let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     for tr in &state.open {
-        trades::register(&tr.coin, "listing");
+        trades::register(&tr.coin, "listing", tr.risk());
     }
     log!("listing: account {}: a listing shorted {:.0} days on (${:.0}M+ a day), stop {:.0}%, take {:.0}%, {:.0} days, risk {}, at most {}; {} held, {} coins known",
         venue.account, p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,

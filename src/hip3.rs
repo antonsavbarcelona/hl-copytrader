@@ -150,7 +150,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         }
     }
     for tr in &state.open {
-        crate::trades::register(&tr.coin, "hip3");
+        crate::trades::register(&tr.coin, "hip3", tr.risk());
     }
     if let Some((v, _)) = &venue {
         log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held", v.account, crate::trades::sizing_label(p.risk_usd, p.stop), p.stop * 100.0, p.max_open, state.open.len());
@@ -257,11 +257,12 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     changed = true;
                     // Traded (HIP3_LIVE=1): a coin of a USDC dex, within the limits.
                     let Some((v, max_lev)) = &venue else { continue };
-                    if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin) {
-                        log!("hip3: {coin} not traded (not on a USDC dex, at most open or held)");
+                    let risk = crate::trades::risk_usd(p.risk_usd);
+                    if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin, risk) {
+                        log!("hip3: {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
                         continue;
                     }
-                    let size = crate::trades::size_for(crate::trades::risk_usd(p.risk_usd), p.stop, mid);
+                    let size = crate::trades::size_for(risk, p.stop, mid);
                     let r = async {
                         crate::trades::h3_leverage(v, &coin, max_lev.get(&coin).copied().unwrap_or(1), &mut lev_set).await?;
                         crate::trades::open_market(v, &coin, size, p.stop, None, p.hold_s).await
@@ -270,7 +271,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         Ok(tr) => {
                             event(&store, json!({"what": "open", "coin": coin, "fall": fall, "window": w, "mid": mid, "px": tr.entry_px, "size": tr.size,
                                 "notional": tr.size * tr.entry_px, "stop_px": tr.stop_px, "hold_min": p.hold_s / 60.0}));
-                            crate::trades::register(&coin, "hip3");
+                            crate::trades::register(&coin, "hip3", tr.risk());
                             state.open.push(tr);
                         }
                         Err(e) => event(&store, json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),

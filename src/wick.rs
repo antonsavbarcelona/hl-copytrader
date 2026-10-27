@@ -12,7 +12,7 @@
 //! filled 0.5% under the last close) - and up when the level rises `WICK_REPRICE_PCT` (2) over it
 //! (the address's rate limit: not every minute); the crypto bids come off while BTC moves 1%+ in a
 //! minute. Filled (a wick through it): a resting stop `WICK_STOP_PCT` (20) under and a resting take
-//! `WICK_TAKE_PCT` (5) over the fill, out at market `WICK_HOLD_MIN` (60) later; sized so that the
+//! `WICK_TAKE_PCT` (5; HIP-3 `WICK_H3_TAKE_PCT`, 4) over the fill, out at market `WICK_HOLD_MIN` (60) later; sized so that the
 //! stop loses `WICK_RISK_USD` ($20; `FAMILY_RISK_PCT` of the equity when set); at most
 //! `WICK_MAX_OPEN` (2) crypto and `WICK_H3_MAX_OPEN` (2) HIP-3 trades and the family's caps (a side's
 //! bids off while it is full; all off when the family's open risk is); a coin not bid again for
@@ -28,7 +28,9 @@
 //! The pick (2026-10-27, the tape, the 24 h deviation known an hour before the fill): of the HIP-3 4%
 //! fills the top 5 by volume held 5% ($40 / 11 months), the top 5 by the deviation 69% ($589), 10 79%
 //! ($615); crypto 7%: the top 20 by volume 60% ($328 / 16 months), by the deviation 80% ($434), 30 93%
-//! ($475). A bid holds its margin: ~$10 a crypto one (10x), ~$41 a HIP-3 one, at $20 risk.
+//! ($475). The HIP-3 take (2026-10-27, the tape, the 4% bid on the USDC dexes, 307 fills, 60 min,
+//! stop 20%): 3% +119 bp, 4% +145 bp (hit 58%, halves +182 / +109), 5% +132 bp (hit 38%), 6% +126:
+//! 4% sits just under the last close the wick fell from. A bid holds its margin: ~$10 a crypto one (10x), ~$41 a HIP-3 one, at $20 risk.
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -72,6 +74,7 @@ struct Params {
     reprice: f64,
     reprice_down: f64,
     take: f64,
+    h3_take: f64,
     stop: f64,
     hold_s: f64,
     risk_usd: f64,
@@ -88,7 +91,7 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
             h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
-            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
+            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
             by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true) }
@@ -373,8 +376,8 @@ impl Wick {
         if !trades::trial_open(self.p.trial, n) {
             crate::notify::send(format!("🏁 проколы ({side}): проба окончена ({n} сделки), лимитки сняты"));
         }
-        let pct = if coin.contains(':') { self.p.h3_pct } else { self.p.pct };
-        match trades::protect(&self.venue, coin, got, px, self.p.stop, Some(self.p.take), self.p.hold_s).await {
+        let (pct, take) = if coin.contains(':') { (self.p.h3_pct, self.p.h3_take) } else { (self.p.pct, self.p.take) };
+        match trades::protect(&self.venue, coin, got, px, self.p.stop, Some(take), self.p.hold_s).await {
             Ok(tr) => {
                 self.event(json!({"what": "open", "coin": coin, "pct": pct, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
                     "stop_px": tr.stop_px, "hold_min": self.p.hold_s / 60.0}));
@@ -518,11 +521,11 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     for tr in &state.open {
         trades::register(&tr.coin, "wick", tr.risk());
     }
-    log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}%, stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
-        venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
+    log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}% (HIP-3 {:.0}%), stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
+        venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.h3_take * 100.0, p.stop * 100.0,
         p.hold_s / 60.0, trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open, if p.by_spread { "the 24 h deviation" } else { "volume" }, state.open.len());
-    crate::notify::send(format!("🎣 проколы лимиток НА ДЕНЬГИ: крипта лимитка на {:.0}% ниже на {} монетах (оборот от ${:.0}M), HIP-3 на {:.0}% ниже на {} монетах; тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, риск {}, до {} + {} позиций (крипта + HIP-3); монеты {}",
-        p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.take * 100.0, p.stop * 100.0, p.hold_s / 60.0,
+    crate::notify::send(format!("🎣 проколы лимиток НА ДЕНЬГИ: крипта лимитка на {:.0}% ниже на {} монетах (оборот от ${:.0}M), HIP-3 на {:.0}% ниже на {} монетах; тейк +{:.0}% (HIP-3 +{:.0}%), стоп {:.0}%, выход через {:.0} мин, риск {}, до {} + {} позиций (крипта + HIP-3); монеты {}",
+        p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.take * 100.0, p.h3_take * 100.0, p.stop * 100.0, p.hold_s / 60.0,
         trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open,
         if p.by_spread { "самые дёрганые за сутки (по разбросу минутных движений)" } else { "с наибольшим оборотом" })
         + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));

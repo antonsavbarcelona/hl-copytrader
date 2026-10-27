@@ -362,6 +362,26 @@ mod tests {
         assert!(signal(&c[..300], &p).is_none());                // too few bars
     }
 
+    /// The indicators against the research's (Python, v52lib) on real 5m closes: `RSIDIP_FIXTURE` = a JSON list of
+    /// {closes, rsi, ema, signal}. `cargo test -- --ignored the_research_s_indicators`.
+    #[test]
+    #[ignore]
+    fn the_research_s_indicators() {
+        let path = std::env::var("RSIDIP_FIXTURE").expect("RSIDIP_FIXTURE");
+        let fx: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let arr = |v: &Value| v.as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect::<Vec<f64>>();
+        let p = Params::from_env();
+        for f in &fx {
+            let (c, r0, e0) = (arr(&f["closes"]), arr(&f["rsi"]), arr(&f["ema"]));
+            let (r, e) = (rsi(&c, 14), ema(&c, 200));
+            for i in 0..c.len() {
+                assert!((r[i] - r0[i]).abs() < 1e-9, "{} rsi[{i}] {} vs {}", f["coin"], r[i], r0[i]);
+                assert!((e[i] / e0[i] - 1.0).abs() < 1e-12, "{} ema[{i}] {} vs {}", f["coin"], e[i], e0[i]);
+            }
+            assert_eq!(signal(&c, &p).is_some(), f["signal"].as_bool().unwrap(), "{} signal", f["coin"]);
+        }
+    }
+
     #[test]
     fn a_paper_buy() {
         let mut pos = Pos::default();

@@ -234,6 +234,34 @@ impl Closes {
         self.0.get(coin)?.iter().rev().find(|(m, _)| *m <= minute).map(|x| x.1)
     }
 
+    /// Older closes (the minute, the close) put before those seen, at most `keep` kept.
+    pub(crate) fn backfill(&mut self, coin: &str, older: &[(i64, f64)], keep: usize) {
+        let q = self.0.entry(coin.to_string()).or_default();
+        let first = q.front().map_or(i64::MAX, |x| x.0);
+        for x in older.iter().rev().filter(|x| x.0 < first) {
+            q.push_front(*x);
+        }
+        while q.len() > keep {
+            q.pop_front();
+        }
+    }
+
+    /// The standard deviation of the 1-minute returns over the `n` minutes to `minute` (the
+    /// pairs of minutes one apart, at least `min_n` of them).
+    pub(crate) fn spread(&self, coin: &str, minute: i64, n: i64, min_n: usize) -> Option<f64> {
+        let q = self.0.get(coin)?;
+        let (mut k, mut s, mut s2) = (0usize, 0.0, 0.0);
+        for (a, b) in q.iter().zip(q.iter().skip(1)) {
+            if b.0 == a.0 + 1 && b.0 <= minute && b.0 > minute - n && a.1 > 0.0 {
+                let r = b.1 / a.1 - 1.0;
+                k += 1;
+                s += r;
+                s2 += r * r;
+            }
+        }
+        (k >= min_n).then(|| (s2 / k as f64 - (s / k as f64).powi(2)).max(0.0).sqrt())
+    }
+
     /// The move over `w` minutes to the close of `minute` (it and the one `w` before both seen).
     pub(crate) fn change(&self, coin: &str, minute: i64, w: i64) -> Option<f64> {
         let q = self.0.get(coin)?;

@@ -1,9 +1,12 @@
 //! The wick bids (`WICK_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
 //! a resting buy `WICK_PCT` (7) under each liquid perp's anchor - the last minute's close, or its
-//! oracle when lower - on the `WICK_MAX_COINS` (20) coins with the most day volume of
-//! `WICK_MIN_VOL_USD` (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the
-//! last minute's close on the `WICK_H3_MAX_COINS` (5; 0: none) with `WICK_H3_MIN_VOL_USD` (1M)+ (hyna,
-//! the crypto copies, left out). A bid moves when its level drifts `WICK_REPRICE_PCT` (2) or more
+//! oracle when lower - on `WICK_MAX_COINS` (30) of the coins with a day volume of `WICK_MIN_VOL_USD`
+//! (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the last minute's close
+//! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (1M)+ (hyna, the crypto copies, left
+//! out). Which coins (every 5 min): the most restless - the biggest standard deviation of the 1-minute
+//! returns over the last 24 h (the main dex's mids every 5 s, every HIP-3 dex's every 15 s; after a
+//! start 24 h of 1-minute candles read, a coin a minute; a coin with under 6 h of them after the
+//! others, by volume); `WICK_PICK=volume`: the biggest day volume (the HIP-3 dexes bid on every 5 s). A bid moves when its level drifts `WICK_REPRICE_PCT` (2) or more
 //! (the address's rate limit: not every minute); the crypto bids come off while BTC moves 1%+ in a
 //! minute. Filled (a wick through it): a resting stop `WICK_STOP_PCT` (20) under and a resting take
 //! `WICK_TAKE_PCT` (5) over the fill, out at market `WICK_HOLD_MIN` (60) later; sized so that the
@@ -19,6 +22,10 @@
 //! The levels 2026-10-26 (the tape, the bot's trading at $20 risk, 2 slots): crypto 7% 13 trades a month
 //! +234 bp, $513 / 16 months (8%: 10, +273 bp, $428; 6% fails its first half); HIP-3 4% 43 a month
 //! +158 bp, $747 / 11 months, 12 of 12 months up (5%: 28, +257 bp, $784): more trades, the same $.
+//! The pick (2026-10-27, the tape, the 24 h deviation known an hour before the fill): of the HIP-3 4%
+//! fills the top 5 by volume held 5% ($40 / 11 months), the top 5 by the deviation 69% ($589), 10 79%
+//! ($615); crypto 7%: the top 20 by volume 60% ($328 / 16 months), by the deviation 80% ($434), 30 93%
+//! ($475). A bid holds its margin: ~$10 a crypto one (10x), ~$41 a HIP-3 one, at $20 risk.
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -43,6 +50,13 @@ const VOLUME_EVERY_S: f64 = 300.0;
 const ORACLE_EVERY_S: f64 = 60.0;
 const AGAIN_AFTER_S: f64 = 3600.0;
 const BTC_MAX_MINUTE: f64 = 0.01;
+/// The minutes of closes kept a coin (24 h), the fewest returns its deviation is read from (6 h).
+const HIST: usize = 1441;
+const MIN_HIST: usize = 360;
+/// A coin's 24 h of 1-minute candles read at most this often, and every HIP-3 dex's mids (the
+/// deviation picking from all of them) this often: the API's weight (the HIP-3 dip reads them too).
+const BACKFILL_EVERY_S: f64 = 60.0;
+const H3_MIDS_EVERY_S: f64 = 15.0;
 
 #[derive(Clone, Debug)]
 struct Params {
@@ -61,16 +75,19 @@ struct Params {
     h3_max_open: usize,
     /// The trial (`WICK_ENABLED` unset): each side's live trades at most.
     trial: Option<u32>,
+    /// The coins picked by the 24 h deviation (else by the day volume).
+    by_spread: bool,
 }
 
 impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
-        Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 20.0) as usize,
-            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 5.0) as usize,
+        Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
+            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
-            h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten() }
+            h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
+            by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true) }
     }
 }
 
@@ -111,10 +128,16 @@ fn drifted(old: f64, new: f64, reprice: f64) -> bool {
     old <= 0.0 || (new / old - 1.0).abs() >= reprice
 }
 
-/// The coins to bid: the top `n` by volume of `min_vol`+ (left out: those `skip` says).
-fn pick(volume: &HashMap<String, f64>, min_vol: f64, n: usize, skip: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut v: Vec<(&String, &f64)> = volume.iter().filter(|(c, x)| **x >= min_vol && !skip(c)).collect();
-    v.sort_by(|a, b| b.1.total_cmp(a.1));
+/// The coins to bid: of those with a volume of `min_vol`+ (left out: those `skip` says), the top `n`
+/// by `score` (the coins without one after, by volume).
+fn pick(volume: &HashMap<String, f64>, min_vol: f64, n: usize, skip: impl Fn(&str) -> bool, score: impl Fn(&str) -> Option<f64>) -> Vec<String> {
+    let mut v: Vec<(&String, Option<f64>, f64)> = volume.iter().filter(|(c, x)| **x >= min_vol && !skip(c)).map(|(c, x)| (c, score(c), *x)).collect();
+    v.sort_by(|a, b| match (a.1, b.1) {
+        (Some(x), Some(y)) => y.total_cmp(&x),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.2.total_cmp(&a.2),
+    });
     v.into_iter().take(n).map(|x| x.0.clone()).collect()
 }
 
@@ -150,6 +173,10 @@ struct Wick {
     h3_volume: HashMap<String, f64>,
     held: HashMap<String, f64>,
     lev_set: HashSet<String>,
+    /// The coins bid on (crypto, HIP-3), picked every `VOLUME_EVERY_S`; the coins whose candles were read.
+    picked: Vec<String>,
+    h3_picked: Vec<String>,
+    backfilled: HashSet<String>,
 }
 
 impl Wick {
@@ -217,7 +244,7 @@ impl Wick {
             _ => false,
         };
         if btc_calm && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
-            for c in pick(&self.volume, self.p.min_vol, self.p.max_coins, |c| c == "BTC" || !self.venue.coins.contains_key(c)) {
+            for c in self.picked.clone() {
                 let (Some(close), o) = (self.closes.at(&c, minute - 1), self.oracle.get(&c).copied().unwrap_or(0.0)) else { continue };
                 if !free(&c) {
                     continue;
@@ -227,7 +254,7 @@ impl Wick {
             }
         }
         if self.p.h3_max_coins > 0 && n_h3 < self.p.h3_max_open && trades::trial_open(self.p.trial, self.state.h3_opened) {
-            for c in pick(&self.h3_volume, self.p.h3_min_vol, self.p.h3_max_coins, |c| c.starts_with("hyna:") || !self.venue.coins.contains_key(c)) {
+            for c in self.h3_picked.clone() {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
                 if free(&c) {
                     out.insert(c, level(close, self.p.h3_pct));
@@ -237,19 +264,51 @@ impl Wick {
         out
     }
 
-    /// The prices of the main dex and of the dexes bid on.
-    async fn read_mids(&mut self, minute: i64) {
+    /// The coins to bid on now: crypto and HIP-3.
+    fn repick(&mut self, minute: i64) {
+        let closes = &self.closes;
+        let by_spread = self.p.by_spread;
+        let spread = |c: &str| if by_spread { closes.spread(c, minute - 1, HIST as i64 - 1, MIN_HIST) } else { None };
+        let coins = &self.venue.coins;
+        self.picked = pick(&self.volume, self.p.min_vol, self.p.max_coins, |c| c == "BTC" || !coins.contains_key(c), spread);
+        self.h3_picked = if self.p.h3_max_coins > 0 {
+            pick(&self.h3_volume, self.p.h3_min_vol, self.p.h3_max_coins, |c| c.starts_with("hyna:") || !coins.contains_key(c), spread)
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// One coin's 24 h of 1-minute closes (the liquid ones without 6 h of them, the biggest first).
+    async fn backfill(&mut self) {
+        let (coins, closes, done) = (&self.venue.coins, &self.closes, &self.backfilled);
+        let short = |c: &String| !done.contains(c) && coins.contains_key(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_HIST);
+        let mut todo: Vec<(&String, &f64)> = self.volume.iter().filter(|(c, x)| **x >= self.p.min_vol && c.as_str() != "BTC" && short(c))
+            .chain(self.h3_volume.iter().filter(|(c, x)| **x >= self.p.h3_min_vol && !c.starts_with("hyna:") && short(c))).collect();
+        todo.sort_by(|a, b| b.1.total_cmp(a.1));
+        let Some(c) = todo.first().map(|x| x.0.clone()) else { return };
+        self.backfilled.insert(c.clone());
+        match self.api.minute_closes(&c, now() - HIST as f64 * 60.0).await {
+            Ok(v) => self.closes.backfill(&c, &v, HIST),
+            Err(e) => log!("wick: {c} candles not read: {e:#}"),
+        }
+    }
+
+    /// The prices of the main dex and, with `h3`, of the HIP-3 dexes: by the deviation every one
+    /// (the coins not bid on too), else those bid on.
+    async fn read_mids(&mut self, minute: i64, h3: bool) {
         let mut dexes: HashSet<String> = HashSet::from([String::new()]);
-        if self.p.h3_max_coins > 0 {
-            for c in pick(&self.h3_volume, self.p.h3_min_vol, self.p.h3_max_coins, |c| c.starts_with("hyna:")) {
-                dexes.insert(dex_of(&c).to_string());
+        if h3 && self.p.h3_max_coins > 0 {
+            if self.p.by_spread {
+                dexes.extend(self.venue.coins.keys().filter(|c| !c.starts_with("hyna:")).filter_map(|c| c.split_once(':').map(|d| d.0.to_string())));
+            } else {
+                dexes.extend(self.h3_picked.iter().map(|c| dex_of(c).to_string()));
             }
         }
         for d in dexes {
             match self.api.mids(&d).await {
                 Ok(m) => {
                     for (c, px) in m {
-                        self.closes.update(&c, minute, px, 4);
+                        self.closes.update(&c, minute, px, HIST);
                     }
                 }
                 Err(e) => log!("wick: mids {d} not read: {e:#}"),
@@ -458,24 +517,27 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     for tr in &state.open {
         trades::register(&tr.coin, "wick", tr.risk());
     }
-    log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}%, stop {:.0}%, {:.0} min, risk {}, at most {} + {}; {} held",
+    log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}%, stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
         venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
-        p.hold_s / 60.0, trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open, state.open.len());
-    crate::notify::send(format!("🎣 проколы лимиток НА ДЕНЬГИ: крипта лимитка на {:.0}% ниже на {} монетах (оборот от ${:.0}M), HIP-3 на {:.0}% ниже на {} монетах; тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, риск {}, до {} + {} позиций (крипта + HIP-3)",
+        p.hold_s / 60.0, trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open, if p.by_spread { "the 24 h deviation" } else { "volume" }, state.open.len());
+    crate::notify::send(format!("🎣 проколы лимиток НА ДЕНЬГИ: крипта лимитка на {:.0}% ниже на {} монетах (оборот от ${:.0}M), HIP-3 на {:.0}% ниже на {} монетах; тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, риск {}, до {} + {} позиций (крипта + HIP-3); монеты {}",
         p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.take * 100.0, p.stop * 100.0, p.hold_s / 60.0,
-        trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open)
+        trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open,
+        if p.by_spread { "самые дёрганые за сутки (по разбросу минутных движений)" } else { "с наибольшим оборотом" })
         + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));
     let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
-        volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new() };
+        volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new(),
+        picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new() };
     tokio::spawn(async move {
-        let (mut vol_at, mut oracle_at, mut orders_at) = (0.0, 0.0, 0.0);
+        let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at) = (0.0, 0.0, 0.0, 0.0, 0.0);
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
             tick.tick().await;
             let t = now();
             let minute = (t / 60.0).floor() as i64;
-            if t - vol_at >= VOLUME_EVERY_S {
+            let repick = t - vol_at >= VOLUME_EVERY_S;
+            if repick {
                 w.read_ctx(true).await;
                 vol_at = t;
                 oracle_at = t;
@@ -483,7 +545,18 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 w.read_ctx(false).await;
                 oracle_at = t;
             }
-            w.read_mids(minute).await;
+            let h3 = !w.p.by_spread || t - h3_at >= H3_MIDS_EVERY_S;
+            w.read_mids(minute, h3).await;
+            if h3 {
+                h3_at = t;
+            }
+            if repick {
+                w.repick(minute);
+            }
+            if w.p.by_spread && t - backfill_at >= BACKFILL_EVERY_S {
+                w.backfill().await;
+                backfill_at = t;
+            }
             if t - orders_at >= ORDERS_EVERY_S {
                 w.check().await;
                 orders_at = t;
@@ -509,8 +582,26 @@ mod tests {
         assert!(drifted(92.0, 94.0, 0.02));
         assert!(drifted(0.0, 94.0, 0.02));
         let vol: HashMap<String, f64> = [("A".into(), 50e6), ("B".into(), 20e6), ("C".into(), 5e6), ("hyna:X".into(), 90e6)].into();
-        assert_eq!(pick(&vol, 10e6, 5, |c| c.starts_with("hyna:")), vec!["A".to_string(), "B".to_string()]);
-        assert_eq!(pick(&vol, 10e6, 1, |_| false), vec!["hyna:X".to_string()]);
+        assert_eq!(pick(&vol, 10e6, 5, |c| c.starts_with("hyna:"), |_| None), vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(pick(&vol, 10e6, 1, |_| false, |_| None), vec!["hyna:X".to_string()]);
+        // By the score first (B the more restless), the coins without one after by volume.
+        let score = |c: &str| match c { "B" => Some(0.02), "hyna:X" => Some(0.01), _ => None };
+        assert_eq!(pick(&vol, 10e6, 3, |_| false, score), vec!["B".to_string(), "hyna:X".to_string(), "A".to_string()]);
+    }
+
+    #[test]
+    fn the_deviation_and_the_candles() {
+        let mut cl = Closes::default();
+        // 400 minutes alternating 100 / 101: returns +1% / -0.99%.
+        let older: Vec<(i64, f64)> = (0..400).map(|m| (m, if m % 2 == 0 { 100.0 } else { 101.0 })).collect();
+        cl.update("A", 400, 100.0, HIST);
+        cl.backfill("A", &older, HIST);
+        assert_eq!(cl.0["A"].len(), 401);
+        let sd = cl.spread("A", 400, 1440, MIN_HIST).unwrap();
+        assert!((sd - 0.00995).abs() < 1e-4, "{sd}");
+        assert!(cl.spread("A", 400, 100, MIN_HIST).is_none());       // under 360 returns in the window
+        cl.backfill("A", &[(5, 1.0)], HIST);                            // not older than what it has: left out
+        assert_eq!(cl.0["A"].front(), Some(&(0, 100.0)));
         assert_eq!(dex_of("xyz:TSLA"), "xyz");
         assert_eq!(dex_of("SOL"), "");
         let m = message(&json!({"what": "close", "coin": "SOL", "why": "take", "entry_px": 92.0, "px": 96.6, "ret_pct": 5.0, "pnl_usd": 5.0})).unwrap();

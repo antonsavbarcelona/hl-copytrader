@@ -192,6 +192,14 @@ impl Api {
         Ok(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect())
     }
 
+    /// A coin's 1-minute closes from `start` (s) on: (the minute, the close).
+    pub async fn minute_closes(&self, coin: &str, start: f64) -> Result<Vec<(i64, f64)>> {
+        let n = ((now() - start) / 60.0).max(1.0);
+        let body = json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": (start * 1000.0) as i64, "endTime": (now() * 1000.0) as i64}});
+        let v = self.info(body, 20 + (n / 60.0).ceil() as u32).await?;
+        Ok(v.as_array().into_iter().flatten().filter_map(|c| Some((c["t"].as_i64()? / 60_000, num(&c["c"])))).filter(|x| x.1 > 0.0).collect())
+    }
+
     /// A HIP-3 dex's coins and their day volume ($).
     pub async fn dex_volumes(&self, dex: &str) -> Result<HashMap<String, f64>> {
         let v = self.info(json!({"type": "metaAndAssetCtxs", "dex": dex}), 20).await?;

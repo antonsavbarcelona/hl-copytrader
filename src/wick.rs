@@ -4,9 +4,12 @@
 //! (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the last minute's close
 //! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (1M)+ (hyna, the crypto copies, left
 //! out). Which coins (every 5 min): the most restless - the biggest standard deviation of the 1-minute
-//! returns over the last 24 h (the main dex's mids every 5 s, every HIP-3 dex's every 15 s; after a
-//! start 24 h of 1-minute candles read, a coin a minute; a coin with under 6 h of them after the
-//! others, by volume); `WICK_PICK=volume`: the biggest day volume (the HIP-3 dexes bid on every 5 s). A bid moves when its level drifts `WICK_REPRICE_PCT` (2) or more
+//! returns over the last 24 h (the main dex's and the bid HIP-3 dexes' mids every 5 s, every other
+//! HIP-3 dex's every 30 s; after a start 24 h of 1-minute candles read, a coin a minute; a coin with
+//! under 6 h of them after the others, by volume); `WICK_PICK=volume`: the biggest day volume. A bid
+//! moves down as soon as its level falls `WICK_REPRICE_DOWN_PCT` (0.2) under it - never resting
+//! over the level the research had, or a slow slide fills it (xyz:MRNA 2026-10-27: a bid 3.5% stale,
+//! filled 0.5% under the last close) - and up when the level rises `WICK_REPRICE_PCT` (2) over it
 //! (the address's rate limit: not every minute); the crypto bids come off while BTC moves 1%+ in a
 //! minute. Filled (a wick through it): a resting stop `WICK_STOP_PCT` (20) under and a resting take
 //! `WICK_TAKE_PCT` (5) over the fill, out at market `WICK_HOLD_MIN` (60) later; sized so that the
@@ -56,7 +59,7 @@ const MIN_HIST: usize = 360;
 /// A coin's 24 h of 1-minute candles read at most this often, and every HIP-3 dex's mids (the
 /// deviation picking from all of them) this often: the API's weight (the HIP-3 dip reads them too).
 const BACKFILL_EVERY_S: f64 = 60.0;
-const H3_MIDS_EVERY_S: f64 = 15.0;
+const H3_MIDS_EVERY_S: f64 = 30.0;
 
 #[derive(Clone, Debug)]
 struct Params {
@@ -67,6 +70,7 @@ struct Params {
     h3_min_vol: f64,
     h3_max_coins: usize,
     reprice: f64,
+    reprice_down: f64,
     take: f64,
     stop: f64,
     hold_s: f64,
@@ -84,7 +88,7 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
             h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
-            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
+            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
             by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true) }
@@ -124,8 +128,8 @@ fn level(anchor: f64, pct: f64) -> f64 {
 }
 
 /// Whether a resting bid at `old` should move to `new`.
-fn drifted(old: f64, new: f64, reprice: f64) -> bool {
-    old <= 0.0 || (new / old - 1.0).abs() >= reprice
+fn drifted(old: f64, new: f64, up: f64, down: f64) -> bool {
+    old <= 0.0 || new >= old * (1.0 + up) || new <= old * (1.0 - down)
 }
 
 /// The coins to bid: of those with a volume of `min_vol`+ (left out: those `skip` says), the top `n`
@@ -293,16 +297,13 @@ impl Wick {
         }
     }
 
-    /// The prices of the main dex and, with `h3`, of the HIP-3 dexes: by the deviation every one
-    /// (the coins not bid on too), else those bid on.
-    async fn read_mids(&mut self, minute: i64, h3: bool) {
+    /// The prices of the main dex and of the HIP-3 dexes bid on (the anchors: every poll); with
+    /// `all`, every HIP-3 dex (the deviations of the coins not bid on).
+    async fn read_mids(&mut self, minute: i64, all: bool) {
         let mut dexes: HashSet<String> = HashSet::from([String::new()]);
-        if h3 && self.p.h3_max_coins > 0 {
-            if self.p.by_spread {
-                dexes.extend(self.venue.coins.keys().filter(|c| !c.starts_with("hyna:")).filter_map(|c| c.split_once(':').map(|d| d.0.to_string())));
-            } else {
-                dexes.extend(self.h3_picked.iter().map(|c| dex_of(c).to_string()));
-            }
+        dexes.extend(self.h3_picked.iter().map(|c| dex_of(c).to_string()));
+        if all && self.p.by_spread && self.p.h3_max_coins > 0 {
+            dexes.extend(self.venue.coins.keys().filter(|c| !c.starts_with("hyna:")).filter_map(|c| c.split_once(':').map(|d| d.0.to_string())));
         }
         for d in dexes {
             match self.api.mids(&d).await {
@@ -330,7 +331,7 @@ impl Wick {
         for (c, lvl) in want {
             let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.stop, lvl);
             if let Some(b) = self.state.bids.get(&c) {
-                if !drifted(b.px, lvl, self.p.reprice) {
+                if !drifted(b.px, lvl, self.p.reprice, self.p.reprice_down) {
                     continue;
                 }
                 self.venue.cancel(&c, b.oid).await;
@@ -545,9 +546,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 w.read_ctx(false).await;
                 oracle_at = t;
             }
-            let h3 = !w.p.by_spread || t - h3_at >= H3_MIDS_EVERY_S;
-            w.read_mids(minute, h3).await;
-            if h3 {
+            let all = t - h3_at >= H3_MIDS_EVERY_S;
+            w.read_mids(minute, all).await;
+            if all {
                 h3_at = t;
             }
             if repick {
@@ -578,9 +579,12 @@ mod tests {
     #[test]
     fn levels_drift_and_the_pick() {
         assert!((level(100.0, 0.08) - 92.0).abs() < 1e-12);
-        assert!(!drifted(92.0, 93.0, 0.02));
-        assert!(drifted(92.0, 94.0, 0.02));
-        assert!(drifted(0.0, 94.0, 0.02));
+        assert!(!drifted(92.0, 93.0, 0.02, 0.002));      // up 1.1%: stays
+        assert!(drifted(92.0, 94.0, 0.02, 0.002));       // up 2.2%: moves
+        assert!(!drifted(92.0, 91.9, 0.02, 0.002));      // down 0.1%: stays
+        assert!(drifted(92.0, 91.7, 0.02, 0.002));       // down 0.3%: moves at once
+        assert!(drifted(186.24, 179.7, 0.02, 0.002));    // the MRNA case: the level 3.5% under the bid
+        assert!(drifted(0.0, 94.0, 0.02, 0.002));
         let vol: HashMap<String, f64> = [("A".into(), 50e6), ("B".into(), 20e6), ("C".into(), 5e6), ("hyna:X".into(), 90e6)].into();
         assert_eq!(pick(&vol, 10e6, 5, |c| c.starts_with("hyna:"), |_| None), vec!["A".to_string(), "B".to_string()]);
         assert_eq!(pick(&vol, 10e6, 1, |_| false, |_| None), vec!["hyna:X".to_string()]);

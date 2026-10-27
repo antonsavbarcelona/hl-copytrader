@@ -20,6 +20,7 @@ mod live;
 mod notify;
 mod report;
 mod rollstats;
+mod rsidip;
 mod stable;
 mod stats;
 mod store;
@@ -72,6 +73,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
         hip3::start(&cfg, store.clone(), api.clone()).await?;
         wick::start(&cfg, store.clone(), api.clone()).await?;
+        rsidip::start(&cfg, store.clone(), api.clone()).await?;
         listing::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
@@ -88,6 +90,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
     hip3::start(&cfg, store.clone(), api.clone()).await?;
     wick::start(&cfg, store.clone(), api.clone()).await?;
+    rsidip::start(&cfg, store.clone(), api.clone()).await?;
     listing::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;

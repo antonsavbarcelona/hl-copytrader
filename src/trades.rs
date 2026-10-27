@@ -89,10 +89,19 @@ pub(crate) fn equity() -> f64 {
     *EQUITY.lock().unwrap()
 }
 
-/// A trade's risk ($ its stop loses): `FAMILY_RISK_PCT` (0: off) of the equity when set and the
-/// equity known (the compounding: the sizes follow the deposit), else the strategy's own `usd`.
+/// The family's risk a trade, % of the equity: `FAMILY_RISK_PCT` (3.3; 0: off, each strategy's own $).
+/// The 20% setting (2026-10-27, V60/V61 on the tape, 2025-05 .. 2026-10, all the strategies on one
+/// deposit, compounding, the slots, one a coin): 3.3% a trade within a `FAMILY_RISK_CAP_PCT` of 20%,
+/// the dip held 120 min, the pump short 240, the listing's take 30%, the RSI dip a third a buy:
+/// +1,108%, the drawdown with the open 17.3% (3.38%: 20.2%), ~2.9 trades a day.
+pub(crate) fn family_risk_pct() -> f64 {
+    env_f("FAMILY_RISK_PCT", 3.3)
+}
+
+/// A trade's risk ($ its stop loses): `family_risk_pct` of the equity when on and the equity known
+/// (the compounding: the sizes follow the deposit), else the strategy's own `usd`.
 pub(crate) fn risk_usd(usd: f64) -> f64 {
-    let pct = env_f("FAMILY_RISK_PCT", 0.0);
+    let pct = family_risk_pct();
     let eq = equity();
     if pct > 0.0 && eq > 0.0 { pct / 100.0 * eq } else { usd }
 }
@@ -107,12 +116,12 @@ pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64)>) {
     }
 }
 
-/// Whether one more trade risking `risk` $ fits: the coin free, `FAMILY_MAX_OPEN` (12; 0: no cap)
-/// trades at once, and the open trades' risks with it within `FAMILY_RISK_CAP_PCT` (10; 0: no cap)
-/// of the equity (the deposit's simultaneous risk; each strategy keeps its own slots besides).
+/// Whether one more trade risking `risk` $ fits: the coin free, `FAMILY_MAX_OPEN` (0: no cap, as the
+/// 20% setting) trades at once, and the open trades' risks with it within `FAMILY_RISK_CAP_PCT` (20;
+/// 0: no cap) of the equity (the deposit's simultaneous risk; each strategy keeps its own slots besides).
 pub(crate) fn can_open(coin: &str, risk: f64) -> bool {
-    let cap = env_f("FAMILY_MAX_OPEN", 12.0) as usize;
-    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 10.0) / 100.0;
+    let cap = env_f("FAMILY_MAX_OPEN", 0.0) as usize;
+    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 20.0) / 100.0;
     let eq = equity();
     let g = OPEN.lock().unwrap();
     let (n, open_risk, held) = g.as_ref().map_or((0, 0.0, false), |m| (m.len(), m.values().map(|x| x.1).sum::<f64>(), m.contains_key(coin)));
@@ -131,7 +140,7 @@ pub(crate) fn unregister(coin: &str) {
 
 /// The family's line for the chat: the sizing and the cap.
 pub(crate) fn sizing_label(usd: f64, stop: f64) -> String {
-    let pct = env_f("FAMILY_RISK_PCT", 0.0);
+    let pct = family_risk_pct();
     if pct > 0.0 { format!("{pct:.1}% депозита на сделку (позиция {:.0}% депозита)", pct / stop) } else { format!("${usd:.0} на сделку (позиция ${:.0})", usd / stop) }
 }
 

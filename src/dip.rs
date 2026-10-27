@@ -2,7 +2,7 @@
 //! as for `live`): a perp with `DIP_MIN_VOL_USD` (20M) or more traded over the last 24 h whose mid
 //! fell `DIP_DROP_PCT` (8) or more over the last `DIP_WINDOW_MIN` (15) minutes, by the minutes'
 //! closes, while BTC's moved less than `DIP_BTC_MAX_PCT` (2) over them (the coin's own fall, not
-//! the market's), is bought at market as its minute closes; out at market `DIP_HOLD_MIN` (60)
+//! the market's), is bought at market as its minute closes; out at market `DIP_HOLD_MIN` (120; 60 until 2026-10-27, V16: 120 the better)
 //! later, with a resting stop `DIP_STOP_PCT` (20) under our fill; sized so that the stop loses
 //! `DIP_RISK_USD` ($20; 0: `DIP_RISK_PCT` (5) of the account's equity instead: 25% a trade); at most
 //! `DIP_MAX_OPEN` (3) open, one a coin, a coin not again for `DIP_COOLDOWN_MIN` (240) after its
@@ -37,7 +37,7 @@
 //! The same family's other side (`PUMP_ENABLED=1`, off by default; DIP V1 above is untouched by
 //! it): a perp with `PUMP_MIN_VOL_USD` (10M) or more a day, traded `PUMP_MIN_AGE_DAYS` (14)+, whose
 //! mid rose `PUMP_RISE_PCT` (20) or more over the same window is shorted at market; out at market
-//! `PUMP_HOLD_MIN` (120) later, no take, a resting stop `PUMP_STOP_PCT` (50) above our fill, sized
+//! `PUMP_HOLD_MIN` (240) later, no take, a resting stop `PUMP_STOP_PCT` (50) above our fill, sized
 //! so that it loses `PUMP_RISK_USD` ($20; 0: `PUMP_RISK_PCT` (10) of the equity: a short of 20%); at most `PUMP_MAX_OPEN`
 //! (3), a coin not again for 240 min after its move of the rise either way. The archive research
 //! of 2026-10-25 (the raw tape, the short at the worst price of the first block a second after):
@@ -99,7 +99,11 @@ struct Params {
 /// The $ a trade's stop loses: `FAMILY_RISK_PCT` of the equity when set (one deposit for the whole
 /// family, compounding; see `trades`), else `usd` when set, else `pct` of the equity.
 fn risk_dollars(pct: f64, usd: f64, equity: f64) -> f64 {
-    let family = std::env::var("FAMILY_RISK_PCT").ok().and_then(|x| x.trim().parse::<f64>().ok()).unwrap_or(0.0);
+    risk_with(crate::trades::family_risk_pct(), pct, usd, equity)
+}
+
+/// `risk_dollars` with the family's % given (0: off).
+fn risk_with(family: f64, pct: f64, usd: f64, equity: f64) -> f64 {
     if family > 0.0 && equity > 0.0 { family / 100.0 * equity } else if usd > 0.0 { usd } else { pct * equity }
 }
 
@@ -118,7 +122,11 @@ fn rsi(closes: &[f64], n: usize) -> Option<f64> {
     Some(100.0 - 100.0 / (1.0 + up / dn.max(1e-12)))
 }
 
-/// The risk as said in the chat and the log.
+/// The risk as said in the chat and the log: the family's when on (see `risk_dollars`).
+fn risk_text(pct: f64, usd: f64, stop: f64) -> String {
+    if crate::trades::family_risk_pct() > 0.0 { crate::trades::sizing_label(usd, stop) } else { risk_label(pct, usd, stop) }
+}
+
 fn risk_label(pct: f64, usd: f64, stop: f64) -> String {
     if usd > 0.0 { format!("${usd:.0} на сделку (позиция ${:.0})", usd / stop) } else { format!("{:.1}% на сделку ({:.0}% депозита)", pct * 100.0, pct / stop * 100.0) }
 }
@@ -146,11 +154,11 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         let on = |k: &str| std::env::var(k).unwrap_or_default().trim() == "1";
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
-            min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 60.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
+            min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0),
             pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
-                min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 120.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
+                min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 240.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
     }
 }
@@ -304,22 +312,22 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     let p = Params::from_env();
     log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
         if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.window, p.btc_max * 100.0,
-        p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_label(p.risk, p.risk_usd, p.stop), p.max_open);
+        p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open);
     if std::env::var("LIVE_ENABLED").unwrap_or_default().trim() == "1" {
         log!("dip: LIVE_ENABLED is on too: the copy's coins are left alone (one position a coin on the account)");
     }
     crate::notify::send(format!("🤖 покупка падений запущена{} ({}), открыто {}
 сигнал: падение {:.0}% за {} мин (BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {}, до {} позиций",
         if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
-        p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_label(p.risk, p.risk_usd, p.stop), p.max_open));
+        p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open));
     let q = &p.pump;
     if q.enabled {
         log!("dip: the pump short is on{}: a rise of {:.0}% in {} min (${:.0}M+ a day, {:.0}+ days traded), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
-            if q.dry { " (DRY: signals only)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0, risk_label(q.risk, q.risk_usd, q.stop), q.max_open);
+            if q.dry { " (DRY: signals only)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0, risk_text(q.risk, q.risk_usd, q.stop), q.max_open);
         crate::notify::send(format!("🔻 шорт пампов запущен{}
 сигнал: рост {:.0}% за {} мин (оборот от ${:.0}M, монете {:.0}+ дней), держим {:.0} мин, без тейка, стоп +{:.0}%, риск {}, до {} позиций",
             if q.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, q.rise * 100.0, p.window, q.min_vol / 1e6, q.min_age_days, q.hold_s / 60.0, q.stop * 100.0,
-            risk_label(q.risk, q.risk_usd, q.stop), q.max_open) + &crate::trades::trial_label(q.trial, state.pumps_opened));
+            risk_text(q.risk, q.risk_usd, q.stop), q.max_open) + &crate::trades::trial_label(q.trial, state.pumps_opened));
     } else {
         log!("dip: the pump short is off (PUMP_ENABLED=0)");
     }
@@ -1048,9 +1056,9 @@ mod tests {
 
     #[test]
     fn the_risk_in_dollars_or_of_the_equity() {
-        assert_eq!(risk_dollars(0.05, 20.0, 1000.0), 20.0);     // $20 whatever the equity
-        assert_eq!(risk_dollars(0.05, 0.0, 1000.0), 50.0);      // 0: the share of the equity
-        assert!((risk_dollars(0.05, 20.0, 1000.0) / 0.20 - 100.0).abs() < 1e-9);   // the dip: a $100 position at a 20% stop
+        assert_eq!(risk_with(0.0, 0.05, 20.0, 1000.0), 20.0);     // $20 whatever the equity
+        assert_eq!(risk_with(0.0, 0.05, 0.0, 1000.0), 50.0);      // 0: the share of the equity
+        assert!((risk_with(0.0, 0.05, 20.0, 1000.0) / 0.20 - 100.0).abs() < 1e-9);   // the dip: a $100 position at a 20% stop
         assert!(risk_label(0.10, 20.0, 0.50).contains("$40"));   // the pump short: $40 at +50%
     }
 

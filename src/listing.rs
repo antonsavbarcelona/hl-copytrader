@@ -1,7 +1,7 @@
 //! The listing short (`LIST_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the
 //! dip): a perp newly listed on the main dex (its first daily candle), `LIST_DELAY_DAYS` (7) on,
 //! with `LIST_MIN_VOL_USD` (5M) or more a day, is shorted at market; a resting stop `LIST_STOP_PCT`
-//! (25) over, a resting take `LIST_TAKE_PCT` (20) under, out at market `LIST_HOLD_DAYS` (14) later;
+//! (25) over, a resting take `LIST_TAKE_PCT` (30; 20 until 2026-10-27) under, out at market `LIST_HOLD_DAYS` (14) later;
 //! the stop losing `LIST_RISK_USD` ($20; `FAMILY_RISK_PCT` of the equity when set); at most
 //! `LIST_MAX_OPEN` (3) and the family's cap; each listing once. Coins listed before the first look
 //! (older than 60 days) are never shorted.
@@ -49,7 +49,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { delay_days: v("LIST_DELAY_DAYS", 7.0), min_vol: v("LIST_MIN_VOL_USD", 5e6), stop: v("LIST_STOP_PCT", 25.0) / 100.0,
-            take: v("LIST_TAKE_PCT", 20.0) / 100.0, hold_s: v("LIST_HOLD_DAYS", 14.0) * DAY, risk_usd: v("LIST_RISK_USD", 20.0),
+            take: v("LIST_TAKE_PCT", 30.0) / 100.0, hold_s: v("LIST_HOLD_DAYS", 14.0) * DAY, risk_usd: v("LIST_RISK_USD", 20.0),
             max_open: v("LIST_MAX_OPEN", 3.0) as usize, trial: trades::switch("LIST_ENABLED").flatten() }
     }
 }

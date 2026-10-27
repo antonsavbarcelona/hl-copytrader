@@ -1,42 +1,54 @@
-//! The RSI dip on paper (`RSIDIP_ENABLED`, on by default; "0" off): no orders, the trades simulated on
-//! the mids and logged (events kind `rsidip`: `open` / `add` / `close`, to the chat too) to check live
-//! what the archive found. On each 5-minute close: a main-dex perp with `RSIDIP_MIN_VOL_USD` (10M)+ a
-//! day whose RSI14 (Wilder, the 5m closes) was under `RSIDIP_RSI_MAX` (35) the bar before and is up
-//! now, the close `RSIDIP_UNDER_PCT` (8) or more under the EMA200 of the 5m closes, BTC's last 15
-//! minutes under `RSIDIP_BTC_MAX_PCT` (0.5): bought at the mid; up to `RSIDIP_ADDS` (2) adds, each at a
-//! 5m close `RSIDIP_ADD_PCT` (3) under the last buy; out at the average +`RSIDIP_TAKE_PCT` (2) (a
-//! resting limit: maker), at the average -`RSIDIP_STOP_PCT` (20) or `RSIDIP_HOLD_H` (24) h on (taker);
-//! a buy of `RSIDIP_RISK_USD` / the stop ($10 / 20% = $50) each; one a coin, at most `RSIDIP_MAX_OPEN`
-//! (3). Costs: taker 4.5 bp + 5 bp slippage, maker 1.5 bp, a stop +5 bp; no funding.
+//! The RSI dip (`RSIDIP_ENABLED`: unset the trial, its first `TRIAL_TRADES` (3) positions live, then
+//! paper; "1" live; "0" off; without `LIVE_KEY` / `LIVE_ACCOUNT` paper only). On each 5-minute close: a
+//! main-dex perp with `RSIDIP_MIN_VOL_USD` (10M)+ a day whose RSI14 (Wilder, the 5m closes) was under
+//! `RSIDIP_RSI_MAX` (35) the bar before and is up now, the close `RSIDIP_UNDER_PCT` (8) or more under the
+//! EMA200 of the 5m closes, BTC's last 15 minutes under `RSIDIP_BTC_MAX_PCT` (0.5): bought at market; up
+//! to `RSIDIP_ADDS` (2) adds at market, each at a 5m close `RSIDIP_ADD_PCT` (3) under the last buy; out at
+//! the average +`RSIDIP_TAKE_PCT` (2) (a resting reduce-only limit: maker), at the average
+//! -`RSIDIP_STOP_PCT` (20) (a resting stop) or `RSIDIP_HOLD_H` (24) h after the first buy (market). After
+//! each add the stop and the take are placed again for the whole size at the new average (the new stop
+//! first; it not placed: the position closed). A buy risks a third of the family's risk
+//! (`trades::risk_usd`: 3.3% of the equity, so 1.1% a buy at its 20% stop, 5.5% of the equity in coin;
+//! `RSIDIP_RISK_USD` ($10) a buy when the family's is off) and a position reserves all its buys' risk in
+//! the family's cap from the first; one a coin (the family's too), at most `RSIDIP_MAX_OPEN` (3) live
+//! and as many on paper. Paper (the trial over, the cap full, no account): simulated on the mids, costs
+//! taker 4.5 bp + 5 bp slippage, maker 1.5 bp, a stop +5 bp. Events kind `rsidip` (`open` / `add` /
+//! `close` / `error`, `live` true or false), to the chat too.
 //!
 //! The research (2026-10-27, V52..V56): 202 + 1.58M configs from the user's pinescript logic, chosen
 //! on 11 months, checked on 7, a placebo grid, Binance 2020..2026 and the raw tape: this one held on
 //! the tape (the buys at the worst trade of the first block a second on), 2025-05 .. 2026-10: 1,127
 //! trades, +73 bp a buy, +$1,196 at $100 a buy, w/o the 20 best days +$480, the 2 best days 12%,
 //! 14 of 18 months up, t 3.8; at most 3 open: +$650, the drawdown with the open $212 at $100 a buy.
-//! On Binance only on the coins HL lists (all of Binance: nothing), so the live record decides.
+//! V61 (all 4,525 raw signals replayed on the tape a coin at a time, the stop and the take on the
+//! average re-read after each add): 1,166 trades, +64 bp a buy; an independent version on the bars
+//! agrees (98% the same exits). On Binance only on the coins HL lists (all of Binance: nothing), so the
+//! live record decides.
 //!
 //! Prices: the main dex's mids each `POLL_S`, the 5m closes their last mid in each bar; after a
-//! start the liquid coins' 5m candles (50 h) read, a coin each `BACKFILL_EVERY_S`. Its state is the
-//! store's doc `rsidip` (the positions, the tally).
+//! start the liquid coins' 5m candles (50 h) read, a coin each `BACKFILL_EVERY_S`. The live positions
+//! checked on the account each `CHECK_EVERY_S`. Its state is the store's doc `rsidip`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::{Api, now};
 use crate::config::Config;
 use crate::dip::Closes;
+use crate::live::{Placed, Venue};
 use crate::log;
 use crate::store::Store;
+use crate::trades::{self, Trade};
 
 const DOC: &str = "rsidip";
 const BAR_MIN: i64 = 5;
 const POLL_S: f64 = 10.0;
 const VOLUME_EVERY_S: f64 = 300.0;
 const BACKFILL_EVERY_S: f64 = 10.0;
+const CHECK_EVERY_S: f64 = 30.0;
 /// The 5m bars kept a coin (50 h), and the fewest the signal is read from (the EMA200 warmed).
 const KEEP: usize = 600;
 const MIN_BARS: usize = 400;
@@ -57,6 +69,8 @@ struct Params {
     add_step: f64,
     max_open: usize,
     risk_usd: f64,
+    /// The trial (`RSIDIP_ENABLED` unset): its live positions at most.
+    trial: Option<u32>,
 }
 
 impl Params {
@@ -65,16 +79,27 @@ impl Params {
         Params { rsi_max: v("RSIDIP_RSI_MAX", 35.0), under: v("RSIDIP_UNDER_PCT", 8.0) / 100.0, btc_max: v("RSIDIP_BTC_MAX_PCT", 0.5) / 100.0,
             min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 2.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
             hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 3.0) / 100.0,
-            max_open: v("RSIDIP_MAX_OPEN", 3.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 10.0) }
+            max_open: v("RSIDIP_MAX_OPEN", 3.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 10.0), trial: trades::switch("RSIDIP_ENABLED").flatten() }
+    }
+
+    /// The buys a position can have.
+    fn buys(&self) -> f64 {
+        (self.adds + 1) as f64
+    }
+
+    /// The $ a buy's stop loses: its share of the family's risk (`RSIDIP_RISK_USD` without it).
+    fn buy_risk(&self) -> f64 {
+        trades::risk_usd(self.risk_usd * self.buys()) / self.buys()
     }
 
     /// The $ of a buy: the risk over the stop.
     fn buy_usd(&self) -> f64 {
-        self.risk_usd / self.stop
+        self.buy_risk() / self.stop
     }
 }
 
-/// A paper position: its buys, their fees ($).
+/// A position: its buys, their fees ($); `tr` the live one's account side (its size, the average,
+/// the resting stop and take), None on paper.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Pos {
     coin: String,
@@ -86,6 +111,8 @@ struct Pos {
     fees: f64,
     rsi: f64,
     under: f64,
+    #[serde(default)]
+    tr: Option<Trade>,
 }
 
 impl Pos {
@@ -93,12 +120,32 @@ impl Pos {
         self.cost / self.qty
     }
 
-    fn buy(&mut self, px: f64, usd: f64) {
-        self.qty += usd / px;
-        self.cost += usd;
+    fn live(&self) -> bool {
+        self.tr.is_some()
+    }
+
+    /// A buy of `qty` coins at `px`.
+    fn fill(&mut self, px: f64, qty: f64) {
+        self.qty += qty;
+        self.cost += qty * px;
         self.units += 1;
         self.last = px;
-        self.fees += TAKER * usd;
+        self.fees += TAKER * qty * px;
+    }
+
+    fn buy(&mut self, px: f64, usd: f64) {
+        self.fill(px, usd / px);
+    }
+
+    /// The risk it holds in the family's cap: all its buys' (a buy's $ x the stop x the buys).
+    fn reserve(&self, p: &Params) -> f64 {
+        if self.units > 0 { self.cost / self.units as f64 * p.stop * p.buys() } else { 0.0 }
+    }
+
+    /// The $ at an exit at `px` (`why` its fee).
+    fn pnl(&self, px: f64, why: &str) -> f64 {
+        let fee = match why { "take" => MAKER, "stop" => TAKER + STOP_X, _ => TAKER };
+        px * self.qty - self.cost - fee * px * self.qty - self.fees
     }
 }
 
@@ -112,6 +159,47 @@ struct State {
     wins: u32,
     #[serde(default)]
     pnl_usd: f64,
+    /// The live positions opened (the trial's count).
+    #[serde(default)]
+    opened: u32,
+}
+
+/// A live position: bought at market for `usd` (at the `mid` now), its stop and take at the fill.
+async fn open_live(v: &Venue, coin: &str, usd: f64, mid: f64, p: &Params) -> Result<Pos> {
+    let tr = trades::open_market(v, coin, usd / mid, p.stop, Some(p.take), p.hold_s).await?;
+    let mut pos = Pos { coin: coin.to_string(), at: tr.at, ..Default::default() };
+    pos.fill(tr.entry_px, tr.size);
+    pos.tr = Some(tr);
+    Ok(pos)
+}
+
+/// A live add: bought at market for `usd`; the stop and the take placed again for the whole size at
+/// the new average (the new stop first, then the old orders cancelled). An error with the position's
+/// size and average already updated: the caller closes it (`trades::close` sells the whole size).
+async fn add_live(v: &Venue, pos: &mut Pos, usd: f64, mid: f64, p: &Params) -> Result<()> {
+    let (got, px, _) = v.market(&pos.coin, usd / mid, false).await?;
+    if got <= 0.0 {
+        bail!("{}: nothing filled", pos.coin);
+    }
+    pos.fill(px, got);
+    let (coin, qty, avg) = (pos.coin.clone(), pos.qty, pos.avg());
+    let Some(tr) = pos.tr.as_mut() else { bail!("{coin}: not live") };
+    tr.size = qty;
+    tr.entry_px = avg;
+    let stop_px = avg * (1.0 - p.stop);
+    let stop_oid = v.stop(&coin, 1.0, qty, stop_px).await?;
+    for o in [tr.stop_oid.take(), tr.take_oid.take()].into_iter().flatten() {
+        v.cancel(&coin, o).await;
+    }
+    tr.stop_px = stop_px;
+    tr.stop_oid = Some(stop_oid);
+    tr.take_px = avg * (1.0 + p.take);
+    match v.limit(&coin, -qty, tr.take_px, true, "Gtc").await {
+        Ok(Placed::Resting(o)) => tr.take_oid = Some(o),
+        Ok(Placed::Filled(..)) => {}
+        Err(e) => log!("rsidip: {coin} take not placed (out on the stop or the time): {e:#}"),
+    }
+    Ok(())
 }
 
 pub(crate) fn ema(x: &[f64], n: usize) -> Vec<f64> {
@@ -178,37 +266,52 @@ fn usd(x: f64) -> String {
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
+    let live = ev["live"] == true;
+    let tag = if live { "💵 RSI-дип НА ДЕНЬГИ" } else { "📝 RSI-дип (бумага, без сделки)" };
     Some(match ev["what"].as_str()? {
-        "open" => format!("📝 RSI-дип (БУМАГА, без сделки) ВХОД {coin}: RSI был {:.0} и развернулся, цена {:.1}% ниже EMA200; по {}, ${:.0}, тейк {} / стоп {}, до {:.0} ч",
-            f("rsi"), -f("under") * 100.0, f("px"), f("usd"), f("take_px"), f("stop_px"), f("hold_h")),
-        "add" => format!("📝 RSI-дип (бумага) ДОБОР {coin} №{:.0}: по {}, средняя {}, тейк {} / стоп {}", f("units"), f("px"), f("avg"), f("take_px"), f("stop_px")),
-        "close" => format!("{} RSI-дип (бумага) {} {coin}: средняя {} -> {}, покупок {:.0}, {} ({:+.2}%) | всего {:.0} сделок, в плюсе {:.0}, итог {}",
-            if f("pnl_usd") >= 0.0 { "✅" } else { "🔻" }, match ev["why"].as_str().unwrap_or("") { "take" => "ТЕЙК", "stop" => "СТОП", _ => "ВЫХОД ПО ВРЕМЕНИ" },
+        "open" => format!("{tag} ВХОД {coin}: RSI был {:.0} и развернулся, цена {:.1}% ниже EMA200; по {}, ${:.0}, тейк {} / стоп {}, до {:.0} ч{}",
+            f("rsi"), -f("under") * 100.0, f("px"), f("usd"), f("take_px"), f("stop_px"), f("hold_h"), ev["trial"].as_str().unwrap_or("")),
+        "add" => format!("{tag} ДОБОР {coin} №{:.0}: по {}, средняя {}, тейк {} / стоп {} (на весь объём)", f("units"), f("px"), f("avg"), f("take_px"), f("stop_px")),
+        "close" => format!("{} {tag} {} {coin}: средняя {} -> {}, покупок {:.0}, {} ({:+.2}%) | всего {:.0} сделок, в плюсе {:.0}, итог {}",
+            if f("pnl_usd") >= 0.0 { "✅" } else { "🔻" },
+            match ev["why"].as_str().unwrap_or("") { "take" => "ТЕЙК", "stop" => "СТОП", "error" => "ЗАКРЫТ ИЗ-ЗА ОШИБКИ", _ => "ВЫХОД ПО ВРЕМЕНИ" },
             f("avg"), f("px"), f("units"), usd(f("pnl_usd")), f("ret_pct"), f("closed"), f("wins"), usd(f("total_usd"))),
+        "error" => format!("⚠️ RSI-дип {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         _ => return None,
     })
 }
 
-/// Starts the RSI dip on paper unless `RSIDIP_ENABLED` is "0" (see the module).
+/// Starts the RSI dip unless `RSIDIP_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if crate::trades::switch("RSIDIP_ENABLED").is_none() {
+    if trades::switch("RSIDIP_ENABLED").is_none() {
         log!("rsidip: off (RSIDIP_ENABLED=0)");
         return Ok(());
     }
     let p = Params::from_env();
+    let venue = crate::live::venue_from_env(None).await?;
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-    log!("rsidip: paper; RSI14 5m hook from < {:.0}, {:.0}%+ under the EMA200, BTC 15 min < {:.1}%, ${:.0}M+; take {:.0}% stop {:.0}% {:.0} h, {} adds {:.0}% apart, ${:.0} a buy, at most {}; {} open, {} closed",
-        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buy_usd(), p.max_open,
-        state.open.len(), state.closed);
-    crate::notify::send(format!("📝 RSI-дип запущен НА БУМАГЕ (без сделок): 5-минутки, RSI14 разворот из-под {:.0}, цена на {:.0}%+ ниже EMA200, BTC спокоен (за 15 мин меньше {:.1}%), оборот от ${:.0}M; тейк +{:.0}%, стоп −{:.0}%, до {:.0} ч, {} добора через {:.0}%, по ${:.0} на покупку (риск ${:.0}), до {} позиций. Открыто {}, закрыто {} (итог {})",
-        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buy_usd(), p.risk_usd,
-        p.max_open, state.open.len(), state.closed, usd(state.pnl_usd)));
+    for pos in state.open.iter().filter(|x| x.live()) {
+        trades::register(&pos.coin, "rsidip", pos.reserve(&p));
+    }
+    let mode = match (&venue, p.trial) {
+        (None, _) => "paper (no LIVE_KEY / LIVE_ACCOUNT)".to_string(),
+        (Some(_), Some(n)) => format!("the trial: the first {n} live (opened {}), then paper", state.opened),
+        (Some(_), None) => "live".to_string(),
+    };
+    log!("rsidip: {mode}; RSI14 5m hook from < {:.0}, {:.0}%+ under the EMA200, BTC 15 min < {:.1}%, ${:.0}M+; take {:.0}% stop {:.0}% {:.0} h, {} adds {:.0}% apart, risk {} a position, at most {}; {} open, {} closed",
+        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0,
+        trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed);
+    crate::notify::send(format!("{} RSI-дип запущен{}: 5-минутки, RSI14 разворот из-под {:.0}, цена на {:.0}%+ ниже EMA200, BTC спокоен (за 15 мин меньше {:.1}%), оборот от ${:.0}M; тейк +{:.0}% / стоп −{:.0}% от средней, до {:.0} ч, {} добора через {:.0}%, риск на позицию (все {:.0} покупки) {}, до {} позиций. Открыто {}, закрыто {} (итог {}){}",
+        if venue.is_some() { "💵" } else { "📝" }, if venue.is_some() { " НА ДЕНЬГИ" } else { " НА БУМАГЕ (без сделок)" },
+        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
+        trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
+        if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let mut closes = Closes::default();
         let mut volume: HashMap<String, f64> = HashMap::new();
         let mut backfilled: HashSet<String> = HashSet::new();
-        let (mut vol_at, mut backfill_at) = (0.0, 0.0);
+        let (mut vol_at, mut backfill_at, mut check_at) = (0.0, 0.0, 0.0);
         let mut last_bar = (now() / 60.0).floor() as i64 / BAR_MIN;
         let event = |store: &Store, mut ev: Value| {
             ev["kind"] = json!("rsidip");
@@ -226,6 +329,18 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     log!("rsidip: state not saved: {e:#}");
                 }
             });
+        };
+        // A position out at `px`: the tally, the event, the family's cap freed.
+        let closed = |store: &Store, state: &mut State, pos: &Pos, why: &str, px: f64, t: f64| {
+            let pnl = pos.pnl(px, why);
+            state.closed += 1;
+            state.wins += (pnl > 0.0) as u32;
+            state.pnl_usd += pnl;
+            if pos.live() {
+                trades::unregister(&pos.coin);
+            }
+            event(store, json!({"what": "close", "live": pos.live(), "coin": pos.coin, "why": why, "avg": pos.avg(), "px": px, "units": pos.units, "pnl_usd": pnl,
+                "ret_pct": pnl / pos.cost * 100.0, "held_h": (t - pos.at) / 3600.0, "closed": state.closed, "wins": state.wins, "total_usd": state.pnl_usd}));
         };
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
@@ -266,36 +381,100 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 backfill_at = t;
             }
             let mut changed = false;
-            // The exits, on the mids now: the take, the stop, the time.
+            // The live positions on the account: out on time; gone (the stop or the take filled).
+            if let Some((v, unified)) = &venue {
+                if t - check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
+                    check_at = t;
+                    match crate::live::equity_of(&v.ex, &v.account, *unified).await {
+                        Ok((eq, held)) => {
+                            trades::set_equity(eq);
+                            let mut keep = Vec::new();
+                            for pos in std::mem::take(&mut state.open) {
+                                let Some(tr) = pos.tr.clone() else {
+                                    keep.push(pos);
+                                    continue;
+                                };
+                                let out = if t >= tr.exit_at {
+                                    match trades::close(v, &tr).await {
+                                        Ok(px) => Some(("time", px)),
+                                        Err(e) => {
+                                            event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("exit: {e:#}")}));
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    trades::gone(v, &tr, held.get(&pos.coin).copied().unwrap_or(0.0)).await
+                                };
+                                match out {
+                                    Some((why, px)) => {
+                                        closed(&store, &mut state, &pos, why, px, t);
+                                        changed = true;
+                                    }
+                                    None => keep.push(pos),
+                                }
+                            }
+                            state.open.extend(keep);
+                        }
+                        Err(e) => log!("rsidip: account not read: {e:#}"),
+                    }
+                }
+            }
+            // The paper positions' exits, on the mids now: the take, the stop, the time.
             let mut keep = Vec::new();
             for pos in std::mem::take(&mut state.open) {
-                let Some(&mid) = mids.get(&pos.coin) else { keep.push(pos); continue };
+                let Some(&mid) = mids.get(&pos.coin).filter(|_| !pos.live()) else {
+                    keep.push(pos);
+                    continue;
+                };
                 let avg = pos.avg();
                 let why = if mid >= avg * (1.0 + p.take) { Some("take") } else if mid <= avg * (1.0 - p.stop) { Some("stop") } else if t - pos.at >= p.hold_s { Some("time") } else { None };
-                let Some(why) = why else { keep.push(pos); continue };
-                let (px, fee) = match why { "take" => (avg * (1.0 + p.take), MAKER), "stop" => (mid, TAKER + STOP_X), _ => (mid, TAKER) };
-                let pnl = px * pos.qty - pos.cost - fee * px * pos.qty - pos.fees;
-                state.closed += 1;
-                state.wins += (pnl > 0.0) as u32;
-                state.pnl_usd += pnl;
-                event(&store, json!({"what": "close", "coin": pos.coin, "why": why, "avg": avg, "px": px, "units": pos.units, "pnl_usd": pnl,
-                    "ret_pct": pnl / pos.cost * 100.0, "held_h": (t - pos.at) / 3600.0, "closed": state.closed, "wins": state.wins, "total_usd": state.pnl_usd}));
+                let Some(why) = why else {
+                    keep.push(pos);
+                    continue;
+                };
+                closed(&store, &mut state, &pos, why, if why == "take" { avg * (1.0 + p.take) } else { mid }, t);
                 changed = true;
             }
             state.open = keep;
             if bar > last_bar {
                 let b = bar - 1;          // the bar that just closed
-                // The adds: a close the step under the last buy.
-                for pos in state.open.iter_mut() {
-                    let (Some(c), Some(&mid)) = (closes.0.get(&pos.coin).map(|q| series(q, b)), mids.get(&pos.coin)) else { continue };
-                    if pos.units <= p.adds && c.last().is_some_and(|x| *x <= pos.last * (1.0 - p.add_step)) {
-                        pos.buy(mid, p.buy_usd());
-                        let avg = pos.avg();
-                        event(&store, json!({"what": "add", "coin": pos.coin, "px": mid, "units": pos.units, "avg": avg,
-                            "take_px": avg * (1.0 + p.take), "stop_px": avg * (1.0 - p.stop)}));
-                        changed = true;
+                // The adds: a close the step under the last buy (live: at market, the stop and the take moved).
+                let mut keep = Vec::new();
+                for mut pos in std::mem::take(&mut state.open) {
+                    let (Some(c), Some(&mid)) = (closes.0.get(&pos.coin).map(|q| series(q, b)), mids.get(&pos.coin)) else {
+                        keep.push(pos);
+                        continue;
+                    };
+                    if pos.units > p.adds || !c.last().is_some_and(|x| *x <= pos.last * (1.0 - p.add_step)) {
+                        keep.push(pos);
+                        continue;
                     }
+                    let usd_buy = pos.cost / pos.units as f64;          // the first buy's $ again
+                    match &venue {
+                        Some((v, _)) if pos.live() => {
+                            if let Err(e) = add_live(v, &mut pos, usd_buy, mid, &p).await {
+                                event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("add: {e:#}; closing the position")}));
+                                let tr = pos.tr.clone().unwrap_or_default();
+                                match trades::close(v, &tr).await {
+                                    Ok(px) => closed(&store, &mut state, &pos, "error", px, t),
+                                    Err(e) => {
+                                        event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("not closed: {e:#}")}));
+                                        keep.push(pos);
+                                    }
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        _ => pos.buy(mid, usd_buy),
+                    }
+                    let avg = pos.avg();
+                    event(&store, json!({"what": "add", "live": pos.live(), "coin": pos.coin, "px": pos.last, "units": pos.units, "avg": avg,
+                        "take_px": avg * (1.0 + p.take), "stop_px": avg * (1.0 - p.stop)}));
+                    keep.push(pos);
+                    changed = true;
                 }
+                state.open = keep;
                 // The signals.
                 let btc = closes.0.get("BTC").map(|q| series(q, b)).filter(|c| c.len() > 3).map(|c| c[c.len() - 1] / c[c.len() - 4] - 1.0);
                 if btc.is_some_and(|x| x.abs() < p.btc_max) {
@@ -310,14 +489,36 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     }
                     cands.sort_by(|a, b| a.2.total_cmp(&b.2));      // the deepest first
                     for (c, r, u) in cands {
-                        if state.open.len() >= p.max_open {
-                            break;
-                        }
                         let Some(&mid) = mids.get(&c) else { continue };
-                        let mut pos = Pos { coin: c.clone(), at: t, rsi: r, under: u, ..Default::default() };
-                        pos.buy(mid, p.buy_usd());
-                        event(&store, json!({"what": "open", "coin": c, "px": mid, "usd": p.buy_usd(), "rsi": r, "under": u, "take_px": mid * (1.0 + p.take),
-                            "stop_px": mid * (1.0 - p.stop), "hold_h": p.hold_s / 3600.0}));
+                        let n_live = state.open.iter().filter(|x| x.live()).count();
+                        let usd_buy = p.buy_usd();
+                        let reserve = usd_buy * p.stop * p.buys();
+                        let live = venue.as_ref().filter(|(v, _)| v.coins.contains_key(&c) && n_live < p.max_open
+                            && trades::trial_open(p.trial, state.opened) && trades::can_open(&c, reserve));
+                        let mut pos = match live {
+                            Some((v, _)) => match open_live(v, &c, usd_buy, mid, &p).await {
+                                Ok(pos) => {
+                                    state.opened += 1;
+                                    trades::register(&c, "rsidip", pos.reserve(&p));
+                                    pos
+                                }
+                                Err(e) => {
+                                    event(&store, json!({"what": "error", "live": true, "coin": c, "error": format!("open: {e:#}")}));
+                                    continue;
+                                }
+                            },
+                            None if state.open.len() - n_live < p.max_open => {
+                                let mut pos = Pos { coin: c.clone(), at: t, ..Default::default() };
+                                pos.buy(mid, usd_buy);
+                                pos
+                            }
+                            None => continue,
+                        };
+                        pos.rsi = r;
+                        pos.under = u;
+                        let trial = if pos.live() && !trades::trial_open(p.trial, state.opened) { ", ПРОБА окончена: дальше на бумаге" } else { "" };
+                        event(&store, json!({"what": "open", "live": pos.live(), "coin": c, "px": pos.last, "usd": pos.cost, "rsi": r, "under": u,
+                            "take_px": pos.avg() * (1.0 + p.take), "stop_px": pos.avg() * (1.0 - p.stop), "hold_h": p.hold_s / 3600.0, "trial": trial}));
                         state.open.push(pos);
                         changed = true;
                     }
@@ -325,7 +526,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 if bar % 12 == 0 {
                     let ready = closes.0.iter().filter(|(c, q)| volume.get(*c).copied().unwrap_or(0.0) >= p.min_vol && q.len() >= MIN_BARS).count();
                     let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
-                    log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} open, {} closed, {}", state.open.len(), state.closed, usd(state.pnl_usd));
+                    log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} open ({} live), {} closed, {}", state.open.len(),
+                        state.open.iter().filter(|x| x.live()).count(), state.closed, usd(state.pnl_usd));
                 }
                 last_bar = bar;
             }
@@ -389,5 +591,28 @@ mod tests {
         pos.buy(97.0, 50.0);
         assert!((pos.avg() - 98.477).abs() < 1e-3, "{}", pos.avg());
         assert!((pos.fees - 2.0 * 50.0 * TAKER).abs() < 1e-12);
+    }
+
+    /// The stop and the take on the average after the adds (V61's RESOLV walk-through: three equal $
+    /// buys, the average 0.142567, the stop 0.114054), the reserve, a buy a third of the family's risk.
+    #[test]
+    fn the_average_the_stop_and_the_risk() {
+        let p = Params { stop: 0.20, take: 0.02, adds: 2, risk_usd: 10.0, ..Params::from_env() };
+        let mut pos = Pos::default();
+        for px in [0.15314, 0.14226, 0.13363] {
+            pos.buy(px, 100.0);
+        }
+        assert!((pos.avg() - 0.142567).abs() < 1e-6, "{}", pos.avg());
+        assert!((pos.avg() * (1.0 - p.stop) - 0.114054).abs() < 1e-6);
+        assert!((pos.reserve(&p) - 60.0).abs() < 1e-9);           // 3 buys of $100 at a 20% stop
+        // out at the take: the average +2% on all the coins, less the maker fee and the buys' fees
+        let px = pos.avg() * 1.02;
+        assert!((pos.pnl(px, "take") - (300.0 * 0.02 - MAKER * 306.0 - 3.0 * TAKER * 100.0)).abs() < 1e-9);
+        // a buy: a third of the family's risk (off: RSIDIP_RISK_USD a buy)
+        trades::set_equity(1000.0);
+        let fam = trades::family_risk_pct();
+        let want = if fam > 0.0 { fam / 100.0 * 1000.0 / 3.0 } else { 10.0 };
+        assert!((p.buy_risk() - want).abs() < 1e-9, "{} {want}", p.buy_risk());
+        assert!((p.buy_usd() - want / 0.20).abs() < 1e-9);
     }
 }

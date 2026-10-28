@@ -12,7 +12,7 @@
 //! each add the stop and the take are placed again for the whole size at the new average (the new stop
 //! first; it not placed: the position closed). A buy risks a third of the family's risk
 //! (`trades::risk_usd`: 3.3% of the equity, so 1.1% a buy at its 20% stop, 5.5% of the equity in coin;
-//! `RSIDIP_RISK_USD` ($10) a buy when the family's is off) and a position reserves all its buys' risk in
+//! `RSIDIP_RISK_USD` ($6.67: a position of 3 buys $20 as the others' trades) a buy when the family's is off) and a position reserves all its buys' risk in
 //! the family's cap from the first; one a coin (the family's too), at most `RSIDIP_MAX_OPEN` (5; 3 until 2026-10-28: the
 //! portfolio on one deposit, V75, skipped 656 of its signals for the slots; 5 takes 144 more, the cap binds past it) live
 //! and as many on paper. Paper (the trial over, the cap full, no account): simulated on the mids, costs
@@ -96,7 +96,7 @@ impl Params {
         Params { rsi_max: v("RSIDIP_RSI_MAX", 35.0), under: v("RSIDIP_UNDER_PCT", 8.0) / 100.0, btc_max: v("RSIDIP_BTC_MAX_PCT", 0.5) / 100.0,
             min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 2.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
             hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 3.0) / 100.0,
-            max_open: v("RSIDIP_MAX_OPEN", 5.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 10.0),
+            max_open: v("RSIDIP_MAX_OPEN", 5.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 20.0 / 3.0),
             wide_rsi_max: v("RSIDIP_WIDE_RSI_MAX", 45.5), wide_under: v("RSIDIP_WIDE_UNDER_PCT", 5.6) / 100.0, h1_under: v("RSIDIP_H1_UNDER_PCT", 10.65) / 100.0,
             trial: trades::switch("RSIDIP_ENABLED").flatten() }
     }

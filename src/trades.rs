@@ -2,8 +2,9 @@
 //! listing short): a position with its resting stop (and take) on the exchange and an exit time.
 //! A trade is opened at market (`open_market`) or from a bid's fill (`protect`); out at market
 //! when its time is up (`close`); a position gone from the account (its stop or take filled, a
-//! liquidation) ends it (`gone`). The HIP-3 perps are isolated: their leverage is set to
-//! `H3_LEVERAGE` (3) first, so the stop is hit before the liquidation.
+//! liquidation) ends it (`gone`). The HIP-3 perps go cross at `H3_LEVERAGE` (10; the coin's max when
+//! lower) first; a coin the dex keeps isolated only at `H3_ISOLATED_LEVERAGE` (3), so its stop is hit before
+//! its liquidation.
 
 use std::collections::HashSet;
 
@@ -13,8 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::api::now;
 use crate::live::{Placed, Venue};
 
-/// The HIP-3 perps' isolated leverage: the liquidation ~30% away, past the 20-25% stops.
-pub(crate) const H3_LEVERAGE: u32 = 3;
+/// The HIP-3 perps' leverage: cross at 10 (2026-10-28, V77: the bids' margin a third of the isolated 3x's, so the
+/// family's margin no longer skips trades at a higher risk; on cross the liquidation is the account's, far past the
+/// stops within the family's cap); a coin only isolated at 3 (the liquidation ~30% away, past the 20-25% stops).
+pub(crate) const H3_LEVERAGE: u32 = 10;
+pub(crate) const H3_ISOLATED_LEVERAGE: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Trade {
@@ -89,13 +93,15 @@ pub(crate) fn equity() -> f64 {
     *EQUITY.lock().unwrap()
 }
 
-/// The family's risk a trade, % of the equity: `FAMILY_RISK_PCT` (3.3; 0: off, each strategy's own $).
+/// The family's risk a trade, % of the equity: `FAMILY_RISK_PCT` (0 for the test: each strategy's own $20; the
+/// target after it 5: V77, the HIP-3 perps cross at 10x and a cap of 40%, x103 over 16.8 months, the drawdown with
+/// the open 28.1%, 1,935 trades, win 83%, halves x11.0 / x9.3; before: 3.3).
 /// The 20% setting (2026-10-27, V60/V61 on the tape, 2025-05 .. 2026-10, all the strategies on one
 /// deposit, compounding, the slots, one a coin): 3.3% a trade within a `FAMILY_RISK_CAP_PCT` of 20%,
 /// the dip held 120 min, the pump short 240, the listing's take 30%, the RSI dip a third a buy:
 /// +1,108%, the drawdown with the open 17.3% (3.38%: 20.2%), ~2.9 trades a day.
 pub(crate) fn family_risk_pct() -> f64 {
-    env_f("FAMILY_RISK_PCT", 3.3)
+    env_f("FAMILY_RISK_PCT", 0.0)
 }
 
 /// A trade's risk ($ its stop loses): `family_risk_pct` of the equity when on and the equity known
@@ -117,11 +123,12 @@ pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64)>) {
 }
 
 /// Whether one more trade risking `risk` $ fits: the coin free, `FAMILY_MAX_OPEN` (0: no cap, as the
-/// 20% setting) trades at once, and the open trades' risks with it within `FAMILY_RISK_CAP_PCT` (20;
+/// 20% setting) trades at once, and the open trades' risks with it within `FAMILY_RISK_CAP_PCT` (40, V77: at 5% a
+/// trade it skipped 17 trades in 16.8 months; all the stops at once lose 40% at most, far from a liquidation; was 20;
 /// 0: no cap) of the equity (the deposit's simultaneous risk; each strategy keeps its own slots besides).
 pub(crate) fn can_open(coin: &str, risk: f64) -> bool {
     let cap = env_f("FAMILY_MAX_OPEN", 0.0) as usize;
-    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 20.0) / 100.0;
+    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
     let eq = equity();
     let g = OPEN.lock().unwrap();
     let (n, open_risk, held) = g.as_ref().map_or((0, 0.0, false), |m| (m.len(), m.values().map(|x| x.1).sum::<f64>(), m.contains_key(coin)));
@@ -149,12 +156,16 @@ pub(crate) fn size_for(risk_usd: f64, stop: f64, px: f64) -> f64 {
     if px > 0.0 && stop > 0.0 { risk_usd / stop / px } else { 0.0 }
 }
 
-/// Sets a HIP-3 coin's isolated leverage once (`done` remembers the coins set).
+/// Sets a HIP-3 coin's leverage once (`done` remembers the coins set): cross at `H3_LEVERAGE` (the coin's max when
+/// lower); refused (a coin the dex keeps isolated only): isolated at `H3_ISOLATED_LEVERAGE`.
 pub(crate) async fn h3_leverage(v: &Venue, coin: &str, max_lev: u32, done: &mut HashSet<String>) -> Result<()> {
     if !coin.contains(':') || done.contains(coin) {
         return Ok(());
     }
-    v.leverage(coin, H3_LEVERAGE.min(max_lev.max(1)), false).await?;
+    if let Err(e) = v.leverage(coin, H3_LEVERAGE.min(max_lev.max(1)), true).await {
+        crate::log!("trades: {coin} cross refused ({e:#}): isolated {H3_ISOLATED_LEVERAGE}x");
+        v.leverage(coin, H3_ISOLATED_LEVERAGE.min(max_lev.max(1)), false).await?;
+    }
     done.insert(coin.to_string());
     Ok(())
 }

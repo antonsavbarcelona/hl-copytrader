@@ -1,6 +1,7 @@
 //! The dip-buy on the live account (`DIP_ENABLED=1`, with `LIVE_KEY`, `LIVE_ACCOUNT`, `LIVE_NET`
-//! as for `live`): a perp with `DIP_MIN_VOL_USD` (20M) or more traded over the last 24 h whose mid
-//! fell `DIP_DROP_PCT` (8) or more over the last `DIP_WINDOW_MIN` (15) minutes, by the minutes'
+//! as for `live`): a perp with `DIP_MIN_VOL_USD` (16M; 20M until 2026-10-28) or more traded over the last 24 h whose mid
+//! fell `DIP_DROP_PCT` (8) or more (`DIP_FUNDING_DROP_PCT` (5.6; 0: off) while the coin's funding is
+//! at or over 0: V2, see below) over the last `DIP_WINDOW_MIN` (15) minutes, by the minutes'
 //! closes, while BTC's moved less than `DIP_BTC_MAX_PCT` (2) over them (the coin's own fall, not
 //! the market's), is bought at market as its minute closes; out at market `DIP_HOLD_MIN` (120; 60 until 2026-10-27, V16: 120 the better)
 //! later, with a resting stop `DIP_STOP_PCT` (20) under our fill; sized so that the stop loses
@@ -16,8 +17,14 @@
 //! at V1's $20M and $20 risk the filter lowers the $ and raises the drawdown ($138 / DD $40 -> $107 /
 //! $66 over 16 months): not for V1. It helps a $10M variant (DIP_MIN_VOL_USD=10e6: $55 / $66 -> $117 / $54).
 //!
-//! DIP V1: these settings are frozen as of 2026-10-20 (no further fitting on the history; the
-//! live record is the independent check). Every signal is logged with the book and the fill
+//! DIP V1: these settings were frozen as of 2026-10-20 (no further fitting on the history; the
+//! live record is the independent check). DIP V2 (2026-10-28, the user's OK): the hold 120 min (V16), and
+//! the early threshold: a coin whose funding is at or over 0 is bought on a fall of 5.6% (its cooldown's
+//! moves read at the same threshold), one whose funding is negative (the market shorting it: an early fall
+//! goes on) waits for the 8%; the volume floor $16M. V67..V73 (the filter search on the bars, 33 kinds against
+//! shuffled luck; the tape): 524 trades against 177, the win rate 60.7% against 62.1%, the sum +84% (w/o the 5
+//! best days x2.1), both halves up, 14 of 17 months up; the early threshold a plateau from 4.8% to 6.0%; the same
+//! 5.6% without the funding gate only +10%. The bot's per-minute rule matches the research's 93-96% of the entries. Every signal is logged with the book and the fill
 //! (events `open` / `skipped` / `too small` / `error`, and `fill` with the exchange's fills and fees
 //! a moment later): best bid / ask, the spread, the depth on our side within 0.5 / 1 / 2%, the
 //! VWAP our whole order would fill at by the book, the fill's price, the slippage against the mid,
@@ -66,7 +73,7 @@ use crate::log;
 use crate::store::Store;
 
 const DOC: &str = "dip";
-const VERSION: &str = "V1";
+const VERSION: &str = "V2";
 const TAKER_FEE: f64 = 0.00045;
 const MIN_ORDER_USD: f64 = 10.0;
 /// A book older than this (s) gives no close.
@@ -93,6 +100,8 @@ struct Params {
     dry: bool,
     /// `DIP_RSI_MAX` (0: off): skip a fall at or above this 1 h RSI14.
     rsi_max: f64,
+    /// `DIP_FUNDING_DROP_PCT` (0: off): the fall bought while the coin's funding is at or over 0.
+    funding_drop: f64,
     pump: PumpParams,
 }
 
@@ -154,9 +163,9 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         let on = |k: &str| std::env::var(k).unwrap_or_default().trim() == "1";
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
-            min_vol: v("DIP_MIN_VOL_USD", 20e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
+            min_vol: v("DIP_MIN_VOL_USD", 16e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
-            dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0),
+            dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
             pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 240.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
@@ -205,6 +214,11 @@ struct State {
     /// The pump shorts opened (the trial's count).
     #[serde(default)]
     pumps_opened: u32,
+}
+
+/// The fall bought: `early` (0: off) while the funding is known and at or over 0, else `drop`.
+fn drop_for(drop: f64, early: f64, funding: Option<f64>) -> f64 {
+    if early > 0.0 && funding.is_some_and(|f| f >= 0.0) { early } else { drop }
 }
 
 /// The archive research's cooldown (`moves.py`, the 198 falls of V1): a coin's move of the drop or
@@ -289,6 +303,8 @@ struct Dip {
     state: State,
     closes: Closes,
     volume: HashMap<String, f64>,
+    /// Each coin's funding now (the hourly rate), read with the volumes.
+    funding: HashMap<String, f64>,
     positions: HashMap<String, f64>,
     equity: f64,
     books: crate::ws::Books,
@@ -310,15 +326,15 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     };
     let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let p = Params::from_env();
-    log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
-        if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.window, p.btc_max * 100.0,
+    log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% ({:.1}% while the funding >= 0) in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
+        if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.funding_drop * 100.0, p.window, p.btc_max * 100.0,
         p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open);
     if std::env::var("LIVE_ENABLED").unwrap_or_default().trim() == "1" {
         log!("dip: LIVE_ENABLED is on too: the copy's coins are left alone (one position a coin on the account)");
     }
     crate::notify::send(format!("🤖 покупка падений запущена{} ({}), открыто {}
-сигнал: падение {:.0}% за {} мин (BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {}, до {} позиций",
-        if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window,
+сигнал: падение {:.0}% за {} мин (или {:.1}%, если фандинг монеты не отрицательный; BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {}, до {} позиций",
+        if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window, p.funding_drop * 100.0,
         p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open));
     let q = &p.pump;
     if q.enabled {
@@ -332,7 +348,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         log!("dip: the pump short is off (PUMP_ENABLED=0)");
     }
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
-        positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new() };
+        funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new() };
     tokio::spawn(async move {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut vol_at = 0.0;
@@ -356,6 +372,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
             if t - vol_at >= VOLUME_EVERY_S {
                 match api.meta().await {
                     Ok((_, ctx)) => {
+                        d.funding = ctx.iter().map(|(c, x)| (c.clone(), x.funding)).collect();
                         d.volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
                         vol_at = t;
                     }
@@ -487,13 +504,18 @@ impl Dip {
     }
 
     /// The falls of the minute that closed, biggest first, bought within the limits.
+    /// The fall a coin is bought on: `funding_drop` while its funding is at or over 0 (V2), else `drop`.
+    fn drop_of(&self, coin: &str) -> f64 {
+        drop_for(self.p.drop, self.p.funding_drop, self.funding.get(coin).copied())
+    }
+
     async fn signals(&mut self, minute: i64) {
         let Some(btc) = self.closes.change("BTC", minute, self.p.window) else { return };
         let decided = now();
         let delay_ms = ((decided - (minute + 1) as f64 * 60.0) * 1000.0).max(0.0) as u64;
-        // Every coin's move of the drop either way, before the filters: the research's cooldown.
+        // Every coin's move of its drop either way, before the filters: the research's cooldown.
         let movers: Vec<String> = self.closes.0.keys()
-            .filter(|c| self.closes.change(c, minute, self.p.window).is_some_and(|r| r.abs() >= self.p.drop))
+            .filter(|c| self.closes.change(c, minute, self.p.window).is_some_and(|r| r.abs() >= self.drop_of(c)))
             .cloned().collect();
         let cooldown_min = (self.p.cooldown_s / 60.0).round() as i64;
         let in_cooldown: std::collections::HashSet<String> = movers.into_iter()
@@ -505,7 +527,7 @@ impl Dip {
         let mut falls: Vec<(String, f64)> = self.closes.0.keys()
             .filter(|c| self.venue.coins.contains_key(*c) && self.volume.get(*c).copied().unwrap_or(0.0) >= self.p.min_vol)
             .filter_map(|c| Some((c.clone(), self.closes.change(c, minute, self.p.window)?)))
-            .filter(|(_, r)| *r <= -self.p.drop).collect();
+            .filter(|(c, r)| *r <= -self.drop_of(c)).collect();
         falls.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (coin, fall) in falls {
             let t = now();
@@ -1052,6 +1074,15 @@ mod tests {
         // More than the book holds: the share it fills.
         assert!((snapshot(&b, true, 26.0, 1000.0)["filled"].as_f64().unwrap() - 0.5).abs() < 1e-9);
         assert!(message(&json!({"what": "skipped", "coin": "X", "why": "btc moved"})).is_none());
+    }
+
+    #[test]
+    fn the_early_threshold_on_the_funding() {
+        assert_eq!(drop_for(0.08, 0.056, Some(0.0)), 0.056);
+        assert_eq!(drop_for(0.08, 0.056, Some(1.25e-5)), 0.056);
+        assert_eq!(drop_for(0.08, 0.056, Some(-1e-6)), 0.08);           // shorted: the 8%
+        assert_eq!(drop_for(0.08, 0.056, None), 0.08);                  // unknown: the 8%
+        assert_eq!(drop_for(0.08, 0.0, Some(1e-5)), 0.08);              // off
     }
 
     #[test]

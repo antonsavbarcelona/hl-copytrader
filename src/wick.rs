@@ -40,6 +40,11 @@
 //! +44%), 12 of 12 months up; no other filter beat shuffled luck (a closer bid: twice the fills, the win rate -7..10 pp,
 //! the same sum).
 //!
+//! The audit's trace (2026-10-28; observing only, the trading as above): every bid placed, moved, cancelled, filled is an
+//! event kind `wick_order` (`place` / `cancel` / `fill`: the level, its anchor (the minute before's last mid, the oracle),
+//! the mid now, the reason, our clock at the level's calculation, the order's send and the exchange's answer, the
+//! quotes' age); `wickwatch` logs the exchange's side (orderUpdates, userFills) and the research's shadow.
+//!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
 use std::collections::{HashMap, HashSet};
@@ -207,6 +212,9 @@ struct Wick {
     picked: Vec<String>,
     h3_picked: Vec<String>,
     backfilled: HashSet<String>,
+    /// When the mids and the contexts (the oracles) were read last (the trace's quote ages).
+    mids_at: f64,
+    ctx_at: f64,
 }
 
 impl Wick {
@@ -218,6 +226,36 @@ impl Wick {
             crate::notify::send(m);
         }
         self.store.event(ev);
+    }
+
+    /// The audit's trace of the bids' life (no chat, no log line).
+    fn trace(&self, mut ev: Value) {
+        ev["kind"] = json!("wick_order");
+        ev["at"] = json!(now());
+        self.store.event(ev);
+    }
+
+    /// Why `coin` gets no bid now (the checks of `wanted`, in its order).
+    fn why_not(&self, c: &str, minute: i64) -> &'static str {
+        let h3 = c.contains(':');
+        let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count();
+        let n_crypto = self.state.open.len() - n_h3;
+        if h3 {
+            if !self.h3_picked.iter().any(|x| x == c) { return "unpicked"; }
+            if n_h3 >= self.p.h3_max_open { return "slots"; }
+            if !trades::trial_open(self.p.trial, self.state.h3_opened) { return "trial"; }
+        } else {
+            if !self.btc_calm(minute) { return "btc"; }
+            if n_crypto >= self.p.max_open { return "slots"; }
+            if !trades::trial_open(self.p.trial, self.state.opened) { return "trial"; }
+            if !self.picked.iter().any(|x| x == c) { return "unpicked"; }
+        }
+        if self.closes.at(c, minute - 1).is_none() { return "no price"; }
+        if self.held.get(c).is_some_and(|x| *x != 0.0) { return "held"; }
+        if self.state.last_fill.get(c).is_some_and(|x| now() - x < AGAIN_AFTER_S) { return "after its fill"; }
+        if !trades::can_open(c, trades::risk_usd(self.p.risk_usd)) { return "family cap"; }
+        if !h3 && self.hot(c, minute) { return "hot"; }
+        "other"
     }
 
     fn save(&self) {
@@ -243,6 +281,7 @@ impl Wick {
                     self.volume.insert(n.to_string(), num(&c["dayNtlVlm"]));
                     self.oracle.insert(n.to_string(), num(&c["oraclePx"]));
                 }
+                self.ctx_at = now();
             }
             Err(e) => log!("wick: contexts not read: {e:#}"),
         }
@@ -264,6 +303,14 @@ impl Wick {
         is_hot(self.closes.spread(coin, minute - 1, 60, 30), self.closes.spread(coin, minute - 1, 1440, 600), self.p.hot_x)
     }
 
+    /// BTC within `BTC_MAX_MINUTE` of the minute before's close.
+    fn btc_calm(&self, minute: i64) -> bool {
+        match (self.closes.at("BTC", i64::MAX), self.closes.at("BTC", minute - 1)) {
+            (Some(a), Some(b)) if b > 0.0 => (a / b - 1.0).abs() < BTC_MAX_MINUTE,
+            _ => false,
+        }
+    }
+
     fn wanted(&self, minute: i64) -> HashMap<String, f64> {
         let mut out = HashMap::new();
         let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count();
@@ -275,11 +322,7 @@ impl Wick {
                 && self.state.last_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
                 && trades::can_open(c, risk)
         };
-        let btc_calm = match (self.closes.at("BTC", i64::MAX), self.closes.at("BTC", minute - 1)) {
-            (Some(a), Some(b)) if b > 0.0 => (a / b - 1.0).abs() < BTC_MAX_MINUTE,
-            _ => false,
-        };
-        if btc_calm && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
+        if self.btc_calm(minute) && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
             for c in self.picked.clone() {
                 let (Some(close), o) = (self.closes.at(&c, minute - 1), self.oracle.get(&c).copied().unwrap_or(0.0)) else { continue };
                 if !free(&c) || self.hot(&c, minute) {
@@ -312,6 +355,10 @@ impl Wick {
         } else {
             Vec::new()
         };
+        // The observer's coins: the picks, bid or not (the research's shadow follows them either way).
+        let mut watch: HashMap<String, (f64, f64)> = self.picked.iter().map(|c| (c.clone(), (self.p.pct, self.p.take))).collect();
+        watch.extend(self.h3_picked.iter().map(|c| (c.clone(), (self.p.h3_pct, self.p.h3_take))));
+        crate::wickwatch::set_watch(watch);
     }
 
     /// One coin's 24 h of 1-minute closes (the liquid ones without 6 h of them, the biggest first).
@@ -347,26 +394,37 @@ impl Wick {
                 Err(e) => log!("wick: mids {d} not read: {e:#}"),
             }
         }
+        self.mids_at = now();
     }
 
     /// The bids put right: off where not wanted, placed where missing, moved where drifted.
     async fn place(&mut self, minute: i64) {
+        let t_calc = now();
         let want = self.wanted(minute);
         let mut changed = false;
         for (c, b) in self.state.bids.clone() {
             if !want.contains_key(&c) {
+                let (why, t_sent) = (self.why_not(&c, minute), now());
+                crate::wickwatch::set_bid(&c, None);
                 self.venue.cancel(&c, b.oid).await;
+                self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": why, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_done": now()}));
                 self.state.bids.remove(&c);
                 changed = true;
             }
         }
         for (c, lvl) in want {
             let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.stop, lvl);
-            if let Some(b) = self.state.bids.get(&c) {
+            let mut old = None;
+            if let Some(b) = self.state.bids.get(&c).cloned() {
                 if !drifted(b.px, lvl, self.p.reprice, self.p.reprice_down) {
                     continue;
                 }
+                let t_sent = now();
+                crate::wickwatch::set_bid(&c, None);
                 self.venue.cancel(&c, b.oid).await;
+                self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": if lvl > b.px { "drift up" } else { "drift down" },
+                    "new_px": lvl, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_done": now()}));
+                old = Some(b.px);
                 self.state.bids.remove(&c);
                 changed = true;
             }
@@ -376,9 +434,22 @@ impl Wick {
                     continue;
                 }
             }
-            match self.venue.limit(&c, size, lvl, false, "Alo").await {
+            let t_sent = now();
+            let placed = self.venue.limit(&c, size, lvl, false, "Alo").await;
+            let t_ack = now();
+            let (result, oid, err) = match &placed {
+                Ok(Placed::Resting(oid)) => ("resting", Some(*oid), None),
+                Ok(Placed::Filled(..)) => ("filled at once", None, None),
+                Err(e) => ("error", None, Some(format!("{e:#}"))),
+            };
+            self.trace(json!({"what": "place", "coin": c, "oid": oid, "result": result, "error": err, "px": lvl, "size": size, "old_px": old,
+                "pct": if c.contains(':') { self.p.h3_pct } else { self.p.pct }, "anchor_close": self.closes.at(&c, minute - 1),
+                "oracle": (!c.contains(':')).then(|| self.oracle.get(&c).copied()).flatten(), "mid": self.closes.at(&c, i64::MAX),
+                "mids_age_s": t_sent - self.mids_at, "ctx_age_s": t_sent - self.ctx_at, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_ack": t_ack}));
+            match placed {
                 Ok(Placed::Resting(oid)) => {
                     self.state.bids.insert(c.clone(), Bid { oid, px: lvl, size });
+                    crate::wickwatch::set_bid(&c, Some(crate::wickwatch::BidView { px: lvl, oid, since: t_ack }));
                     changed = true;
                 }
                 Ok(Placed::Filled(got, px, _)) => self.filled(&c, got, px).await,
@@ -393,6 +464,9 @@ impl Wick {
 
     /// A bid filled for `got` at `px`: the trade protected (or out again).
     async fn filled(&mut self, coin: &str, got: f64, px: f64) {
+        let oid = self.state.bids.get(coin).map(|b| b.oid);
+        self.trace(json!({"what": "fill", "coin": coin, "oid": oid, "got": got, "px": px, "t_detect": now()}));
+        crate::wickwatch::set_bid(coin, None);
         self.state.bids.remove(coin);
         self.state.last_fill.insert(coin.to_string(), now());
         let (side, n) = if coin.contains(':') {
@@ -476,6 +550,8 @@ impl Wick {
                     if f > 0.0 {
                         self.filled(&c, f, b.px).await;
                     } else {
+                        self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": "gone from the book, not filled", "t_done": now()}));
+                        crate::wickwatch::set_bid(&c, None);
                         self.state.bids.remove(&c);
                         self.save();
                     }
@@ -564,7 +640,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));
     let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new() };
+        picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
+    crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     tokio::spawn(async move {
         let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at) = (0.0, 0.0, 0.0, 0.0, 0.0);
         let mut last_minute = (now() / 60.0).floor() as i64;

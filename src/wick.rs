@@ -128,7 +128,15 @@ struct State {
     opened: u32,
     #[serde(default)]
     h3_opened: u32,
+    /// The trials' round: the counts reset once when it is under `TRIAL_ROUND` (a new round: the earlier fills
+    /// were not the bot's present logic).
+    #[serde(default)]
+    trial_round: u32,
 }
+
+/// The trials' round now: 2 (2026-10-28: the HIP-3 trial's first fill, xyz:MRNA 2026-10-27, came from a bid left over
+/// the research's level before the down-repricing; the trials start again on today's settings).
+const TRIAL_ROUND: u32 = 2;
 
 /// A coin's dex ("" for the main one).
 fn dex_of(coin: &str) -> &str {
@@ -533,6 +541,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         (core.clone(), HashMap::new())
     };
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    if state.trial_round < TRIAL_ROUND {
+        log!("wick: the trials start again (round {TRIAL_ROUND}): crypto {} and HIP-3 {} fills before not counted", state.opened, state.h3_opened);
+        (state.opened, state.h3_opened, state.trial_round) = (0, 0, TRIAL_ROUND);
+    }
     // The bids a restart left: off (placed again at the levels now).
     for (c, b) in std::mem::take(&mut state.bids) {
         if venue.coins.contains_key(&c) {

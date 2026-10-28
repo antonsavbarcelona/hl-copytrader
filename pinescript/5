@@ -1,0 +1,77 @@
+//@version=5
+
+//
+//indicator(title = "Long_Hedg_alert+STOP", shorttitle="Long_Hedg_alert+STOP", overlay=true)
+strategy("Long_Hedg+STOP", overlay=false, initial_capital = 1000, currency = "USD", pyramiding = 7, default_qty_type = strategy.cash, default_qty_value = 1000, commission_value = 0.04)
+i_date = input.time(timestamp("16 Jan 2022 00:00 +0300"), "Date")
+pyramidingg = input.int(7, "Пирамидинг", minval=1)
+ratio = input.int(5, "Коэфициент в процентах для Buy", minval=1)
+profit = input.int(1, "Минимальный процент профита /10", minval=1)
+distance = input.int(2, "Расстояние EMA -> close")
+sl = input.int(1, "StopLose процентах", minval=0)
+minut = input.int(60, "Минут после StopLose", minval=0)
+
+
+
+min_RSI = input.int(32, minval=1)
+max_RSI= input.int(72, minval=1)
+//RSI
+len = input.int(12, minval=1, title="Length")
+Smooth_RSI = input.int(3, minval=1)
+up = ta.rma(math.max(ta.change(close), 0), len)
+down = ta.rma(-math.min(ta.change(close), 0), len)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiMA = ta.sma(rsi, Smooth_RSI)
+
+//EMA
+
+len_EMA = input.int(155, minval=1, title="Length")
+//src_EMA = input(close, title="Source")
+offset = input.int(title="Offset", defval=0, minval=-500, maxval=500)
+out_EMA = ta.ema(close, len_EMA)
+
+
+
+//var TrendisLong = true
+var entrytime = i_date
+var lastSell = 0.0
+var lastBuy = 0.0
+long_entry = false
+var summ = array.new_float(0)
+if (time_close > entrytime)
+    if (  rsiMA[1] < min_RSI and rsiMA[1] < rsiMA and array.size(summ) <= (pyramidingg+1)     and (100-(close/out_EMA*100))>distance)
+        if (lastBuy == 0)
+            lastBuy := close
+            array.push(summ, close)
+            long_entry := true
+            lastSell := 0
+            entrytime := i_date
+            strategy.entry("Long", strategy.long, when = (long_entry))
+        else
+            if (close  < (lastBuy/(1+(ratio*array.size(summ)/100))))
+                lastBuy := close
+                array.push(summ, close)
+                long_entry := true
+                lastSell := 0
+                entrytime := i_date
+                strategy.entry("Long", strategy.long, when = ( long_entry))
+
+
+
+
+short_entry = false
+
+//if (  rsiMA[1] > max_RSI  and rsiMA[1] > rsiMA and rsiMA[1] > rsiMA[2] or ( k[1] > k and k[1] > k[2] and k[1] > 85) or ( (array.sum(summ)/array.size(summ))*(1+(svecha/100)) < close) )
+if ( (array.sum(summ)/array.size(summ))*(1+(profit/1000)) < close) // or ( (array.sum(summ)/array.size(summ))  * (100 - sl)/100  > close )
+    short_entry := true
+    lastBuy := 0
+    array.clear(summ)
+    entrytime := i_date
+    strategy.close("Long", when = ( short_entry))
+else
+    if ( (array.sum(summ)/array.size(summ))  * (1000 - sl)/1000  > close )
+        short_entry := true
+        lastBuy := 0
+        array.clear(summ)
+        entrytime := time_close + (minut*60 * 1000)
+        strategy.close("Long", when = ( short_entry))

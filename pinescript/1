@@ -1,0 +1,22 @@
+//@version=4
+//
+
+//
+study(title = "security", shorttitle="security", format=format.price, precision=2, resolution="", overlay=true)
+
+string timeframe = input("15",   "High Timeframe",               type = input.resolution)
+
+lower_RSI = input(45, "RSI-15min")
+string timeframe1 = input("1",   "Low Timeframe",               type = input.resolution)
+high_RSI = input(55, "RSI-1min")
+
+
+
+r_rsi = security("BINANCE:THETAUSDT", timeframe,  rsi(close, 14))
+n_rsi = security("BINANCE:THETAUSDT", timeframe1,  rsi(close, 14))
+
+LongCondition =   r_rsi < lower_RSI and crossover(n_rsi, high_RSI)
+
+plotshape(LongCondition, title="Buy", style=shape.labelup, location=location.belowbar, size=size.small, color=color.red, textcolor=color.white, text="Buy")
+
+alertcondition(LongCondition, message="Buy My Alert", title="Buy My Alert")

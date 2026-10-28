@@ -1,0 +1,126 @@
+//@version=5
+
+//
+//indicator(title = "EMA_cross+_long", shorttitle="EMA_cross+_long", overlay=true)
+strategy("EMA_cross+_long", overlay=false, initial_capital = 1000, currency = "USD", pyramiding = 15, default_qty_type = strategy.cash, default_qty_value = 1000, commission_value = 0.04)
+ratio = input.int(2, "Коэфициент в процентах для Buy", minval=1)
+profit = input.int(2, "Минимальный процент профита", minval=1)
+//smoothK = input.int(10, "K", minval=1)
+//smoothD = input.int(3, "D", minval=1)
+//lengthRSI = input.int(36, "RSI Length", minval=1)
+//lengthStoch = input.int(212, "Stochastic Length", minval=1)
+//src = input(close, title="RSI Source")
+//rsi1 = ta.rsi(src, lengthRSI)
+//k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+//d = ta.sma(k, smoothD)
+//plot(k, "K", color=#0094FF)
+//plot(d, "D", color=#FF6A00)
+//h0 = hline(80, "Upper Band", color=#606060)
+//h1 = hline(20, "Lower Band", color=#606060)
+//fill(h0, h1, color=#9915FF, transp=80, title="Background")
+
+//k = request.security(syminfo.tickerid, "60",  k_k)
+//d = request.security(syminfo.tickerid, "60",  d_d)
+//min_RSI = input.int(30, minval=1)
+//max_RSI= input.int(73, minval=1)
+//RSI
+//len = input.int(9, minval=1, title="Length")
+//Smooth_RSI = input.int(6, minval=1)
+//src_RSI = input(close, "Source")
+//up = ta.rma(math.max(ta.change(src_RSI), 0), len)
+//down = ta.rma(-math.min(ta.change(src_RSI), 0), len)
+//rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+//rsiMA = ta.sma(rsi, Smooth_RSI)
+
+//EMA
+//indicator(title="Moving Average Exponential", shorttitle="EMA", overlay=true, timeframe="", timeframe_gaps=true)
+len_EMA = input.int(47, minval=1, title="Length")
+src_EMA = input(close, title="Source")
+offset = input.int(title="Offset", defval=0, minval=-500, maxval=500)
+out_EMA = ta.ema(src_EMA, len_EMA)
+plot(out_EMA, title="EMA", color=color.blue, offset=offset)
+
+//EMA2
+//indicator(title="Moving Average Exponential", shorttitle="EMA", overlay=true, timeframe="", timeframe_gaps=true)
+len_EMA2 = input.int(6, minval=1, title="Length")
+src_EMA2 = input(close, title="Source")
+offset2 = input.int(title="Offset2", defval=0, minval=-500, maxval=500)
+out_EMA2 = ta.ema(src_EMA2, len_EMA2)
+plot(out_EMA2, title="EMA", color=color.blue, offset=offset2)
+
+//macd
+// Getting inputs
+fast_length = input(title="Fast Length", defval=72)
+slow_length = input(title="Slow Length", defval=107)
+src_macd = input(title="Source", defval=close)
+signal_length = input.int(title="Signal Smoothing",  minval = 1, maxval = 1500, defval = 407)
+sma_source = input.string(title="Oscillator MA Type",  defval="EMA", options=["SMA", "EMA"])
+sma_signal = input.string(title="Signal Line MA Type", defval="EMA", options=["SMA", "EMA"])
+// Plot colors
+col_macd = input(#2962FF, "MACD Line  ", group="Color Settings", inline="MACD")
+col_signal = input(#FF6D00, "Signal Line  ", group="Color Settings", inline="Signal")
+col_grow_above = input(#26A69A, "Above   Grow", group="Histogram", inline="Above")
+col_fall_above = input(#B2DFDB, "Fall", group="Histogram", inline="Above")
+col_grow_below = input(#FFCDD2, "Below Grow", group="Histogram", inline="Below")
+col_fall_below = input(#FF5252, "Fall", group="Histogram", inline="Below")
+// Calculating
+fast_ma = sma_source == "SMA" ? ta.sma(src_macd, fast_length) : ta.ema(src_macd, fast_length)
+slow_ma = sma_source == "SMA" ? ta.sma(src_macd, slow_length) : ta.ema(src_macd, slow_length)
+macd = fast_ma - slow_ma
+signal = sma_signal == "SMA" ? ta.sma(macd, signal_length) : ta.ema(macd, signal_length)
+hist = macd - signal
+
+
+
+var lastSell = 0.0
+var lastBuy = 0.0
+long_entry = false
+var summ = array.new_float(0)
+if (ta.crossover(out_EMA2, out_EMA) and close > out_EMA2 and signal < 0  )// and out_EMA2[1]<out_EMA[1] and out_EMA2[2]<out_EMA[2]   )//(  rsiMA[1] < min_RSI  and rsiMA[1] < rsiMA and rsiMA[1] < rsiMA[2]  ) or ( k[1] < k and k[1] < k[2] and k < 18 and rsiMA[1] < 40)
+    if (lastBuy == 0)
+        lastBuy := close
+        array.push(summ, close)
+        long_entry := true
+        lastSell := 0
+        strategy.entry("Long", strategy.long, when = (long_entry))
+    else
+        if (close  < (lastBuy/(1+(ratio/100))))
+            lastBuy := close
+            array.push(summ, close)
+            long_entry := true
+            lastSell := 0
+            strategy.entry("Long", strategy.long, when = ( long_entry))
+
+
+short_entry = false
+
+if  (ta.crossover(out_EMA, out_EMA2) and close < out_EMA2   )  //(  rsiMA[1] > max_RSI  and rsiMA[1] > rsiMA and rsiMA[1] > rsiMA[2] or ( k[1] > k and k[1] > k[2] and k[1] > 85) )
+    if ( (array.sum(summ)/array.size(summ))*(1+(profit/100)) < close)
+//    if (lastSell == 0)
+//        lastSell := close
+        short_entry := true
+        lastBuy := 0
+        array.clear(summ)
+        strategy.close("Long", when = ( short_entry))
+//    else
+//        if ((close*1.0)>lastSell)
+//            lastSell := close
+//            short_entry := true
+//            lastBuy := 0
+//            strategy.close("Long", when = ( short_entry))
+
+
+//LongCondition = ( long_entry) //and ta.crossover(cci, cci_lower) ) //or (crossover(k, 20) and cci >= cci_lower ) /// (crossover(cci, cci_lower)// and cci > cci[1] and rsi > rsi[1]  and mf < 50
+
+//ShortCondition =  (short_entry)// (( cci2sma >  100 and  mf < mf[1] and mf[1] > mf[2]   and mf[1] > 75))
+
+//plotshape(long_entry, title="Buy", style=shape.labelup, location=location.belowbar, size=size.small, color=color.green, textcolor=color.white, text="Buy")
+
+
+
+
+
+//plotshape(ShortCondition, title="Sell", style=shape.labeldown, location=location.abovebar, size=size.small, color=color.black, textcolor=color.white, text="Sell")
+//ShortCondition =   (crossunder(mf, upper)  and rsi > upper_RSI and cci > cci_upper) or (crossunder(rsi, upper_RSI ) and mf > upper and cci > cci_upper ) or (crossunder(cci, cci_upper) and mf > upper and rsi > upper_RSI )
+//alertcondition(LongCondition, message="Buy My Alert", title="Buy My Alert")
+//alertcondition(ShortCondition, message="sell My Alert", title="Sell My Alert")

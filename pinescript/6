@@ -1,0 +1,91 @@
+//@version=5
+
+//
+//indicator(title = "Long_Hedg_ADA", shorttitle="Long_Hedg_ADA", overlay=true)
+strategy("Long_Hedg_ADA", overlay=false, initial_capital = 1000, currency = "USD", pyramiding = 7, default_qty_type = strategy.cash, default_qty_value = 1000, commission_value = 0.04)
+i_date = input.time(timestamp("16 Jan 2022 00:00 +0300"), "Date")
+pyramidingg = input.int(7, "Пирамидинг", minval=1)
+ratio = input.int(5, "Коэфициент в процентах для Buy", minval=1)
+profit = input.int(3, "Минимальный процент профита", minval=1)
+distance = input.int(3, "Расстояние EMA -> close")
+smoothK = input.int(9, "K", minval=1)
+smoothD = input.int(3, "D", minval=1)
+lengthRSI = input.int(25, "RSI Length", minval=1)
+lengthStoch = input.int(80, "Stochastic Length", minval=1)
+src = input(close, title="RSI Source")
+rsi1 = ta.rsi(src, lengthRSI)
+k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+d = ta.sma(k, smoothD)
+//plot(k, "K", color=#0094FF)
+//plot(d, "D", color=#FF6A00)
+h0 = hline(80, "Upper Band", color=#606060)
+h1 = hline(20, "Lower Band", color=#606060)
+//fill(h0, h1, color=#9915FF, transp=80, title="Background")
+
+//k = request.security(syminfo.tickerid, "60",  k_k)
+//d = request.security(syminfo.tickerid, "60",  d_d)
+min_RSI = input.int(32, minval=1)
+max_RSI= input.int(72, minval=1)
+//RSI
+len = input.int(12, minval=1, title="Length")
+Smooth_RSI = input.int(3, minval=1)
+src_RSI = input(close, "Source")
+up = ta.rma(math.max(ta.change(src_RSI), 0), len)
+down = ta.rma(-math.min(ta.change(src_RSI), 0), len)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiMA = ta.sma(rsi, Smooth_RSI)
+
+//EMA
+
+len_EMA = input.int(200, minval=1, title="Length")
+src_EMA = input(close, title="Source")
+offset = input.int(title="Offset", defval=0, minval=-500, maxval=500)
+out_EMA = ta.ema(src_EMA, len_EMA)
+
+
+
+//var TrendisLong = true
+var lastSell = 0.0
+var lastBuy = 0.0
+long_entry = false
+var summ = array.new_float(0)
+if (time_close > i_date)
+    if (  rsiMA[1] < min_RSI and rsiMA[1] < rsiMA and array.size(summ) <= (pyramidingg+1)  and  k < 30   and (100-(close/out_EMA*100))>distance) or (100-(close/close[2]*100))>8
+        if (lastBuy == 0)
+            lastBuy := close
+            array.push(summ, close)
+            long_entry := true
+            lastSell := 0
+            strategy.entry("Long", strategy.long, when = (long_entry))
+        else
+            if (close  < (lastBuy/(1+(ratio/100))))
+                lastBuy := close
+                array.push(summ, close)
+                long_entry := true
+                lastSell := 0
+                strategy.entry("Long", strategy.long, when = ( long_entry))
+
+
+
+
+short_entry = false
+
+if (  (rsiMA[1] > max_RSI  and rsiMA[1] > rsiMA and rsiMA[1] > rsiMA[2]) or ( k[1] > k and k[1] > k[2] and k[1] > 85) )
+    if ( (array.sum(summ)/array.size(summ))*(1+(profit/100)) < close)
+        short_entry := true
+        lastBuy := 0
+        array.clear(summ)
+        strategy.close("Long", when = ( short_entry))
+
+
+if (close < lastBuy*0.98)
+    short_entry := true
+    lastBuy := 0
+    array.clear(summ)
+    strategy.close("Long", when = ( short_entry))
+//LongCondition = ( long_entry) //and ta.crossover(cci, cci_lower) ) //or (crossover(k, 20) and cci >= cci_lower ) /// (crossover(cci, cci_lower)// and cci > cci[1] and rsi > rsi[1]  and mf < 50
+//ShortCondition =  (short_entry)// (( cci2sma >  100 and  mf < mf[1] and mf[1] > mf[2]   and mf[1] > 75))
+//plotshape(long_entry, title="Buy", style=shape.labelup, location=location.belowbar, size=size.small, color=color.green, textcolor=color.white, text="Buy")
+//plotshape(ShortCondition, title="Sell", style=shape.labeldown, location=location.abovebar, size=size.small, color=color.black, textcolor=color.white, text="Sell")
+//alertcondition(LongCondition1, message="Buy My Alert", title="Buy My Alert")
+//alertcondition(ShortCondition1, message="sell My Alert", title="Sell My Alert")

@@ -1,0 +1,253 @@
+//@version=5
+
+strategy("Simple_Long_Short_Strategy", overlay=true, initial_capital = 1000, currency = "USD", pyramiding = 4, default_qty_type = strategy.percent_of_equity, default_qty_value = 25, commission_value = 0.04)
+
+// ========== ОБЩИЕ ПАРАМЕТРЫ ==========
+i_date = input.time(timestamp("16 Jan 2022 00:00 +0300"), "Дата начала")
+ratio = input.float(0.5, "Коэфициент усреднения %", minval=0.1)
+distance = input.float(0.15, "Расстояние EMA -> close")
+rebalance_target = input.float(0.5, "Целевая прибыль для ребалансировки %", minval=0.1)
+
+// ========== STOCH RSI ПАРАМЕТРЫ ==========
+smoothK = input.int(9, "K", minval=1)
+smoothD = input.int(3, "D", minval=1)
+lengthRSI = input.int(25, "RSI Length", minval=1)
+lengthStoch = input.int(80, "Stochastic Length", minval=1)
+src = input(close, title="RSI Source")
+rsi1 = ta.rsi(src, lengthRSI)
+k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+d = ta.sma(k, smoothD)
+
+// ========== RSI ПАРАМЕТРЫ ==========
+min_RSI_long = input.int(35, "Min RSI для лонга", minval=1)
+max_RSI_long = input.int(55, "Max RSI для лонга", minval=1)
+min_RSI_short = input.int(45, "Min RSI для шорта", minval=1)
+max_RSI_short = input.int(65, "Max RSI для шорта", minval=1)
+len = input.int(10, "RSI Length", minval=1)
+Smooth_RSI = input.int(1, "RSI Smoothing", minval=1)
+src_RSI = input(close, "RSI Source")
+up = ta.rma(math.max(ta.change(src_RSI), 0), len)
+down = ta.rma(-math.min(ta.change(src_RSI), 0), len)
+rsi = down == 0 ? 100 : up == 0 ? 0 : 100 - (100 / (1 + up / down))
+rsiMA = ta.sma(rsi, Smooth_RSI)
+
+// ========== EMA ПАРАМЕТРЫ ==========
+len_EMA = input.int(183, "EMA Length", minval=1)
+src_EMA = input(close, "EMA Source")
+offset = input.int(0, "EMA Offset", minval=-500, maxval=500)
+out_EMA = ta.ema(src_EMA, len_EMA)
+plot(out_EMA, title="EMA", color=color.blue, offset=offset)
+
+// ========== ПАРАМЕТРЫ ВЫХОДА ==========
+minProfitPercent = input.float(0.3, "Минимальный процент профита для закрытия", minval=0.1)
+
+// ========== ПЕРЕМЕННЫЕ ДЛЯ ОТСЛЕЖИВАНИЯ ПОЗИЦИЙ ==========
+var float long_avg_price = na
+var float short_avg_price = na
+var int long_position_count = 0
+var int short_position_count = 0
+var float long_total_cost = 0.0
+var float short_total_cost = 0.0
+var float long_total_qty = 0.0
+var float short_total_qty = 0.0
+var float total_realized_pnl = 0.0
+var float cycle_start_capital = 1000.0
+
+// ========== РАСЧЕТ ТЕКУЩИХ ЗНАЧЕНИЙ ==========
+current_capital = strategy.initial_capital + total_realized_pnl
+cycle_pnl_percent = (current_capital - cycle_start_capital) / cycle_start_capital * 100
+
+// ========== ОТЛАДОЧНАЯ ИНФОРМАЦИЯ ==========
+// Показываем текущие значения для понимания
+plotchar(cycle_pnl_percent, "Cycle PnL %", "●", location.top, color.purple, size=size.tiny)
+plotchar(rebalance_target, "Target %", "◐", location.top, color.orange, size=size.tiny)
+
+// ========== УСЛОВИЯ ДЛЯ ВХОДОВ ==========
+long_condition = time_close > i_date and rsiMA[1] < min_RSI_long and rsiMA[1] < rsiMA and rsiMA[1] < rsiMA[2] and out_EMA > close*(1+(distance/100))
+short_condition = time_close > i_date and rsiMA[1] > max_RSI_short and rsiMA[1] > rsiMA and rsiMA[1] > rsiMA[2] and out_EMA < close*(1-(distance/100))
+
+// ========== РАСЧЕТ ПРИБЫЛИ ПО КАЖДОЙ СТОРОНЕ ==========
+long_profit_percent = long_position_count > 0 and not na(long_avg_price) ? (long_total_qty * (close - long_avg_price)) / current_capital * 100 : 0
+short_profit_percent = short_position_count > 0 and not na(short_avg_price) ? (short_total_qty * (short_avg_price - close)) / current_capital * 100 : 0
+
+// ========== ЛОГИКА ПРОТИВОПОЛОЖНЫХ СИГНАЛОВ (ТОЛЬКО В ПЛЮСЕ) ==========
+// Закрываем лонг при сигнале на шорт (только в плюсе)
+if (short_condition and long_position_count > 0 and long_profit_percent >= 0)
+    trade_profit_dollars = long_total_qty * (close - long_avg_price)
+    trade_profit_percent = trade_profit_dollars / strategy.initial_capital * 100
+
+    // Проверяем ребалансировку ДО обновления
+    new_total_pnl = total_realized_pnl + trade_profit_dollars
+    new_capital = strategy.initial_capital + new_total_pnl
+    new_cycle_pnl = (new_capital - cycle_start_capital) / cycle_start_capital * 100
+
+    total_realized_pnl := new_total_pnl
+
+    strategy.close("Long1")
+    strategy.close("Long2")
+
+    // Метка выхода
+    label.new(bar_index, close, "📈 LONG EXIT\nСделка: +" + str.tostring(trade_profit_percent, "#.##") + "%",
+              color=color.new(color.green, 20), style=label.style_label_left, size=size.small, textcolor=color.white)
+
+    long_avg_price := na
+    long_position_count := 0
+    long_total_cost := 0.0
+    long_total_qty := 0.0
+
+    // Ребалансировка
+    if new_cycle_pnl >= rebalance_target
+        cycle_start_capital := new_capital
+        rebal_text = "🔄 REBALANCE\n$" + str.tostring(new_capital, "#") + "\nЦикл: " + str.tostring(new_cycle_pnl, "#.##") + "%"
+        label.new(bar_index, close, rebal_text, color=color.new(color.purple, 20), style=label.style_label_center, size=size.normal, textcolor=color.white)
+
+// Закрываем шорт при сигнале на лонг (только в плюсе)
+if (long_condition and short_position_count > 0 and short_profit_percent >= 0)
+    trade_profit_dollars = short_total_qty * (short_avg_price - close)
+    trade_profit_percent = trade_profit_dollars / strategy.initial_capital * 100
+
+    // Проверяем ребалансировку ДО обновления
+    new_total_pnl = total_realized_pnl + trade_profit_dollars
+    new_capital = strategy.initial_capital + new_total_pnl
+    new_cycle_pnl = (new_capital - cycle_start_capital) / cycle_start_capital * 100
+
+    total_realized_pnl := new_total_pnl
+
+    strategy.close("Short1")
+    strategy.close("Short2")
+
+    // Метка выхода
+    label.new(bar_index, close, "📉 SHORT EXIT\nСделка: +" + str.tostring(trade_profit_percent, "#.##") + "%",
+              color=color.new(color.red, 20), style=label.style_label_right, size=size.small, textcolor=color.white)
+
+    short_avg_price := na
+    short_position_count := 0
+    short_total_cost := 0.0
+    short_total_qty := 0.0
+
+    // Ребалансировка
+    if new_cycle_pnl >= rebalance_target
+        cycle_start_capital := new_capital
+        rebal_text = "🔄 REBALANCE\n$" + str.tostring(new_capital, "#") + "\nЦикл: " + str.tostring(new_cycle_pnl, "#.##") + "%"
+        label.new(bar_index, close, rebal_text, color=color.new(color.purple, 20), style=label.style_label_center, size=size.normal, textcolor=color.white)
+
+// ========== ЛОГИКА ВХОДОВ В ЛОНГ ==========
+if (long_condition and long_position_count < 2)
+    if long_position_count == 0
+        strategy.entry("Long1", strategy.long, qty=25)
+        entry_amount = current_capital * 0.25
+        long_total_cost := entry_amount
+        long_total_qty := entry_amount / close
+        long_avg_price := close
+        long_position_count := 1
+
+        label.new(bar_index, low, "📈 LONG\n$" + str.tostring(close, "#.##"),
+                  color=color.new(color.green, 30), style=label.style_label_up, size=size.small, textcolor=color.white)
+
+    else if close < (long_avg_price - (long_avg_price * ratio / 100))
+        strategy.entry("Long2", strategy.long, qty=25)
+        entry_amount = current_capital * 0.25
+        new_qty = entry_amount / close
+        long_total_cost := long_total_cost + entry_amount
+        long_total_qty := long_total_qty + new_qty
+        long_avg_price := long_total_cost / long_total_qty
+        long_position_count := 2
+
+        label.new(bar_index, low, "📈 AVG\n$" + str.tostring(long_avg_price, "#.##"),
+                  color=color.new(color.green, 50), style=label.style_label_up, size=size.small, textcolor=color.white)
+
+// ========== ЛОГИКА ВХОДОВ В ШОРТ ==========
+if (short_condition and short_position_count < 2)
+    if short_position_count == 0
+        strategy.entry("Short1", strategy.short, qty=25)
+        entry_amount = current_capital * 0.25
+        short_total_cost := entry_amount
+        short_total_qty := entry_amount / close
+        short_avg_price := close
+        short_position_count := 1
+
+        label.new(bar_index, high, "📉 SHORT\n$" + str.tostring(close, "#.##"),
+                  color=color.new(color.red, 30), style=label.style_label_down, size=size.small, textcolor=color.white)
+
+    else if close > (short_avg_price + (short_avg_price * ratio / 100))
+        strategy.entry("Short2", strategy.short, qty=25)
+        entry_amount = current_capital * 0.25
+        new_qty = entry_amount / close
+        short_total_cost := short_total_cost + entry_amount
+        short_total_qty := short_total_qty + new_qty
+        short_avg_price := short_total_cost / short_total_qty
+        short_position_count := 2
+
+        label.new(bar_index, high, "📉 AVG\n$" + str.tostring(short_avg_price, "#.##"),
+                  color=color.new(color.red, 50), style=label.style_label_down, size=size.small, textcolor=color.white)
+
+// ========== ОБЫЧНЫЕ УСЛОВИЯ ВЫХОДА ==========
+// Выход из лонга
+if (ta.crossunder(close, out_EMA) and long_position_count > 0 and long_profit_percent >= minProfitPercent)
+    trade_profit_dollars = long_total_qty * (close - long_avg_price)
+    trade_profit_percent = trade_profit_dollars / strategy.initial_capital * 100
+
+    // Проверяем ребалансировку ДО обновления
+    new_total_pnl = total_realized_pnl + trade_profit_dollars
+    new_capital = strategy.initial_capital + new_total_pnl
+    new_cycle_pnl = (new_capital - cycle_start_capital) / cycle_start_capital * 100
+
+    total_realized_pnl := new_total_pnl
+
+    strategy.close("Long1")
+    strategy.close("Long2")
+
+    label.new(bar_index, close, "📈 LONG EXIT\nСделка: +" + str.tostring(trade_profit_percent, "#.##") + "%",
+              color=color.new(color.green, 20), style=label.style_label_left, size=size.small, textcolor=color.white)
+
+    long_avg_price := na
+    long_position_count := 0
+    long_total_cost := 0.0
+    long_total_qty := 0.0
+
+    // Ребалансировка
+    if new_cycle_pnl >= rebalance_target
+        cycle_start_capital := new_capital
+        rebal_text = "🔄 REBALANCE\n$" + str.tostring(new_capital, "#") + "\nЦикл: " + str.tostring(new_cycle_pnl, "#.##") + "%"
+        label.new(bar_index, close, rebal_text, color=color.new(color.purple, 20), style=label.style_label_center, size=size.normal, textcolor=color.white)
+
+// Выход из шорта
+if (ta.crossover(close, out_EMA) and short_position_count > 0 and short_profit_percent >= minProfitPercent)
+    trade_profit_dollars = short_total_qty * (short_avg_price - close)
+    trade_profit_percent = trade_profit_dollars / strategy.initial_capital * 100
+
+    // Проверяем ребалансировку ДО обновления
+    new_total_pnl = total_realized_pnl + trade_profit_dollars
+    new_capital = strategy.initial_capital + new_total_pnl
+    new_cycle_pnl = (new_capital - cycle_start_capital) / cycle_start_capital * 100
+
+    total_realized_pnl := new_total_pnl
+
+    strategy.close("Short1")
+    strategy.close("Short2")
+
+    label.new(bar_index, close, "📉 SHORT EXIT\nСделка: +" + str.tostring(trade_profit_percent, "#.##") + "%",
+              color=color.new(color.red, 20), style=label.style_label_right, size=size.small, textcolor=color.white)
+
+    short_avg_price := na
+    short_position_count := 0
+    short_total_cost := 0.0
+    short_total_qty := 0.0
+
+    // Ребалансировка
+    if new_cycle_pnl >= rebalance_target
+        cycle_start_capital := new_capital
+        label.new(bar_index, close, "🔄 REBALANCE\n$" + str.tostring(new_capital, "#") +
+                  "\nЦикл: " + str.tostring(new_cycle_pnl, "#.##") + "% ≥ " + str.tostring(rebalance_target, "#.##") + "%",
+                  color=color.new(color.purple, 20), style=label.style_label_center, size=size.normal, textcolor=color.white)
+
+// ========== ПОДСВЕТКА ОБЛАСТЕЙ RSI ==========
+bgcolor(long_condition ? color.new(color.green, 90) : na, title="Long Zone")
+bgcolor(short_condition ? color.new(color.red, 90) : na, title="Short Zone")
+
+// ========== ОТОБРАЖЕНИЕ ЦИКЛА В УГЛУ (ПРОСТОЕ) ==========
+if barstate.islast
+    var label cycle_label = na
+    label.delete(cycle_label)
+    info_text = "💰 Капитал: $" + str.tostring(current_capital, "#") + "\n🔄 Цикл: " + str.tostring(cycle_pnl_percent, "#.##") + "%" + "\n🎯 Цель: " + str.tostring(rebalance_target, "#.##") + "%"
+    cycle_label := label.new(bar_index + 10, close, info_text, color=color.new(color.blue, 30), style=label.style_label_left, size=size.normal, textcolor=color.white)

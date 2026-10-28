@@ -2,7 +2,7 @@
 //! a resting buy `WICK_PCT` (7) under each liquid perp's anchor - the last minute's close, or its
 //! oracle when lower - on `WICK_MAX_COINS` (30) of the coins with a day volume of `WICK_MIN_VOL_USD`
 //! (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the last minute's close
-//! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (1M)+ (hyna, the crypto copies, left
+//! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (0.7M; 1M until 2026-10-28)+ (hyna, the crypto copies, left
 //! out). Which coins (every 5 min): the most restless - the biggest standard deviation of the 1-minute
 //! returns over the last 24 h (the main dex's and the bid HIP-3 dexes' mids every 5 s, every other
 //! HIP-3 dex's every 30 s; after a start 24 h of 1-minute candles read, a coin a minute; a coin with
@@ -31,6 +31,10 @@
 //! ($475). The HIP-3 take (2026-10-27, the tape, the 4% bid on the USDC dexes, 307 fills, 60 min,
 //! stop 20%): 3% +119 bp, 4% +145 bp (hit 58%, halves +182 / +109), 5% +132 bp (hit 38%), 6% +126:
 //! 4% sits just under the last close the wick fell from. A bid holds its margin: ~$10 a crypto one (10x), ~$41 a HIP-3 one, at $20 risk.
+//! The HIP-3 volume floor (2026-10-28, V67..V69: the filter matrix and 27 filter kinds on the bars, then the tape):
+//! $0.7M against $1M: 246 fills against 217, the win rate 80.1% against 78.8%, the sum +33% (w/o the 5 best days
+//! +44%), 12 of 12 months up; no other filter beat shuffled luck (a closer bid: twice the fills, the win rate -7..10 pp,
+//! the same sum).
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -90,7 +94,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
-            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 1e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
+            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 0.7e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),

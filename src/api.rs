@@ -201,7 +201,7 @@ impl Api {
     /// its opening minute / `bar_min`, the close).
     pub async fn bar_closes(&self, coin: &str, bar_min: i64, start: f64) -> Result<Vec<(i64, f64)>> {
         let n = ((now() - start) / 60.0 / bar_min as f64).max(1.0);
-        let body = json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": format!("{bar_min}m"), "startTime": (start * 1000.0) as i64, "endTime": (now() * 1000.0) as i64}});
+        let body = json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": if bar_min % 60 == 0 { format!("{}h", bar_min / 60) } else { format!("{bar_min}m") }, "startTime": (start * 1000.0) as i64, "endTime": (now() * 1000.0) as i64}});
         let v = self.info(body, 20 + (n / 60.0).ceil() as u32).await?;
         Ok(v.as_array().into_iter().flatten().filter_map(|c| Some((c["t"].as_i64()? / 60_000 / bar_min, num(&c["c"])))).filter(|x| x.1 > 0.0).collect())
     }

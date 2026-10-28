@@ -2,7 +2,10 @@
 //! paper; "1" live; "0" off; without `LIVE_KEY` / `LIVE_ACCOUNT` paper only). On each 5-minute close: a
 //! main-dex perp with `RSIDIP_MIN_VOL_USD` (10M)+ a day whose RSI14 (Wilder, the 5m closes) was under
 //! `RSIDIP_RSI_MAX` (35) the bar before and is up now, the close `RSIDIP_UNDER_PCT` (8) or more under the
-//! EMA200 of the 5m closes, BTC's last 15 minutes under `RSIDIP_BTC_MAX_PCT` (0.5): bought at market; up
+//! EMA200 of the 5m closes, BTC's last 15 minutes under `RSIDIP_BTC_MAX_PCT` (0.5); or the wider signal: the
+//! RSI under `RSIDIP_WIDE_RSI_MAX` (45.5) and up, `RSIDIP_WIDE_UNDER_PCT` (5.6)+ under the 5m EMA200, while
+//! the price is `RSIDIP_H1_UNDER_PCT` (10.65; 0: off)+ under the EMA200 of the hourly closes (the coin in a
+//! deep fall on the hours: there the weaker 5m hook pays as well): bought at market; up
 //! to `RSIDIP_ADDS` (2) adds at market, each at a 5m close `RSIDIP_ADD_PCT` (3) under the last buy; out at
 //! the average +`RSIDIP_TAKE_PCT` (2) (a resting reduce-only limit: maker), at the average
 //! -`RSIDIP_STOP_PCT` (20) (a resting stop) or `RSIDIP_HOLD_H` (24) h after the first buy (market). After
@@ -24,9 +27,15 @@
 //! average re-read after each add): 1,166 trades, +64 bp a buy; an independent version on the bars
 //! agrees (98% the same exits). On Binance only on the coins HL lists (all of Binance: nothing), so the
 //! live record decides.
+//! V67..V72 (2026-10-28, the filter search, 33 kinds, checked against shuffled luck and on the tape): the wider
+//! signal under the 1h EMA200 gate: 2,006 trades against 1,157, the win rate the same 95.8%, the sum x2.3
+//! (w/o the 5 best days x2.0), 18 of 18 months up; at most 3 at once, compounding at 1.1% a buy: +62% over
+//! 16.8 months, the drawdown with the open 9.1% (the old signal alone +42%, 10.9%). The gate on the hourly
+//! candles (the EMA of the last 1,000 hours) decides as the research's minute EMA (span 12,000) 99.8% of the time.
 //!
 //! Prices: the main dex's mids each `POLL_S`, the 5m closes their last mid in each bar; after a
-//! start the liquid coins' 5m candles (50 h) read, a coin each `BACKFILL_EVERY_S`. The live positions
+//! start the liquid coins' 5m candles (50 h) read, a coin each `BACKFILL_EVERY_S`; their hourly candles (1,000
+//! h, for the 1h EMA200) read again each hour, a coin a poll. The live positions
 //! checked on the account each `CHECK_EVERY_S`. Its state is the store's doc `rsidip`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -49,6 +58,9 @@ const POLL_S: f64 = 10.0;
 const VOLUME_EVERY_S: f64 = 300.0;
 const BACKFILL_EVERY_S: f64 = 10.0;
 const CHECK_EVERY_S: f64 = 30.0;
+/// The hourly closes read for the 1h EMA200 (its EMA seeded at the first), and the fewest it is read from.
+const H1_HOURS: f64 = 1000.0;
+const H1_MIN: usize = 300;
 /// The 5m bars kept a coin (50 h), and the fewest the signal is read from (the EMA200 warmed).
 const KEEP: usize = 600;
 const MIN_BARS: usize = 400;
@@ -69,6 +81,10 @@ struct Params {
     add_step: f64,
     max_open: usize,
     risk_usd: f64,
+    /// The wider signal: its RSI ceiling, its depth under the 5m EMA200, and how far under the 1h EMA200 it needs (0: off).
+    wide_rsi_max: f64,
+    wide_under: f64,
+    h1_under: f64,
     /// The trial (`RSIDIP_ENABLED` unset): its live positions at most.
     trial: Option<u32>,
 }
@@ -79,7 +95,9 @@ impl Params {
         Params { rsi_max: v("RSIDIP_RSI_MAX", 35.0), under: v("RSIDIP_UNDER_PCT", 8.0) / 100.0, btc_max: v("RSIDIP_BTC_MAX_PCT", 0.5) / 100.0,
             min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 2.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
             hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 3.0) / 100.0,
-            max_open: v("RSIDIP_MAX_OPEN", 3.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 10.0), trial: trades::switch("RSIDIP_ENABLED").flatten() }
+            max_open: v("RSIDIP_MAX_OPEN", 3.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 10.0),
+            wide_rsi_max: v("RSIDIP_WIDE_RSI_MAX", 45.5), wide_under: v("RSIDIP_WIDE_UNDER_PCT", 5.6) / 100.0, h1_under: v("RSIDIP_H1_UNDER_PCT", 10.65) / 100.0,
+            trial: trades::switch("RSIDIP_ENABLED").flatten() }
     }
 
     /// The buys a position can have.
@@ -248,15 +266,26 @@ fn series(q: &VecDeque<(i64, f64)>, upto: i64) -> Vec<f64> {
     out
 }
 
-/// The signal on the last close of `c`: (the RSI the bar before, how far under the EMA200).
-fn signal(c: &[f64], p: &Params) -> Option<(f64, f64)> {
+/// The signal on the last close of `c` (`h1`: the 1h EMA200, None unknown): (the RSI the bar before, how far
+/// under the 5m EMA200, the wider signal's or not).
+fn signal(c: &[f64], p: &Params, h1: Option<f64>) -> Option<(f64, f64, bool)> {
     if c.len() < MIN_BARS {
         return None;
     }
     let (r, e) = (rsi(c, 14), ema(c, 200));
     let n = c.len() - 1;
     let under = c[n] / e[n] - 1.0;
-    (r[n - 1] < p.rsi_max && r[n] > r[n - 1] && under < -p.under).then_some((r[n - 1], under))
+    let hook = r[n] > r[n - 1];
+    if hook && r[n - 1] < p.rsi_max && under < -p.under {
+        return Some((r[n - 1], under, false));
+    }
+    let deep = p.h1_under > 0.0 && h1.is_some_and(|x| x > 0.0 && c[n] / x - 1.0 <= -p.h1_under);
+    (deep && hook && r[n - 1] < p.wide_rsi_max && under < -p.wide_under).then_some((r[n - 1], under, true))
+}
+
+/// The EMA200 of the hourly closes (oldest first; seeded at the first), None with fewer than `H1_MIN`.
+fn h1_ema(closes: &[f64]) -> Option<f64> {
+    (closes.len() >= H1_MIN).then(|| *ema(closes, 200).last().unwrap())
 }
 
 fn usd(x: f64) -> String {
@@ -269,8 +298,10 @@ fn message(ev: &Value) -> Option<String> {
     let live = ev["live"] == true;
     let tag = if live { "💵 RSI-дип НА ДЕНЬГИ" } else { "📝 RSI-дип (бумага, без сделки)" };
     Some(match ev["what"].as_str()? {
-        "open" => format!("{tag} ВХОД {coin}: RSI был {:.0} и развернулся, цена {:.1}% ниже EMA200; по {}, ${:.0}, тейк {} / стоп {}, до {:.0} ч{}",
-            f("rsi"), -f("under") * 100.0, f("px"), f("usd"), f("take_px"), f("stop_px"), f("hold_h"), ev["trial"].as_str().unwrap_or("")),
+        "open" => format!("{tag} ВХОД {coin}{}: RSI был {:.0} и развернулся, цена {:.1}% ниже EMA200{}; по {}, ${:.0}, тейк {} / стоп {}, до {:.0} ч{}",
+            if ev["wide"] == true { " (расширенный сигнал)" } else { "" }, f("rsi"), -f("under") * 100.0,
+            if ev["wide"] == true { format!(" и {:.1}% ниже часовой EMA200", -f("under_h1") * 100.0) } else { String::new() },
+            f("px"), f("usd"), f("take_px"), f("stop_px"), f("hold_h"), ev["trial"].as_str().unwrap_or("")),
         "add" => format!("{tag} ДОБОР {coin} №{:.0}: по {}, средняя {}, тейк {} / стоп {} (на весь объём)", f("units"), f("px"), f("avg"), f("take_px"), f("stop_px")),
         "close" => format!("{} {tag} {} {coin}: средняя {} -> {}, покупок {:.0}, {} ({:+.2}%) | всего {:.0} сделок, в плюсе {:.0}, итог {}",
             if f("pnl_usd") >= 0.0 { "✅" } else { "🔻" },
@@ -298,12 +329,13 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         (Some(_), Some(n)) => format!("the trial: the first {n} live (opened {}), then paper", state.opened),
         (Some(_), None) => "live".to_string(),
     };
-    log!("rsidip: {mode}; RSI14 5m hook from < {:.0}, {:.0}%+ under the EMA200, BTC 15 min < {:.1}%, ${:.0}M+; take {:.0}% stop {:.0}% {:.0} h, {} adds {:.0}% apart, risk {} a position, at most {}; {} open, {} closed",
-        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0,
-        trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed);
-    crate::notify::send(format!("{} RSI-дип запущен{}: 5-минутки, RSI14 разворот из-под {:.0}, цена на {:.0}%+ ниже EMA200, BTC спокоен (за 15 мин меньше {:.1}%), оборот от ${:.0}M; тейк +{:.0}% / стоп −{:.0}% от средней, до {:.0} ч, {} добора через {:.0}%, риск на позицию (все {:.0} покупки) {}, до {} позиций. Открыто {}, закрыто {} (итог {}){}",
+    log!("rsidip: {mode}; RSI14 5m hook from < {:.0}, {:.0}%+ under the EMA200 (or from < {:.1}, {:.1}%+ under, {:.2}%+ under the 1h EMA200), BTC 15 min < {:.1}%, ${:.0}M+; take {:.0}% stop {:.0}% {:.0} h, {} adds {:.0}% apart, risk {} a position, at most {}; {} open, {} closed",
+        p.rsi_max, p.under * 100.0, p.wide_rsi_max, p.wide_under * 100.0, p.h1_under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
+        p.hold_s / 3600.0, p.adds, p.add_step * 100.0, trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed);
+    crate::notify::send(format!("{} RSI-дип запущен{}: 5-минутки, RSI14 разворот из-под {:.0}, цена на {:.0}%+ ниже EMA200 (или разворот из-под {:.1} и {:.1}%+ ниже, если монета на {:.2}%+ ниже часовой EMA200), BTC спокоен (за 15 мин меньше {:.1}%), оборот от ${:.0}M; тейк +{:.0}% / стоп −{:.0}% от средней, до {:.0} ч, {} добора через {:.0}%, риск на позицию (все {:.0} покупки) {}, до {} позиций. Открыто {}, закрыто {} (итог {}){}",
         if venue.is_some() { "💵" } else { "📝" }, if venue.is_some() { " НА ДЕНЬГИ" } else { " НА БУМАГЕ (без сделок)" },
-        p.rsi_max, p.under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0, p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
+        p.rsi_max, p.under * 100.0, p.wide_rsi_max, p.wide_under * 100.0, p.h1_under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
+        p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
         trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
     let cfg = cfg.clone();
@@ -311,6 +343,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let mut closes = Closes::default();
         let mut volume: HashMap<String, f64> = HashMap::new();
         let mut backfilled: HashSet<String> = HashSet::new();
+        // Coin -> (the hour it was read in, its 1h EMA200).
+        let mut h1: HashMap<String, (i64, Option<f64>)> = HashMap::new();
         let (mut vol_at, mut backfill_at, mut check_at) = (0.0, 0.0, 0.0);
         let mut last_bar = (now() / 60.0).floor() as i64 / BAR_MIN;
         let event = |store: &Store, mut ev: Value| {
@@ -379,6 +413,25 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     }
                 }
                 backfill_at = t;
+            }
+            // The 1h EMA200s: a liquid coin not read this hour, the biggest first, one a poll.
+            let hour = (t / 3600.0).floor() as i64;
+            if p.h1_under > 0.0 {
+                let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| **v >= p.min_vol && c.as_str() != "BTC" && h1.get(*c).is_none_or(|x| x.0 < hour)).collect();
+                todo.sort_by(|a, b| b.1.total_cmp(a.1));
+                if let Some(c) = todo.first().map(|x| x.0.clone()) {
+                    match api.bar_closes(&c, 60, t - H1_HOURS * 3600.0).await {
+                        Ok(v) => {
+                            let closes: Vec<f64> = v.iter().filter(|x| x.0 < hour).map(|x| x.1).collect();      // the completed hours
+                            h1.insert(c, (hour, h1_ema(&closes)));
+                        }
+                        Err(e) => {
+                            log!("rsidip: {c} hourly candles not read: {e:#}");
+                            let old = h1.get(&c).and_then(|x| x.1);
+                            h1.insert(c, (hour, old));
+                        }
+                    }
+                }
             }
             let mut changed = false;
             // The live positions on the account: out on time; gone (the stop or the take filled).
@@ -478,17 +531,17 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 // The signals.
                 let btc = closes.0.get("BTC").map(|q| series(q, b)).filter(|c| c.len() > 3).map(|c| c[c.len() - 1] / c[c.len() - 4] - 1.0);
                 if btc.is_some_and(|x| x.abs() < p.btc_max) {
-                    let mut cands: Vec<(String, f64, f64)> = Vec::new();
+                    let mut cands: Vec<(String, f64, f64, bool)> = Vec::new();
                     for (c, q) in &closes.0 {
                         if c == "BTC" || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || state.open.iter().any(|x| &x.coin == c) {
                             continue;
                         }
-                        if let Some((r, u)) = signal(&series(q, b), &p) {
-                            cands.push((c.clone(), r, u));
+                        if let Some((r, u, w)) = signal(&series(q, b), &p, h1.get(c).and_then(|x| x.1)) {
+                            cands.push((c.clone(), r, u, w));
                         }
                     }
                     cands.sort_by(|a, b| a.2.total_cmp(&b.2));      // the deepest first
-                    for (c, r, u) in cands {
+                    for (c, r, u, wide) in cands {
                         let Some(&mid) = mids.get(&c) else { continue };
                         let n_live = state.open.iter().filter(|x| x.live()).count();
                         let usd_buy = p.buy_usd();
@@ -517,7 +570,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         pos.rsi = r;
                         pos.under = u;
                         let trial = if pos.live() && !trades::trial_open(p.trial, state.opened) { ", ПРОБА окончена: дальше на бумаге" } else { "" };
-                        event(&store, json!({"what": "open", "live": pos.live(), "coin": c, "px": pos.last, "usd": pos.cost, "rsi": r, "under": u,
+                        event(&store, json!({"what": "open", "live": pos.live(), "coin": c, "px": pos.last, "usd": pos.cost, "rsi": r, "under": u, "wide": wide,
+                            "under_h1": h1.get(&c).and_then(|x| x.1).map(|e| pos.last / e - 1.0),
                             "take_px": pos.avg() * (1.0 + p.take), "stop_px": pos.avg() * (1.0 - p.stop), "hold_h": p.hold_s / 3600.0, "trial": trial}));
                         state.open.push(pos);
                         changed = true;
@@ -526,7 +580,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 if bar % 12 == 0 {
                     let ready = closes.0.iter().filter(|(c, q)| volume.get(*c).copied().unwrap_or(0.0) >= p.min_vol && q.len() >= MIN_BARS).count();
                     let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
-                    log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} open ({} live), {} closed, {}", state.open.len(),
+                    let deep: Vec<String> = h1.iter().filter_map(|(c, x)| Some((c, mids.get(c)? / x.1? - 1.0))).filter(|x| x.1 <= -p.h1_under).map(|x| format!("{} {:.1}%", x.0, x.1 * 100.0)).collect();
+                    log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} with the 1h EMA200 (deep under it: {}), {} open ({} live), {} closed, {}",
+                        h1.values().filter(|x| x.1.is_some()).count(), if deep.is_empty() { "none".to_string() } else { deep.join(", ") }, state.open.len(),
                         state.open.iter().filter(|x| x.live()).count(), state.closed, usd(state.pnl_usd));
                 }
                 last_bar = bar;
@@ -557,11 +613,24 @@ mod tests {
         let p = Params::from_env();
         let mut c: Vec<f64> = vec![100.0; 400];
         c.extend((1..=30).map(|i| 100.0 - i as f64 * 0.5));
-        assert!(signal(&c, &p).is_none());                      // still falling: no hook
+        assert!(signal(&c, &p, None).is_none());                // still falling: no hook
         c.push(85.2);
-        let (r, u) = signal(&c, &p).expect("a hook under 35, 8%+ under the EMA200");
+        let (r, u, w) = signal(&c, &p, None).expect("a hook under 35, 8%+ under the EMA200");
+        assert!(!w);
         assert!(r < 35.0 && u < -0.08, "{r} {u}");
-        assert!(signal(&c[..300], &p).is_none());                // too few bars
+        assert!(signal(&c[..300], &p, None).is_none());          // too few bars
+        // the wider signal: a fall to ~93 (about 7% under the 5m EMA200: not the bot's 8%) and a tick up; taken only
+        // when the price is 10.65%+ under the 1h EMA200
+        let p = Params { rsi_max: 35.0, under: 0.08, wide_rsi_max: 45.5, wide_under: 0.056, h1_under: 0.1065, ..Params::from_env() };
+        let mut c: Vec<f64> = vec![100.0; 400];
+        c.extend((1..=14).map(|i| 100.0 - i as f64 * 0.5));
+        c.push(93.2);
+        assert!(signal(&c, &p, None).is_none());                 // the 1h EMA unknown: no wider signal
+        assert!(signal(&c, &p, Some(100.0)).is_none());          // 6.8% under the 1h EMA200: not deep enough
+        let (r, u, w) = signal(&c, &p, Some(105.0)).expect("the wider signal 11.2% under the 1h EMA200");
+        assert!(w && r < 45.5 && u < -0.056 && u > -0.08, "{r} {u}");
+        assert!(signal(&c, &Params { h1_under: 0.0, ..p.clone() }, Some(105.0)).is_none());    // the gate off
+        assert!(h1_ema(&[1.0; 299]).is_none() && (h1_ema(&[2.0; 300]).unwrap() - 2.0).abs() < 1e-12);
     }
 
     /// The indicators against the research's (Python, v52lib) on real 5m closes: `RSIDIP_FIXTURE` = a JSON list of
@@ -580,7 +649,7 @@ mod tests {
                 assert!((r[i] - r0[i]).abs() < 1e-9, "{} rsi[{i}] {} vs {}", f["coin"], r[i], r0[i]);
                 assert!((e[i] / e0[i] - 1.0).abs() < 1e-12, "{} ema[{i}] {} vs {}", f["coin"], e[i], e0[i]);
             }
-            assert_eq!(signal(&c, &p).is_some(), f["signal"].as_bool().unwrap(), "{} signal", f["coin"]);
+            assert_eq!(signal(&c, &p, None).is_some(), f["signal"].as_bool().unwrap(), "{} signal", f["coin"]);
         }
     }
 

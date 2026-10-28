@@ -31,6 +31,10 @@
 //! ($475). The HIP-3 take (2026-10-27, the tape, the 4% bid on the USDC dexes, 307 fills, 60 min,
 //! stop 20%): 3% +119 bp, 4% +145 bp (hit 58%, halves +182 / +109), 5% +132 bp (hit 38%), 6% +126:
 //! 4% sits just under the last close the wick fell from. A bid holds its margin: ~$10 a crypto one (10x), ~$41 a HIP-3 one, at $20 risk.
+//! The crash insurance (2026-10-28, V69/V75): no crypto bid while the coin's last hour is already 2.5x as restless as
+//! its day (`WICK_HOT_X`): on the tape it skips 82 of the 309 fills, those of 2025-10-10 (-16 stops, all the crypto
+//! wick's profit) and on the other days +3 stops; on one deposit it keeps the drawdown with the open at 19.4% at 3.3% a
+//! trade (23.2% without it).
 //! The HIP-3 volume floor (2026-10-28, V67..V69: the filter matrix and 27 filter kinds on the bars, then the tape):
 //! $0.7M against $1M: 246 fills against 217, the win rate 80.1% against 78.8%, the sum +33% (w/o the 5 best days
 //! +44%), 12 of 12 months up; no other filter beat shuffled luck (a closer bid: twice the fills, the win rate -7..10 pp,
@@ -88,6 +92,8 @@ struct Params {
     trial: Option<u32>,
     /// The coins picked by the 24 h deviation (else by the day volume).
     by_spread: bool,
+    /// `WICK_HOT_X` (2.5; 0: off): no crypto bid while the last hour's 1-minute deviation is over this many times the day's.
+    hot_x: f64,
 }
 
 impl Params {
@@ -98,7 +104,7 @@ impl Params {
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
-            by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true) }
+            by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true), hot_x: v("WICK_HOT_X", 2.5) }
     }
 }
 
@@ -150,6 +156,11 @@ fn pick(volume: &HashMap<String, f64>, min_vol: f64, n: usize, skip: impl Fn(&st
         (None, None) => b.2.total_cmp(&a.2),
     });
     v.into_iter().take(n).map(|x| x.0.clone()).collect()
+}
+
+/// The hour's deviation over `x` times the day's (`x` 0: off; either unknown: not hot).
+fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
+    x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
 }
 
 fn usd(x: f64) -> String {
@@ -239,6 +250,12 @@ impl Wick {
     }
 
     /// The coins to bid now and their levels.
+    /// A crash on the coin already: the last hour's 1-minute deviation over `hot_x` times the day's (both to the
+    /// minute before; the day's from 600 minutes); unknown: not hot.
+    fn hot(&self, coin: &str, minute: i64) -> bool {
+        is_hot(self.closes.spread(coin, minute - 1, 60, 30), self.closes.spread(coin, minute - 1, 1440, 600), self.p.hot_x)
+    }
+
     fn wanted(&self, minute: i64) -> HashMap<String, f64> {
         let mut out = HashMap::new();
         let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count();
@@ -257,7 +274,7 @@ impl Wick {
         if btc_calm && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
             for c in self.picked.clone() {
                 let (Some(close), o) = (self.closes.at(&c, minute - 1), self.oracle.get(&c).copied().unwrap_or(0.0)) else { continue };
-                if !free(&c) {
+                if !free(&c) || self.hot(&c, minute) {
                     continue;
                 }
                 let anchor = if o > 0.0 { close.min(o) } else { close };
@@ -582,6 +599,21 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crash_insurance() {
+        assert!(is_hot(Some(0.026), Some(0.01), 2.5));
+        assert!(!is_hot(Some(0.024), Some(0.01), 2.5));
+        assert!(!is_hot(None, Some(0.01), 2.5) && !is_hot(Some(0.05), None, 2.5));     // unknown: bid
+        assert!(!is_hot(Some(0.05), Some(0.01), 0.0));                                // off
+        // on the closes: a calm day, then an hour swinging 3% a minute
+        let mut c = Closes::default();
+        for m in 0..1440 { c.update("X", m, 100.0 * (1.0 + 0.001 * ((m % 2) as f64)), 2000); }
+        for m in 1440..1500 { c.update("X", m, 100.0 * (1.0 + 0.03 * ((m % 2) as f64)), 2000); }
+        let (h, d) = (c.spread("X", 1499, 60, 30), c.spread("X", 1499, 1440, 600));
+        assert!(is_hot(h, d, 2.5), "{h:?} {d:?}");
+        assert!(!is_hot(c.spread("X", 1400, 60, 30), c.spread("X", 1400, 1440, 600), 2.5));
+    }
 
     #[test]
     fn levels_drift_and_the_pick() {

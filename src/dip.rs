@@ -102,6 +102,8 @@ struct Params {
     rsi_max: f64,
     /// `DIP_FUNDING_DROP_PCT` (0: off): the fall bought while the coin's funding is at or over 0.
     funding_drop: f64,
+    /// V2's trial: its first `DIP_TRIAL` (3; 0: none) live entries, then the signals only (as `DIP_DRY`).
+    trial: Option<u32>,
     pump: PumpParams,
 }
 
@@ -166,6 +168,7 @@ impl Params {
             min_vol: v("DIP_MIN_VOL_USD", 16e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
+            trial: Some(v("DIP_TRIAL", 3.0) as u32).filter(|n| *n > 0),
             pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 240.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
@@ -214,6 +217,9 @@ struct State {
     /// The pump shorts opened (the trial's count).
     #[serde(default)]
     pumps_opened: u32,
+    /// V2's live entries (its trial's count).
+    #[serde(default)]
+    v2_opened: u32,
 }
 
 /// The fall bought: `early` (0: off) while the funding is known and at or over 0, else `drop`.
@@ -326,16 +332,17 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     };
     let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let p = Params::from_env();
-    log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% ({:.1}% while the funding >= 0) in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
+    log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% ({:.1}% while the funding >= 0) in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}; the trial {:?} ({} live)",
         if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.funding_drop * 100.0, p.window, p.btc_max * 100.0,
-        p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open);
+        p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open, p.trial, state.v2_opened);
     if std::env::var("LIVE_ENABLED").unwrap_or_default().trim() == "1" {
         log!("dip: LIVE_ENABLED is on too: the copy's coins are left alone (one position a coin on the account)");
     }
     crate::notify::send(format!("🤖 покупка падений запущена{} ({}), открыто {}
 сигнал: падение {:.0}% за {} мин (или {:.1}%, если фандинг монеты не отрицательный; BTC меньше {:.0}%, оборот от ${:.0}M), держим {:.0} мин, стоп {:.0}%, риск {}, до {} позиций",
         if p.dry { " БЕЗ СДЕЛОК (только сигналы)" } else { "" }, if venue.ex.mainnet() { "mainnet" } else { "testnet" }, state.open.len(), p.drop * 100.0, p.window, p.funding_drop * 100.0,
-        p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open));
+        p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, p.stop * 100.0, risk_text(p.risk, p.risk_usd, p.stop), p.max_open)
+        + &crate::trades::trial_label(p.trial, state.v2_opened));
     let q = &p.pump;
     if q.enabled {
         log!("dip: the pump short is on{}: a rise of {:.0}% in {} min (${:.0}M+ a day, {:.0}+ days traded), {:.0} min hold, stop {:.0}%, risk {}, at most {}",
@@ -770,7 +777,7 @@ impl Dip {
             self.event(json!({"what": "too small", "coin": coin, "equity": self.equity, "size": size, "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
             return;
         }
-        if self.p.dry {
+        if self.p.dry || !crate::trades::trial_open(self.p.trial, self.state.v2_opened) {
             // The cooldown as if bought: one signal a coin a fall.
             self.state.last_entry.insert(coin.to_string(), now());
             self.event(json!({"what": "signal", "coin": coin, "fall": fall, "btc": btc, "mid": mid, "size": size, "notional": size * mid, "equity": self.equity,
@@ -802,6 +809,10 @@ impl Dip {
         self.state.open.insert(coin.to_string(), Pos { size: got, entry_px: px, opened: t, stop_px, stop_oid, fall, pump: false });
         self.state.last_entry.insert(coin.to_string(), t);
         self.state.entries += 1;
+        self.state.v2_opened += 1;
+        if !crate::trades::trial_open(self.p.trial, self.state.v2_opened) {
+            crate::notify::send(format!("🏁 покупка падений V2: проба окончена ({} сделки), дальше только сигналы (DIP_TRIAL=0 — снять пробу)", self.state.v2_opened));
+        }
         self.positions.insert(coin.to_string(), got);
         self.event(json!({"what": "open", "coin": coin, "fall": fall, "btc": btc, "size": got, "px": px, "notional": got * px,
             "equity": self.equity, "stop_px": stop_px, "stop_oid": stop_oid, "oid": oid, "signal_mid": mid,

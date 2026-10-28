@@ -749,13 +749,49 @@ async fn read_account(ex: &Exchange, account: &str, unified: bool) -> Option<Rea
 
 /// Our account's equity: its perp account value, and on a unified account the spot USDC not
 /// held as perp margin (it backs the perps too); and its positions.
+/// The HIP-3 dexes margined in USDC (their meta's collateral token 0), read once (not cached when the read fails).
+static USDC_DEXES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
+
+async fn usdc_dexes(ex: &Exchange) -> Vec<String> {
+    let read = || async {
+        let dexes = ex.info(json!({"type": "perpDexs"})).await?;
+        let mut out = Vec::new();
+        for d in dexes.as_array().into_iter().flatten() {
+            let Some(name) = d["name"].as_str() else { continue };
+            if ex.info(json!({"type": "meta", "dex": name})).await?["collateralToken"].as_u64() == Some(0) {
+                out.push(name.to_string());
+            }
+        }
+        anyhow::Ok(out)
+    };
+    match USDC_DEXES.get_or_try_init(read).await {
+        Ok(v) => v.clone(),
+        Err(e) => {
+            log!("live: the HIP-3 dexes not read: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) async fn equity_of(ex: &Exchange, account: &str, unified: bool) -> Result<(f64, HashMap<String, f64>)> {
     let st = ex.info(json!({"type": "clearinghouseState", "user": account})).await?;
-    let mut eq = num(&st["marginSummary"]["accountValue"]);
+    let main = num(&st["marginSummary"]["accountValue"]);
+    let mut eq = main;
     if unified {
         let spot = ex.info(json!({"type": "spotClearinghouseState", "user": account})).await?;
         if let Some(b) = spot["balances"].as_array().into_iter().flatten().find(|b| b["coin"] == "USDC") {
-            eq += num(&b["total"]) - num(&b["hold"]);
+            let hold = num(&b["hold"]);
+            eq += num(&b["total"]) - hold;
+            // The unified account's one USDC: the hold is every dex's account value (the main dex's and the
+            // HIP-3 dexes' margined in USDC: their positions and resting bids); the HIP-3 ones added back too.
+            if hold > main + 0.01 {
+                for d in usdc_dexes(ex).await {
+                    match ex.info(json!({"type": "clearinghouseState", "user": account, "dex": d})).await {
+                        Ok(s) => eq += num(&s["marginSummary"]["accountValue"]),
+                        Err(e) => log!("live: {d} account not read (the equity without it): {e:#}"),
+                    }
+                }
+            }
         }
     }
     let positions = st["assetPositions"].as_array().into_iter().flatten()
@@ -1244,6 +1280,18 @@ pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The equity of a real unified account on mainnet (reads only): `EQUITY_ACCOUNT` = its address.
+    /// `cargo test -- --ignored the_unified_equity --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn the_unified_equity() {
+        let ex = Exchange::new(MAINNET, &format!("0x{}", "11".repeat(32))).unwrap();
+        let a = std::env::var("EQUITY_ACCOUNT").expect("EQUITY_ACCOUNT");
+        let (eq, held) = equity_of(&ex, &a, true).await.unwrap();
+        println!("equity {eq:.2}, {} positions", held.len());
+        assert!(eq > 0.0);
+    }
 
     #[test]
     fn rank_weights_fall_with_the_place_and_keep_the_mean() {

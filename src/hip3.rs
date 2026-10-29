@@ -88,6 +88,9 @@ struct State {
     /// The live trades opened (the trial's count).
     #[serde(default)]
     opened: u32,
+    /// The weekend dips' shadow (`wkd`).
+    #[serde(default)]
+    wkd: crate::wkd::Book,
 }
 
 /// The falls of `minute` worth a signal: (coin, fall, window), biggest first. A coin's move of the
@@ -128,7 +131,7 @@ fn message(ev: &Value) -> Option<String> {
         "error" => format!("⚠️ HIP-3 {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "result" => format!("{} итог HIP-3 сигнала {coin} через {:.0} мин: {} -> {} ({:+.2}% для лонга, до комиссий)",
             if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),
-        _ => return None,
+        _ => return crate::wkd::message(ev),
     })
 }
 
@@ -167,9 +170,12 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     crate::notify::send(format!("📈 HIP-3 покупка падений запущена БЕЗ СДЕЛОК (только сигналы)
 сигнал: падение {:.0}% за 5 или 15 мин (BTC меньше {:.0}%, оборот от ${:.0}M), итог через {:.0} мин", p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0));
     }
+    let wp = crate::wkd::Params::from_env();
+    log!("hip3: the weekend dips' shadow (no orders): {}; {} signals so far", wp.label(), state.wkd.signals);
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let mut closes = Closes::default();
+        let mut lows: HashMap<String, (i64, f64)> = HashMap::new();
         let (mut dexes, mut dex_at, mut vol_at): (Vec<String>, f64, f64) = (Vec::new(), 0.0, 0.0);
         let mut volume: HashMap<String, f64> = HashMap::new();
         let mut last_minute = (now() / 60.0).floor() as i64;
@@ -232,10 +238,22 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     Ok(m) => {
                         for (c, px) in m {
                             closes.update(&c, minute, px, keep);
+                            let lo = lows.entry(c).or_insert((minute, px));
+                            if lo.0 != minute || px < lo.1 {
+                                *lo = (minute, if lo.0 == minute { lo.1.min(px) } else { px });
+                            }
                         }
                     }
                     Err(e) => log!("hip3: {d} mids not read: {e:#}"),
                 }
+            }
+            // The weekend dips' shadow: the signals and their paper results.
+            let wev = state.wkd.step(&wp, &closes, &lows, &volume, minute, t);
+            if !wev.is_empty() {
+                for ev in wev {
+                    event(&store, ev);
+                }
+                save(&cfg, &state);
             }
             if !checked && (t - started > 120.0) {
                 checked = true;

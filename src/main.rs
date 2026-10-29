@@ -27,6 +27,7 @@ mod store;
 mod trades;
 mod wick;
 mod wickwatch;
+mod wkd;
 mod ws;
 
 use std::time::Duration;

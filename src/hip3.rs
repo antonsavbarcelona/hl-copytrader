@@ -171,7 +171,17 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
 сигнал: падение {:.0}% за 5 или 15 мин (BTC меньше {:.0}%, оборот от ${:.0}M), итог через {:.0} мин", p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0));
     }
     let wp = crate::wkd::Params::from_env();
-    log!("hip3: the weekend dips' shadow (no orders): {}; {} signals so far", wp.label(), state.wkd.signals);
+    for tr in &state.wkd.live {
+        crate::trades::register(&tr.coin, "wkd", tr.risk());
+    }
+    let wkd_mode = match (&venue, &wp.live) {
+        (None, _) | (_, None) => "БЕЗ СДЕЛОК (только сигналы)".to_string(),
+        (_, Some(None)) => format!("НА ДЕНЬГИ: риск {}, до {} позиций", crate::trades::sizing_label(wp.risk_usd, wp.stop()), wp.max_open),
+        (_, Some(Some(n))) => format!("НА ДЕНЬГИ: риск {}, до {} позиций, ПРОБА: первые {n} сделки (было {}), потом только сигналы",
+            crate::trades::sizing_label(wp.risk_usd, wp.stop()), wp.max_open, state.wkd.opened),
+    };
+    log!("hip3: the weekend dips: {}; {wkd_mode}; {} signals so far, {} live held", wp.label(), state.wkd.signals, state.wkd.live.len());
+    crate::notify::send(format!("🧪 HIP-3 {}, {wkd_mode}", wp.label()));
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let mut closes = Closes::default();
@@ -183,6 +193,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let started = now();
         let mut lev_set: std::collections::HashSet<String> = Default::default();
         let mut pos_at = 0.0;
+        let mut wkd_pos_at = 0.0;
         let event = |store: &Store, mut ev: Value| {
             ev["kind"] = json!("hip3");
             ev["at"] = json!(now());
@@ -248,11 +259,94 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 }
             }
             // The weekend dips' shadow: the signals and their paper results.
-            let wev = state.wkd.step(&wp, &closes, &lows, &volume, minute, t);
-            if !wev.is_empty() {
-                for ev in wev {
-                    event(&store, ev);
+            let (wev, wentries) = state.wkd.step(&wp, &closes, &lows, &volume, minute, t);
+            let mut wchanged = !wev.is_empty();
+            for ev in wev {
+                event(&store, ev);
+            }
+            // Traded (WKD_LIVE): bought at the paper entry, within the trial, the slots and the family's cap.
+            if let Some((v, max_lev)) = &venue {
+                for (coin, px) in wentries {
+                    let Some(trial) = wp.live else { continue };
+                    if !crate::trades::trial_open(trial, state.wkd.opened) {
+                        log!("hip3: weekend {coin} not traded (the trial's {} trades done)", state.wkd.opened);
+                        continue;
+                    }
+                    let risk = crate::trades::risk_usd(wp.risk_usd);
+                    if !v.coins.contains_key(&coin) || state.wkd.live.len() >= wp.max_open || !crate::trades::can_open(&coin, risk) {
+                        log!("hip3: weekend {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
+                        continue;
+                    }
+                    let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
+                    let size = crate::trades::size_for(risk, wp.stop(), mid);
+                    let r = async {
+                        crate::trades::h3_leverage(v, &coin, max_lev.get(&coin).copied().unwrap_or(1), &mut lev_set).await?;
+                        crate::trades::open_market(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s()).await
+                    }.await;
+                    match r {
+                        Ok(tr) => {
+                            event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "size": tr.size, "notional": tr.size * tr.entry_px,
+                                "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": wp.hold_s() / 3600.0}));
+                            crate::trades::register(&coin, "wkd", tr.risk());
+                            state.wkd.live.push(tr);
+                            state.wkd.opened += 1;
+                            if !crate::trades::trial_open(trial, state.wkd.opened) {
+                                crate::notify::send(format!("🏁 HIP-3 выходные: проба окончена ({} сделки), дальше только сигналы", state.wkd.opened));
+                            }
+                        }
+                        Err(e) => event(&store, json!({"what": "wkd_error", "coin": coin, "error": format!("{e:#}")})),
+                    }
+                    wchanged = true;
                 }
+                // Out on time; a position gone (its stop or take filled) ends its trade.
+                if !state.wkd.live.is_empty() {
+                    let check = t - wkd_pos_at >= 30.0;
+                    let mut held: HashMap<String, f64> = HashMap::new();
+                    let mut read: std::collections::HashSet<String> = Default::default();
+                    if check {
+                        wkd_pos_at = t;
+                        let ds: std::collections::HashSet<String> = state.wkd.live.iter().filter_map(|x| x.coin.split_once(':').map(|d| d.0.to_string())).collect();
+                        for d in ds {
+                            match v.dex_positions(&d).await {
+                                Ok(x) => {
+                                    held.extend(x);
+                                    read.insert(d);
+                                }
+                                Err(e) => log!("hip3: weekend {d} positions not read: {e:#}"),
+                            }
+                        }
+                    }
+                    let mut keep = Vec::new();
+                    for tr in std::mem::take(&mut state.wkd.live) {
+                        let dex_ok = tr.coin.split_once(':').is_some_and(|d| read.contains(d.0));
+                        let out = if t >= tr.exit_at {
+                            match crate::trades::close(v, &tr).await {
+                                Ok(px) => Some(("time", px)),
+                                Err(e) => {
+                                    event(&store, json!({"what": "wkd_error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
+                                    None
+                                }
+                            }
+                        } else if check && dex_ok {
+                            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0)).await
+                        } else {
+                            None
+                        };
+                        match out {
+                            Some((why, px)) => {
+                                let ret = tr.ret(px);
+                                event(&store, json!({"what": "wkd_exit", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                                    "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_h": (t - tr.at) / 3600.0}));
+                                crate::trades::unregister(&tr.coin);
+                                wchanged = true;
+                            }
+                            None => keep.push(tr),
+                        }
+                    }
+                    state.wkd.live = keep;
+                }
+            }
+            if wchanged {
                 save(&cfg, &state);
             }
             if !checked && (t - started > 120.0) {

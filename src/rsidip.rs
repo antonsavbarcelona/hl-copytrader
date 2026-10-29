@@ -10,9 +10,10 @@
 //! the average +`RSIDIP_TAKE_PCT` (2) (a resting reduce-only limit: maker), at the average
 //! -`RSIDIP_STOP_PCT` (20) (a resting stop) or `RSIDIP_HOLD_H` (24) h after the first buy (market). After
 //! each add the stop and the take are placed again for the whole size at the new average (the new stop
-//! first; it not placed: the position closed). A buy risks a third of the family's risk
-//! (`trades::risk_usd`: 3.3% of the equity, so 1.1% a buy at its 20% stop, 5.5% of the equity in coin;
-//! `RSIDIP_RISK_USD` ($6.67: a position of 3 buys $20 as the others' trades) a buy when the family's is off) and a position reserves all its buys' risk in
+//! first; it not placed: the position closed). A position risks `RSIDIP_RISK_PCT` (5; 2026-10-29, the user's call
+//! after the first live trade; 0: the family's) of the equity, a third a buy (1.67% at its 20% stop, 8.3% of the
+//! equity in coin); else a third of the family's risk (`trades::risk_usd`), `RSIDIP_RISK_USD` ($6.67: a position of 3
+//! buys $20 as the others' trades) a buy while the equity is unknown or both are off; a position reserves all its buys' risk in
 //! the family's cap from the first; one a coin (the family's too), at most `RSIDIP_MAX_OPEN` (5; 3 until 2026-10-28: the
 //! portfolio on one deposit, V75, skipped 656 of its signals for the slots; 5 takes 144 more, the cap binds past it) live
 //! and as many on paper. Paper (the trial over, the cap full, no account): simulated on the mids, costs
@@ -82,6 +83,8 @@ struct Params {
     add_step: f64,
     max_open: usize,
     risk_usd: f64,
+    /// A position's risk, % of the equity (0: the family's / `risk_usd`).
+    risk_pct: f64,
     /// The wider signal: its RSI ceiling, its depth under the 5m EMA200, and how far under the 1h EMA200 it needs (0: off).
     wide_rsi_max: f64,
     wide_under: f64,
@@ -97,6 +100,7 @@ impl Params {
             min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 2.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
             hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 3.0) / 100.0,
             max_open: v("RSIDIP_MAX_OPEN", 5.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 20.0 / 3.0),
+            risk_pct: v("RSIDIP_RISK_PCT", 5.0),
             wide_rsi_max: v("RSIDIP_WIDE_RSI_MAX", 45.5), wide_under: v("RSIDIP_WIDE_UNDER_PCT", 5.6) / 100.0, h1_under: v("RSIDIP_H1_UNDER_PCT", 10.65) / 100.0,
             trial: trades::switch("RSIDIP_ENABLED").flatten() }
     }
@@ -106,9 +110,20 @@ impl Params {
         (self.adds + 1) as f64
     }
 
-    /// The $ a buy's stop loses: its share of the family's risk (`RSIDIP_RISK_USD` without it).
+    /// The $ a buy's stop loses: a third of `RSIDIP_RISK_PCT` of the equity, else its share of the family's risk
+    /// (`RSIDIP_RISK_USD` without either or the equity).
     fn buy_risk(&self) -> f64 {
-        trades::risk_usd(self.risk_usd * self.buys()) / self.buys()
+        let eq = trades::equity();
+        if self.risk_pct > 0.0 && eq > 0.0 { self.risk_pct / 100.0 * eq / self.buys() } else { trades::risk_usd(self.risk_usd * self.buys()) / self.buys() }
+    }
+
+    /// The sizing for the log and the chat.
+    fn sizing(&self) -> String {
+        if self.risk_pct > 0.0 {
+            format!("{:.1}% депозита (позиция {:.0}% депозита)", self.risk_pct, self.risk_pct / self.stop)
+        } else {
+            trades::sizing_label(self.risk_usd * self.buys(), self.stop)
+        }
     }
 
     /// The $ of a buy: the risk over the stop.
@@ -332,12 +347,12 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     };
     log!("rsidip: {mode}; RSI14 5m hook from < {:.0}, {:.0}%+ under the EMA200 (or from < {:.1}, {:.1}%+ under, {:.2}%+ under the 1h EMA200), BTC 15 min < {:.1}%, ${:.0}M+; take {:.0}% stop {:.0}% {:.0} h, {} adds {:.0}% apart, risk {} a position, at most {}; {} open, {} closed",
         p.rsi_max, p.under * 100.0, p.wide_rsi_max, p.wide_under * 100.0, p.h1_under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
-        p.hold_s / 3600.0, p.adds, p.add_step * 100.0, trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed);
+        p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.sizing(), p.max_open, state.open.len(), state.closed);
     crate::notify::send(format!("{} RSI-дип запущен{}: 5-минутки, RSI14 разворот из-под {:.0}, цена на {:.0}%+ ниже EMA200 (или разворот из-под {:.1} и {:.1}%+ ниже, если монета на {:.2}%+ ниже часовой EMA200), BTC спокоен (за 15 мин меньше {:.1}%), оборот от ${:.0}M; тейк +{:.0}% / стоп −{:.0}% от средней, до {:.0} ч, {} добора через {:.0}%, риск на позицию (все {:.0} покупки) {}, до {} позиций. Открыто {}, закрыто {} (итог {}){}",
         if venue.is_some() { "💵" } else { "📝" }, if venue.is_some() { " НА ДЕНЬГИ" } else { " НА БУМАГЕ (без сделок)" },
         p.rsi_max, p.under * 100.0, p.wide_rsi_max, p.wide_under * 100.0, p.h1_under * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.take * 100.0, p.stop * 100.0,
         p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
-        trades::sizing_label(p.risk_usd * p.buys(), p.stop), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
+        p.sizing(), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
     let cfg = cfg.clone();
     tokio::spawn(async move {
@@ -667,7 +682,7 @@ mod tests {
     /// buys, the average 0.142567, the stop 0.114054), the reserve, a buy a third of the family's risk.
     #[test]
     fn the_average_the_stop_and_the_risk() {
-        let p = Params { stop: 0.20, take: 0.02, adds: 2, risk_usd: 10.0, ..Params::from_env() };
+        let p = Params { stop: 0.20, take: 0.02, adds: 2, risk_usd: 10.0, risk_pct: 5.0, ..Params::from_env() };
         let mut pos = Pos::default();
         for px in [0.15314, 0.14226, 0.13363] {
             pos.buy(px, 100.0);
@@ -678,11 +693,14 @@ mod tests {
         // out at the take: the average +2% on all the coins, less the maker fee and the buys' fees
         let px = pos.avg() * 1.02;
         assert!((pos.pnl(px, "take") - (300.0 * 0.02 - MAKER * 306.0 - 3.0 * TAKER * 100.0)).abs() < 1e-9);
-        // a buy: a third of the family's risk (off: RSIDIP_RISK_USD a buy)
+        // a buy: a third of RSIDIP_RISK_PCT of the equity: 5% of $1000 / 3; off: a third of the family's (off: RSIDIP_RISK_USD)
         trades::set_equity(1000.0);
-        let fam = trades::family_risk_pct();
-        let want = if fam > 0.0 { fam / 100.0 * 1000.0 / 3.0 } else { 10.0 };
+        let want = 50.0 / 3.0;
         assert!((p.buy_risk() - want).abs() < 1e-9, "{} {want}", p.buy_risk());
         assert!((p.buy_usd() - want / 0.20).abs() < 1e-9);
+        let q = Params { risk_pct: 0.0, ..p.clone() };
+        let fam = trades::family_risk_pct();
+        let want = if fam > 0.0 { fam / 100.0 * 1000.0 / 3.0 } else { 10.0 };
+        assert!((q.buy_risk() - want).abs() < 1e-9, "{} {want}", q.buy_risk());
     }
 }

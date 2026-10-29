@@ -1,5 +1,5 @@
-//! The RSI dip (`RSIDIP_ENABLED`: unset the trial, its first `TRIAL_TRADES` (3) positions live, then
-//! paper; "1" live; "0" off; without `LIVE_KEY` / `LIVE_ACCOUNT` paper only). On each 5-minute close: a
+//! The RSI dip (`RSIDIP_ENABLED`: unset or "1" live, no trial since 2026-10-29 (the user's call after the trial's
+//! first trade); "0" off; without `LIVE_KEY` / `LIVE_ACCOUNT` paper only). On each 5-minute close: a
 //! main-dex perp with `RSIDIP_MIN_VOL_USD` (10M)+ a day whose RSI14 (Wilder, the 5m closes) was under
 //! `RSIDIP_RSI_MAX` (35) the bar before and is up now, the close `RSIDIP_UNDER_PCT` (8) or more under the
 //! EMA200 of the 5m closes, BTC's last 15 minutes under `RSIDIP_BTC_MAX_PCT` (0.5); or the wider signal: the
@@ -89,7 +89,7 @@ struct Params {
     wide_rsi_max: f64,
     wide_under: f64,
     h1_under: f64,
-    /// The trial (`RSIDIP_ENABLED` unset): its live positions at most.
+    /// The trial: its live positions at most (None: no trial, always now).
     trial: Option<u32>,
 }
 
@@ -102,7 +102,7 @@ impl Params {
             max_open: v("RSIDIP_MAX_OPEN", 5.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 20.0 / 3.0),
             risk_pct: v("RSIDIP_RISK_PCT", 5.0),
             wide_rsi_max: v("RSIDIP_WIDE_RSI_MAX", 45.5), wide_under: v("RSIDIP_WIDE_UNDER_PCT", 5.6) / 100.0, h1_under: v("RSIDIP_H1_UNDER_PCT", 10.65) / 100.0,
-            trial: trades::switch("RSIDIP_ENABLED").flatten() }
+            trial: None }
     }
 
     /// The buys a position can have.

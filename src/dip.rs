@@ -6,7 +6,7 @@
 //! the market's), is bought at market as its minute closes; out at market `DIP_HOLD_MIN` (120; 60 until 2026-10-27, V16: 120 the better)
 //! later, with a resting stop `DIP_STOP_PCT` (20) under our fill; sized so that the stop loses
 //! `DIP_RISK_USD` ($20; 0: `DIP_RISK_PCT` (5) of the account's equity instead: 25% a trade); at most
-//! `DIP_MAX_OPEN` (3) open, one a coin, a coin not again for `DIP_COOLDOWN_MIN` (240) after its
+//! `DIP_MAX_OPEN` (5; 3 until 2026-10-29: V94, the portfolio skipped 43 of its signals for the slots, +0.17R each) open, one a coin, a coin not again for `DIP_COOLDOWN_MIN` (240) after its
 //! move of the drop or more either way (a rise, a fall on any volume: as in the research, see
 //! `cooled`; from 2026-10-25, before it only after our entries) or our entry; a coin the account
 //! holds otherwise (the copy's legs) is left alone. `DIP_DRY=1`: the signals only (events
@@ -166,7 +166,7 @@ impl Params {
         let on = |k: &str| std::env::var(k).unwrap_or_default().trim() == "1";
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
             min_vol: v("DIP_MIN_VOL_USD", 16e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
-            risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 3.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
+            risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 5.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
             trial: Some(v("DIP_TRIAL", 3.0) as u32).filter(|n| *n > 0),
             pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),

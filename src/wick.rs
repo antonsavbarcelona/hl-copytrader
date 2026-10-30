@@ -545,10 +545,27 @@ impl Wick {
                     self.filled(&c, f, b.px).await;
                 }
                 Some(_) => {}
+                // Not in the open orders: the order's own status decides; the open-orders read lags
+                // a fresh order at busy times, and a bid dropped while it still rests fills later
+                // with no stop (AAVE 29.10: five such bids filled). Still open, or no status: kept.
                 None => {
-                    let f = self.venue.filled(b.oid).await.map(|x| x.0).unwrap_or(0.0);
+                    let (f, open) = match self.venue.filled(b.oid).await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            log!("wick: {c} bid {} status not read: {e:#}", b.oid);
+                            continue;
+                        }
+                    };
                     if f > 0.0 {
+                        let f = if open {
+                            self.venue.cancel(&c, b.oid).await;
+                            self.venue.filled(b.oid).await.map(|x| x.0).unwrap_or(f)
+                        } else {
+                            f
+                        };
                         self.filled(&c, f, b.px).await;
+                    } else if open {
+                        continue;
                     } else {
                         self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": "gone from the book, not filled", "t_done": now()}));
                         crate::wickwatch::set_bid(&c, None);

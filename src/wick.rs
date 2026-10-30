@@ -502,8 +502,14 @@ impl Wick {
         let mut resting: HashMap<u64, (f64, f64)> = HashMap::new();
         let mut read: HashSet<String> = HashSet::new();
         let mut held = HashMap::new();
+        // Bids resting on the exchange that no state knows of (dropped by the old open-orders
+        // check, 29.10): only this module rests orders that are not reduce-only, so a buy not
+        // reduce-only, not ours and older than a minute is cancelled.
+        let mut strays: Vec<(String, u64)> = Vec::new();
+        let ours: HashSet<u64> = self.state.bids.values().map(|b| b.oid).collect();
+        let t0 = now();
         for d in &dexes {
-            let q = if d.is_empty() { json!({"type": "openOrders", "user": self.venue.account}) } else { json!({"type": "openOrders", "user": self.venue.account, "dex": d}) };
+            let q = if d.is_empty() { json!({"type": "frontendOpenOrders", "user": self.venue.account}) } else { json!({"type": "frontendOpenOrders", "user": self.venue.account, "dex": d}) };
             let orders = match self.venue.ex.info(q).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -514,6 +520,11 @@ impl Wick {
             for o in orders.as_array().into_iter().flatten() {
                 if let Some(oid) = o["oid"].as_u64() {
                     resting.insert(oid, (num(&o["origSz"]), num(&o["sz"])));
+                    let stray = o["side"] == "B" && o["reduceOnly"] == json!(false) && o["isTrigger"] != json!(true) && !ours.contains(&oid)
+                        && o["timestamp"].as_f64().is_some_and(|ms| t0 - ms / 1000.0 > 60.0);
+                    if let (true, Some(c)) = (stray, o["coin"].as_str()) {
+                        strays.push((c.to_string(), oid));
+                    }
                 }
             }
             let pos = if d.is_empty() {
@@ -533,6 +544,14 @@ impl Wick {
             }
         }
         self.held = held;
+        for (c, oid) in strays {
+            if self.venue.coins.contains_key(&c) {
+                self.venue.cancel(&c, oid).await;
+                self.trace(json!({"what": "cancel", "coin": c, "oid": oid, "why": "a stray bid, no state knows of it", "t_done": now()}));
+            } else {
+                log!("wick: a stray bid {c} {oid}, the coin unknown here, not cancelled");
+            }
+        }
         // The bids: gone from the book (filled, or cancelled by the exchange) or partly filled.
         for (c, b) in self.state.bids.clone() {
             if !read.contains(dex_of(&c)) {

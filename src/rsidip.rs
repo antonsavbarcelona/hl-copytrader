@@ -6,12 +6,14 @@
 //! RSI under `RSIDIP_WIDE_RSI_MAX` (45.5) and up, `RSIDIP_WIDE_UNDER_PCT` (5.6)+ under the 5m EMA200, while
 //! the price is `RSIDIP_H1_UNDER_PCT` (10.65; 0: off)+ under the EMA200 of the hourly closes (the coin in a
 //! deep fall on the hours: there the weaker 5m hook pays as well): bought at market; up
-//! to `RSIDIP_ADDS` (2) adds at market, each at a 5m close `RSIDIP_ADD_PCT` (3) under the last buy; out at
-//! the average +`RSIDIP_TAKE_PCT` (2) (a resting reduce-only limit: maker), at the average
+//! to `RSIDIP_ADDS` (2) adds at market, each at a 5m close `RSIDIP_ADD_PCT` (6; 3 until 2026-10-31) under the last buy; out at
+//! the average +`RSIDIP_TAKE_PCT` (10; 2 until 2026-10-31: the exit C1, V116 / V117 / V119, Binance 1m 2020-26: +168 bp a
+//! position against +16, every year up, the battery 23 of 24 against 12; the user's call: the 6 years over HL's 16 months,
+//! where the two were equal a trade and C1 a little behind in the portfolio; win ~63% against ~95%) (a resting reduce-only limit: maker), at the average
 //! -`RSIDIP_STOP_PCT` (20) (a resting stop) or `RSIDIP_HOLD_H` (24) h after the first buy (market). After
 //! each add the stop and the take are placed again for the whole size at the new average (the new stop
-//! first; it not placed: the position closed). A position risks `RSIDIP_RISK_PCT` (5; 2026-10-29, the user's call
-//! after the first live trade; 0: the family's) of the equity, a third a buy (1.67% at its 20% stop, 8.3% of the
+//! first; it not placed: the position closed). A position risks `RSIDIP_RISK_PCT` (0 from 2026-10-31: the family's, 2%, the user's call; 5 from
+//! 2026-10-29) of the equity when set, a third a buy (1.67% at its 20% stop, 8.3% of the
 //! equity in coin); else a third of the family's risk (`trades::risk_usd`), `RSIDIP_RISK_USD` ($6.67: a position of 3
 //! buys $20 as the others' trades) a buy while the equity is unknown or both are off; a position reserves all its buys' risk in
 //! the family's cap from the first; one a coin (the family's too), at most `RSIDIP_MAX_OPEN` (5; 8 tried 2026-10-29 and kept at 5: at 5% a position 8 would hold up to 42% of the equity in the RSI dip alone, the whole family cap, for +6%; 3 until 2026-10-28: the
@@ -97,10 +99,10 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { rsi_max: v("RSIDIP_RSI_MAX", 35.0), under: v("RSIDIP_UNDER_PCT", 8.0) / 100.0, btc_max: v("RSIDIP_BTC_MAX_PCT", 0.5) / 100.0,
-            min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 2.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
-            hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 3.0) / 100.0,
+            min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 10.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
+            hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 6.0) / 100.0,
             max_open: v("RSIDIP_MAX_OPEN", 5.0) as usize, risk_usd: v("RSIDIP_RISK_USD", 20.0 / 3.0),
-            risk_pct: v("RSIDIP_RISK_PCT", 5.0),
+            risk_pct: v("RSIDIP_RISK_PCT", 0.0),
             wide_rsi_max: v("RSIDIP_WIDE_RSI_MAX", 45.5), wide_under: v("RSIDIP_WIDE_UNDER_PCT", 5.6) / 100.0, h1_under: v("RSIDIP_H1_UNDER_PCT", 10.65) / 100.0,
             trial: None }
     }

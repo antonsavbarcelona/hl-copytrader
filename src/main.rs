@@ -25,6 +25,7 @@ mod stable;
 mod stats;
 mod store;
 mod trades;
+mod trend;
 mod wick;
 mod wickwatch;
 mod wkd;
@@ -76,7 +77,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         hip3::start(&cfg, store.clone(), api.clone()).await?;
         wick::start(&cfg, store.clone(), api.clone()).await?;
         rsidip::start(&cfg, store.clone(), api.clone()).await?;
-        listing::start(&cfg, store).await?;
+        listing::start(&cfg, store.clone()).await?;
+        trend::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
         log!("stopped");
@@ -94,6 +96,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     wick::start(&cfg, store.clone(), api.clone()).await?;
     rsidip::start(&cfg, store.clone(), api.clone()).await?;
     listing::start(&cfg, store.clone()).await?;
+    trend::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

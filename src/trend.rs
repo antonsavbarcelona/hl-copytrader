@@ -42,6 +42,9 @@ struct Params {
     btc_ma: usize,
     min_vol: f64,
     risk_usd: f64,
+    /// `TREND_RISK_SHARE` (1): the share of the family's risk a trade (V138: at 2% each the whole HL portfolio's
+    /// drawdown 10% -> 17%, the trend flat in the 2025-26 chop; 0.5 halves it).
+    share: f64,
     max_open: usize,
     /// The trial (`TREND_ENABLED` unset): its live trades at most.
     trial: Option<u32>,
@@ -51,7 +54,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { days: v("TREND_DAYS", 20.0) as usize, atr_k: v("TREND_ATR_K", 3.0), max_days: v("TREND_MAX_DAYS", 90.0),
-            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0),
+            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
             max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch("TREND_ENABLED").flatten() }
     }
 }
@@ -246,7 +249,7 @@ impl TrendLong {
                 if !(dist > 0.0 && dist < 0.5) {
                     continue;
                 }
-                let risk = trades::risk_usd(self.p.risk_usd);
+                let risk = trades::risk_usd(self.p.risk_usd) * self.p.share;
                 if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, "trend", 1.0, risk) {
                     log!("trend: {coin} breaks out but at most open, held or the family's cap");
                     continue;

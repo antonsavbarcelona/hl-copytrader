@@ -46,6 +46,9 @@ struct Params {
     btc_ma: usize,
     min_vol: f64,
     risk_usd: f64,
+    /// `SQZ_RISK_SHARE` (1): the share of the family's risk a trade (V138: at 2% each the whole HL portfolio's
+    /// drawdown 10% -> 19%; 0.5 halves it).
+    share: f64,
     max_open: usize,
     /// The trial (`SQZ_ENABLED` unset): its live trades at most.
     trial: Option<u32>,
@@ -55,7 +58,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
-            min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
+            min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
             trial: trades::switch("SQZ_ENABLED").flatten() }
     }
 }
@@ -257,7 +260,7 @@ impl Squeeze {
                 if !(dist > 0.0 && dist < 0.4) {
                     continue;
                 }
-                let risk = trades::risk_usd(self.p.risk_usd);
+                let risk = trades::risk_usd(self.p.risk_usd) * self.p.share;
                 if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, "squeeze", 1.0, risk) {
                     log!("squeeze: {coin} breaks out but at most open, held or the family's cap");
                     continue;

@@ -14,7 +14,16 @@
 //! trend long at the same drawdown 18%: x33 -> x55 (3 slots; 5 slots worse). HL 2025-10 .. 2026-10: +0.27 R a trade.
 //! Win 40%: the profit is in the few runs.
 //!
-//! Its state is the store's doc `squeeze`.
+//! The SHORT side (`SQZS_ENABLED`: unset off; "1" live; set empty the trial of 3; else off): the mirror, a 4h close under the lower
+//! band after a squeeze (the lowest `SQZS_QUANTILE` (0.1) width), any BTC; out on a 4h close `SQZS_ATR_K` (2) ATR over the
+//! entry or `SQZS_HOLD_DAYS` (5) on; `SQZS_RISK_SHARE` (0.5) of the family's risk; at most `SQZS_MAX_OPEN` (3). V144 / V145
+//! (Binance 2020-26): +0.32 R a trade vs -0.04 on random bars, 6 of 7 years (2022 +128 R), +0.36 R on the untouched
+//! 2023-26; a candle late +0.27, costs x2 +0.29, w/o the 10 best coins +0.24; the daily P&L corr with the live +0.03, the
+//! trend -0.04, the long squeeze -0.01; in the portfolio at half the risk up in all four spans (Binance 2020-23 / 2023-26,
+//! HL halves: +12 / +328 / +12 / +4% at the same drawdown) and the Binance drawdown at 2% 48% -> 37%: a hedge of the longs.
+//! On HL alone flat so far (731 trades 2025-26, -0.02 R).
+//!
+//! The states: the store's docs `squeeze` and `squeeze_short`.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -27,7 +36,6 @@ use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
 
-const DOC: &str = "squeeze";
 const BAR: f64 = 4.0 * 3600.0;
 const DAY: f64 = 86_400.0;
 /// The step this long after a 4h candle's close (the candle final).
@@ -52,6 +60,12 @@ struct Params {
     max_open: usize,
     /// The trial (`SQZ_ENABLED` unset): its live trades at most.
     trial: Option<u32>,
+    /// +1 the breakout long, -1 the breakdown short.
+    side: f64,
+    /// The registry's and the events' kind, the state's doc.
+    kind: &'static str,
+    /// Only while BTC is over its mean (the long).
+    btc_filter: bool,
 }
 
 impl Params {
@@ -59,7 +73,14 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZ_ENABLED").flatten() }
+            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
+    }
+
+    fn short_from_env() -> Self {
+        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
+            min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 0.5), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
+            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
     }
 }
 
@@ -120,8 +141,9 @@ fn atr(b: &[Bar]) -> Option<f64> {
 }
 
 /// Whether the last candle breaks out of a squeeze: the candle before's width within its lowest `q` of the widths
-/// of the `N_HIST` candles to it (at least `N_HIST_MIN` known), the last close over the band's mean + 2 std.
-fn breakout(b: &[Bar], q: f64) -> bool {
+/// of the `N_HIST` candles to it (at least `N_HIST_MIN` known), the last close over the band's mean + 2 std (`side` +1)
+/// or under its mean - 2 std (-1).
+fn breakout(b: &[Bar], q: f64, side: f64) -> bool {
     let c: Vec<f64> = b.iter().map(|x| x.3).collect();
     let k = c.len();
     if k < N_BAND + N_HIST_MIN + 1 {
@@ -135,7 +157,7 @@ fn breakout(b: &[Bar], q: f64) -> bool {
         return false;
     }
     let band = &c[k - N_BAND..];
-    c[k - 1] > mean(band) + 2.0 * std(band)
+    if side > 0.0 { c[k - 1] > mean(band) + 2.0 * std(band) } else { c[k - 1] < mean(band) - 2.0 * std(band) }
 }
 
 /// Whether BTC's last close is over the mean of its last `n` closes.
@@ -150,14 +172,16 @@ fn usd(x: f64) -> String {
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
+    let short = ev["kind"] == "squeeze_short";
+    let nm = if short { "шорт пробоя вниз из сжатия" } else { "пробой из сжатия" };
     Some(match ev["what"].as_str()? {
-        "open" => format!("🗜 ПРОБОЙ ИЗ СЖАТИЯ {coin}: 4ч закрытие над полосой, цена {}, на ${:.0}, выход: закрытие 4ч ниже {} или через {:.0} дн., аварийный стоп {}",
-            f("px"), f("notional"), f("close_stop"), f("hold_days"), f("stop_px")),
-        "close" => format!("{} пробой из сжатия {} {coin}: {} -> {} ({:+.2}%, {}, {:.1} дн.)", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
+        "open" => format!("🗜 {} {coin}: 4ч закрытие {} полосы, цена {}, на ${:.0}, выход: закрытие 4ч {} {} или через {:.0} дн., аварийный стоп {}",
+            nm.to_uppercase(), if short { "под" } else { "над" }, f("px"), f("notional"), if short { "выше" } else { "ниже" }, f("close_stop"), f("hold_days"), f("stop_px")),
+        "close" => format!("{} {nm} {} {coin}: {} -> {} ({:+.2}%, {}, {:.1} дн.)", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
             match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "close_stop" => "СТОП по закрытию 4ч", _ => "ЗАКРЫЛ по времени" },
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
-        "error" => format!("⚠️ пробой из сжатия {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
-        "signal" => format!("🗜 сигнал пробоя из сжатия {coin} по {} (проба окончена, без сделки)", f("px")),
+        "error" => format!("⚠️ {nm} {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" => format!("🗜 сигнал: {nm} {coin} по {} (проба окончена, без сделки)", f("px")),
         _ => return None,
     })
 }
@@ -173,9 +197,9 @@ struct Squeeze {
 
 impl Squeeze {
     fn event(&self, mut ev: Value) {
-        ev["kind"] = json!("squeeze");
+        ev["kind"] = json!(self.p.kind);
         ev["at"] = json!(now());
-        log!("squeeze: {ev}");
+        log!("{}: {ev}", self.p.kind);
         if let Some(m) = message(&ev) {
             crate::notify::send(m);
         }
@@ -183,9 +207,9 @@ impl Squeeze {
     }
 
     fn save(&self) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
+        let (cfg, v, doc) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default(), self.p.kind);
         tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
+            if let Err(e) = crate::store::save_doc(&cfg, doc, &v).await {
                 log!("squeeze: state not saved: {e:#}");
             }
         });
@@ -213,7 +237,7 @@ impl Squeeze {
                 let ret = pos.tr.ret(px);
                 self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                     "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                trades::unregister(&pos.tr.coin, "squeeze");
+                trades::unregister(&pos.tr.coin, self.p.kind);
                 true
             }
             Err(e) => {
@@ -227,7 +251,7 @@ impl Squeeze {
     async fn step(&mut self, bar: f64) {
         for pos in std::mem::take(&mut self.state.open) {
             let last = self.bars(&pos.tr.coin, 3).await.and_then(|b| b.last().copied());
-            let why = if now() >= pos.tr.exit_at { Some("time") } else if last.is_some_and(|x| x.3 <= pos.close_stop) { Some("close_stop") } else { None };
+            let why = if now() >= pos.tr.exit_at { Some("time") } else if last.is_some_and(|x| (x.3 - pos.close_stop) * self.p.side <= 0.0) { Some("close_stop") } else { None };
             if let Some(why) = why {
                 if self.exit(&pos, why).await {
                     continue;
@@ -236,7 +260,7 @@ impl Squeeze {
             self.state.open.push(pos);
         }
         let btc = self.bars("BTC", self.p.btc_ma + 5).await.unwrap_or_default();
-        if !btc_up(&btc, self.p.btc_ma) {
+        if self.p.btc_filter && !btc_up(&btc, self.p.btc_ma) {
             log!("squeeze: BTC under its 50-day mean (or not read): no entries");
         } else if let Ok(ctx) = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
             let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
@@ -251,7 +275,7 @@ impl Squeeze {
                 }
                 let Some(b) = self.bars(&coin, N_BAND + N_HIST + 5).await else { continue };
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if b.last().is_none_or(|x| (x.0 - bar).abs() > 1.0) || !breakout(&b, self.p.q) {
+                if b.last().is_none_or(|x| (x.0 - bar).abs() > 1.0) || !breakout(&b, self.p.q, self.p.side) {
                     continue;
                 }
                 let Some(a) = atr(&b) else { continue };
@@ -261,7 +285,7 @@ impl Squeeze {
                     continue;
                 }
                 let risk = trades::risk_usd(self.p.risk_usd) * self.p.share;
-                if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, "squeeze", 1.0, risk) {
+                if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, self.p.kind, self.p.side, risk) {
                     log!("squeeze: {coin} breaks out but at most open, held or the family's cap");
                     continue;
                 }
@@ -269,14 +293,14 @@ impl Squeeze {
                     self.event(json!({"what": "signal", "coin": coin, "px": px}));
                     continue;
                 }
-                let size = trades::size_for(risk, dist, px);
+                let size = trades::size_for(risk, dist, px) * self.p.side;
                 match trades::open_market(&self.venue, &coin, size, (2.0 * dist).min(0.8), None, self.p.hold_s).await {
                     Ok(tr) => {
-                        let close_stop = tr.entry_px - self.p.atr_k * a;
-                        self.event(json!({"what": "open", "coin": coin, "px": tr.entry_px, "size": tr.size, "notional": tr.size * tr.entry_px, "atr": a,
+                        let close_stop = tr.entry_px - self.p.side * self.p.atr_k * a;
+                        self.event(json!({"what": "open", "coin": coin, "px": tr.entry_px, "size": tr.size, "notional": (tr.size * tr.entry_px).abs(), "atr": a,
                             "close_stop": close_stop, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "close": px}));
                         let r = (tr.size * (tr.entry_px - close_stop)).abs();
-                        trades::register(&coin, "squeeze", r, tr.size);
+                        trades::register(&coin, self.p.kind, r, tr.size);
                         self.state.open.push(Pos { tr, close_stop, risk: r });
                         self.state.opened += 1;
                     }
@@ -308,12 +332,12 @@ impl Squeeze {
         let mut keep = Vec::new();
         let mut changed = false;
         for pos in std::mem::take(&mut self.state.open) {
-            match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), "squeeze").await {
+            match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), self.p.kind).await {
                 Some((why, px)) => {
                     let ret = pos.tr.ret(px);
                     self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                         "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                    trades::unregister(&pos.tr.coin, "squeeze");
+                    trades::unregister(&pos.tr.coin, self.p.kind);
                     changed = true;
                 }
                 None => keep.push(pos),
@@ -326,26 +350,40 @@ impl Squeeze {
     }
 }
 
-/// Starts the squeeze breakout if `SQZ_ENABLED` is "1" (unset: the trial; see the module).
+/// Starts the squeeze breakout long if `SQZ_ENABLED` is "1" (unset: the trial), and the breakdown short if `SQZS_ENABLED`
+/// is set (unset: off; see the module).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     if trades::switch("SQZ_ENABLED").is_none() {
         log!("squeeze: off (SQZ_ENABLED=0)");
-        return Ok(());
+    } else {
+        launch(cfg, store.clone(), Params::from_env()).await?;
     }
+    if std::env::var("SQZS_ENABLED").is_err() || trades::switch("SQZS_ENABLED").is_none() {
+        log!("squeeze_short: off (SQZS_ENABLED unset or 0)");
+    } else {
+        launch(cfg, store, Params::short_from_env()).await?;
+    }
+    Ok(())
+}
+
+async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
     let Some((venue, unified)) = crate::live::venue_from_env(None).await? else {
-        log!("squeeze: LIVE_KEY / LIVE_ACCOUNT not set, off");
+        log!("{}: LIVE_KEY / LIVE_ACCOUNT not set, off", p.kind);
         return Ok(());
     };
-    let p = Params::from_env();
-    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let state: State = crate::store::load_doc(cfg, p.kind).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     for pos in &state.open {
-        trades::register(&pos.tr.coin, "squeeze", pos.risk, pos.tr.size);
+        trades::register(&pos.tr.coin, p.kind, pos.risk, pos.tr.size);
     }
-    let risk = if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct()) } else { format!("${:.0}", p.risk_usd) };
-    log!("squeeze: account {}: a 4h close over the band after a squeeze (the lowest {:.0}% width), BTC over its 50-day mean, ${:.0}M+ a day; out {:.0} ATR under on a 4h close or {:.0} days on; risk {risk}, at most {}; {} held",
-        venue.account, p.q * 100.0, p.min_vol / 1e6, p.atr_k, p.hold_s / DAY, p.max_open, state.open.len());
-    crate::notify::send(format!("🗜 пробой из сжатия НА ДЕНЬГИ: 4ч закрытие над полосой Боллинджера после сжатия (нижние {:.0}% ширины), BTC выше 50-дн. средней, оборот от ${:.0}M; выход: закрытие 4ч на {:.0} ATR ниже входа или {:.0} дн.; риск {risk} на сделку, до {} позиций{}",
-        p.q * 100.0, p.min_vol / 1e6, p.atr_k, p.hold_s / DAY, p.max_open, trades::trial_label(p.trial, state.opened)));
+    let risk = if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct() * p.share) } else { format!("${:.0}", p.risk_usd * p.share) };
+    let short = p.side < 0.0;
+    log!("{}: account {}: a 4h close {} the band after a squeeze (the lowest {:.0}% width){}, ${:.0}M+ a day; out {:.0} ATR {} on a 4h close or {:.0} days on; risk {risk}, at most {}; {} held",
+        p.kind, venue.account, if short { "under" } else { "over" }, p.q * 100.0, if p.btc_filter { ", BTC over its 50-day mean" } else { "" }, p.min_vol / 1e6, p.atr_k,
+        if short { "over" } else { "under" }, p.hold_s / DAY, p.max_open, state.open.len());
+    crate::notify::send(format!("🗜 {} НА ДЕНЬГИ: 4ч закрытие {} полосы Боллинджера после сжатия (нижние {:.0}% ширины){}, оборот от ${:.0}M; выход: закрытие 4ч на {:.0} ATR {} входа или {:.0} дн.; риск {risk} на сделку, до {} позиций{}",
+        if short { "шорт пробоя вниз из сжатия" } else { "пробой из сжатия" }, if short { "под" } else { "над" }, p.q * 100.0,
+        if p.btc_filter { ", BTC выше 50-дн. средней" } else { "" }, p.min_vol / 1e6, p.atr_k, if short { "выше" } else { "ниже" }, p.hold_s / DAY, p.max_open,
+        trades::trial_label(p.trial, state.opened)));
     let mut l = Squeeze { venue, unified, cfg: cfg.clone(), store, p, state };
     tokio::spawn(async move {
         let mut check_at = 0.0;
@@ -382,14 +420,17 @@ mod tests {
         let mut c: Vec<f64> = (0..600).map(|i| if i % 2 == 0 { 90.0 } else { 110.0 }).collect();
         c.extend((0..300).map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 }));
         let bars = |c: &[f64]| c.iter().enumerate().map(|(i, x)| (i as f64 * BAR, x * 1.001, x * 0.999, *x)).collect::<Vec<Bar>>();
-        assert!(!breakout(&bars(&c), 0.2));
+        assert!(!breakout(&bars(&c), 0.2, 1.0) && !breakout(&bars(&c), 0.2, -1.0));
         let mut up = c.clone();
         up.push(103.0);
-        assert!(breakout(&bars(&up), 0.2));
+        assert!(breakout(&bars(&up), 0.2, 1.0) && !breakout(&bars(&up), 0.2, -1.0));
+        let mut dn = c.clone();
+        dn.push(97.0);                                          // the breakdown: the short's signal
+        assert!(breakout(&bars(&dn), 0.2, -1.0) && !breakout(&bars(&dn), 0.2, 1.0));
         // the swings widening: the last width the widest, no squeeze; a close over the band
         let mut wide = (0..900).map(|i| 100.0 + if i % 2 == 0 { -1.0 } else { 1.0 } * (5.0 + i as f64 * 0.02)).collect::<Vec<f64>>();
         wide.push(160.0);
-        assert!(!breakout(&bars(&wide), 0.2));
+        assert!(!breakout(&bars(&wide), 0.2, 1.0));
         assert!(atr(&bars(&up)).is_some_and(|a| a > 0.0));
     }
 }

@@ -544,11 +544,11 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
-            } else if !crate::trades::can_open(&coin, risk_dollars(self.p.risk, self.p.risk_usd, self.equity)) {
+            } else if !crate::trades::can_open(&coin, "dip", 1.0, risk_dollars(self.p.risk, self.p.risk_usd, self.equity)) {
                 Some("family cap")
             } else if in_cooldown.contains(&coin) || self.state.last_entry.get(&coin).is_some_and(|x| t - x < self.p.cooldown_s) {
                 Some("cooldown")
-            } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
+            } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) && !crate::trades::family_holds(&coin) {
                 Some("the account holds it otherwise")
             } else if self.equity <= 0.0 {
                 Some("equity not read yet")
@@ -604,11 +604,11 @@ impl Dip {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {
                 Some("held")
-            } else if !crate::trades::can_open(&coin, risk_dollars(q.risk, q.risk_usd, self.equity)) {
+            } else if !crate::trades::can_open(&coin, "dip", -1.0, risk_dollars(q.risk, q.risk_usd, self.equity)) {
                 Some("family cap")
             } else if in_cooldown.contains(&coin) {
                 Some("cooldown")
-            } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) {
+            } else if self.positions.get(&coin).is_some_and(|x| *x != 0.0) && !crate::trades::family_holds(&coin) {
                 Some("the account holds it otherwise")
             } else if self.equity <= 0.0 {
                 Some("equity not read yet")
@@ -906,12 +906,15 @@ impl Dip {
         };
         self.equity = equity;
         crate::trades::set_equity(equity);
-        crate::trades::sync("dip", self.state.open.iter().map(|(c, p)| (c.clone(), (p.size * (p.entry_px - p.stop_px)).abs())));
+        crate::trades::sync("dip", self.state.open.iter().map(|(c, p)| (c.clone(), (p.size * (p.entry_px - p.stop_px)).abs(), p.size)));
         self.positions = positions;
         let mut changed = false;
         for (coin, p) in self.state.open.clone() {
             let held = self.positions.get(&coin).copied().unwrap_or(0.0);
-            if gone(held, p.size) {
+            // On a coin another strategy holds too the account's position outlives ours: ours ends with its stop.
+            let stopped = !gone(held, p.size) && crate::trades::shared(&coin, "dip")
+                && match p.stop_oid { Some(o) => crate::trades::order_done(&self.venue, o).await, None => false };
+            if gone(held, p.size) || stopped {
                 self.state.open.remove(&coin);
                 let mut ev = json!({"what": "stopped", "coin": coin, "size_was": p.size, "entry_px": p.entry_px, "stop_px": p.stop_px,
                     "pnl_approx": p.size * (p.stop_px - p.entry_px)});

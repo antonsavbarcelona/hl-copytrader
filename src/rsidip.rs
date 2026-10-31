@@ -338,7 +338,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     let venue = crate::live::venue_from_env(None).await?;
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     for pos in state.open.iter().filter(|x| x.live()) {
-        trades::register(&pos.coin, "rsidip", pos.reserve(&p));
+        trades::register(&pos.coin, "rsidip", pos.reserve(&p), 1.0);
     }
     let mode = match (&venue, p.trial) {
         (None, _) => "paper (no LIVE_KEY / LIVE_ACCOUNT)".to_string(),
@@ -387,7 +387,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             state.wins += (pnl > 0.0) as u32;
             state.pnl_usd += pnl;
             if pos.live() {
-                trades::unregister(&pos.coin);
+                trades::unregister(&pos.coin, "rsidip");
             }
             event(store, json!({"what": "close", "live": pos.live(), "coin": pos.coin, "why": why, "avg": pos.avg(), "px": px, "units": pos.units, "pnl_usd": pnl,
                 "ret_pct": pnl / pos.cost * 100.0, "held_h": (t - pos.at) / 3600.0, "closed": state.closed, "wins": state.wins, "total_usd": state.pnl_usd}));
@@ -472,7 +472,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                                         }
                                     }
                                 } else {
-                                    trades::gone(v, &tr, held.get(&pos.coin).copied().unwrap_or(0.0)).await
+                                    trades::gone(v, &tr, held.get(&pos.coin).copied().unwrap_or(0.0), "rsidip").await
                                 };
                                 match out {
                                     Some((why, px)) => {
@@ -563,12 +563,12 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         let usd_buy = p.buy_usd();
                         let reserve = usd_buy * p.stop * p.buys();
                         let live = venue.as_ref().filter(|(v, _)| v.coins.contains_key(&c) && n_live < p.max_open
-                            && trades::trial_open(p.trial, state.opened) && trades::can_open(&c, reserve));
+                            && trades::trial_open(p.trial, state.opened) && trades::can_open(&c, "rsidip", 1.0, reserve));
                         let mut pos = match live {
                             Some((v, _)) => match open_live(v, &c, usd_buy, mid, &p).await {
                                 Ok(pos) => {
                                     state.opened += 1;
-                                    trades::register(&c, "rsidip", pos.reserve(&p));
+                                    trades::register(&c, "rsidip", pos.reserve(&p), 1.0);
                                     pos
                                 }
                                 Err(e) => {

@@ -343,6 +343,16 @@ impl Venue {
         }
         Ok((num(&o["order"]["origSz"]) - num(&o["order"]["sz"]), o["status"] == "open"))
     }
+
+    /// An order's status ("open", "filled", "triggered", "canceled", ...) and the size filled.
+    pub(crate) async fn order_state(&self, oid: u64) -> Result<(String, f64)> {
+        let r = self.ex.info(json!({"type": "orderStatus", "user": self.account, "oid": oid})).await?;
+        let o = &r["order"];
+        if o.is_null() {
+            bail!("order {oid}: no status ({r})");
+        }
+        Ok((o["status"].as_str().unwrap_or("").to_string(), num(&o["order"]["origSz"]) - num(&o["order"]["sz"])))
+    }
 }
 
 /// What a limit order did: rests (its id), or filled at once (the size, signed, its average price).

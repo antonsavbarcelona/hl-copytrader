@@ -158,7 +158,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         }
     }
     for tr in &state.open {
-        crate::trades::register(&tr.coin, "hip3", tr.risk());
+        crate::trades::register(&tr.coin, "hip3", tr.risk(), tr.size);
     }
     if let Some((v, _)) = &venue {
         log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held, trial {:?} ({} opened)", v.account, crate::trades::sizing_label(p.risk_usd, p.stop),
@@ -172,7 +172,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let wp = crate::wkd::Params::from_env();
     for tr in &state.wkd.live {
-        crate::trades::register(&tr.coin, "wkd", tr.risk());
+        crate::trades::register(&tr.coin, "wkd", tr.risk(), tr.size);
     }
     let wkd_mode = match (&venue, &wp.live) {
         (None, _) | (_, None) => "БЕЗ СДЕЛОК (только сигналы)".to_string(),
@@ -273,7 +273,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         continue;
                     }
                     let risk = crate::trades::risk_usd(wp.risk_usd);
-                    if !v.coins.contains_key(&coin) || state.wkd.live.len() >= wp.max_open || !crate::trades::can_open(&coin, risk) {
+                    if !v.coins.contains_key(&coin) || state.wkd.live.len() >= wp.max_open || !crate::trades::can_open(&coin, "wkd", 1.0, risk) {
                         log!("hip3: weekend {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
                         continue;
                     }
@@ -287,7 +287,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         Ok(tr) => {
                             event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "size": tr.size, "notional": tr.size * tr.entry_px,
                                 "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": wp.hold_s() / 3600.0}));
-                            crate::trades::register(&coin, "wkd", tr.risk());
+                            crate::trades::register(&coin, "wkd", tr.risk(), tr.size);
                             state.wkd.live.push(tr);
                             state.wkd.opened += 1;
                             if !crate::trades::trial_open(trial, state.wkd.opened) {
@@ -328,7 +328,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                                 }
                             }
                         } else if check && dex_ok {
-                            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0)).await
+                            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0), "wkd").await
                         } else {
                             None
                         };
@@ -337,7 +337,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                                 let ret = tr.ret(px);
                                 event(&store, json!({"what": "wkd_exit", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                                     "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_h": (t - tr.at) / 3600.0}));
-                                crate::trades::unregister(&tr.coin);
+                                crate::trades::unregister(&tr.coin, "wkd");
                                 wchanged = true;
                             }
                             None => keep.push(tr),
@@ -381,7 +381,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         continue;
                     }
                     let risk = crate::trades::risk_usd(p.risk_usd);
-                    if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin, risk) {
+                    if !v.coins.contains_key(&coin) || state.open.len() >= p.max_open || !crate::trades::can_open(&coin, "hip3", 1.0, risk) {
                         log!("hip3: {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
                         continue;
                     }
@@ -394,7 +394,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         Ok(tr) => {
                             event(&store, json!({"what": "open", "coin": coin, "fall": fall, "window": w, "mid": mid, "px": tr.entry_px, "size": tr.size,
                                 "notional": tr.size * tr.entry_px, "stop_px": tr.stop_px, "hold_min": p.hold_s / 60.0}));
-                            crate::trades::register(&coin, "hip3", tr.risk());
+                            crate::trades::register(&coin, "hip3", tr.risk(), tr.size);
                             state.open.push(tr);
                             state.opened += 1;
                             if !crate::trades::trial_open(p.trial, state.opened) {
@@ -440,7 +440,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                             }
                         }
                     } else if check && dex_ok {
-                        crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0)).await
+                        crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0), "hip3").await
                     } else {
                         None
                     };
@@ -449,7 +449,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                             let ret = tr.ret(px);
                             event(&store, json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                                 "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_min": (t - tr.at) / 60.0}));
-                            crate::trades::unregister(&tr.coin);
+                            crate::trades::unregister(&tr.coin, "hip3");
                             changed = true;
                         }
                         None => keep.push(tr),

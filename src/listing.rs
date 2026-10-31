@@ -174,7 +174,7 @@ impl Listing {
                 continue;
             }
             let risk = trades::risk_usd(self.p.risk_usd);
-            if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, risk) {
+            if self.state.open.len() >= self.p.max_open || !trades::can_open(&coin, "listing", -1.0, risk) {
                 log!("listing: {coin} due but at most open or held");
                 continue;
             }
@@ -189,7 +189,7 @@ impl Listing {
                 Ok(tr) => {
                     self.event(json!({"what": "open", "coin": coin, "days_listed": (t - at) / DAY, "px": tr.entry_px, "size": tr.size,
                         "notional": tr.size.abs() * tr.entry_px, "take_px": tr.take_px, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "volume": v}));
-                    trades::register(&coin, "listing", tr.risk());
+                    trades::register(&coin, "listing", tr.risk(), tr.size);
                     self.state.open.push(tr);
                     self.state.opened += 1;
                 }
@@ -229,7 +229,7 @@ impl Listing {
                     }
                 }
             } else if let Some(h) = &held {
-                trades::gone(&self.venue, &tr, h.get(&tr.coin).copied().unwrap_or(0.0)).await
+                trades::gone(&self.venue, &tr, h.get(&tr.coin).copied().unwrap_or(0.0), "listing").await
             } else {
                 None
             };
@@ -238,7 +238,7 @@ impl Listing {
                     let ret = tr.ret(px);
                     self.event(json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                         "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_days": (t - tr.at) / DAY}));
-                    trades::unregister(&tr.coin);
+                    trades::unregister(&tr.coin, "listing");
                     changed = true;
                 }
                 None => keep.push(tr),
@@ -264,7 +264,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     let p = Params::from_env();
     let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     for tr in &state.open {
-        trades::register(&tr.coin, "listing", tr.risk());
+        trades::register(&tr.coin, "listing", tr.risk(), tr.size);
     }
     log!("listing: account {}: a listing shorted {:.0} days on (${:.0}M+ a day), stop {:.0}%, take {:.0}%, {:.0} days, risk {}, at most {}; {} held, {} coins known",
         venue.account, p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,

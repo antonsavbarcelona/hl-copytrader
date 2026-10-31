@@ -251,9 +251,9 @@ impl Wick {
             if !self.picked.iter().any(|x| x == c) { return "unpicked"; }
         }
         if self.closes.at(c, minute - 1).is_none() { return "no price"; }
-        if self.held.get(c).is_some_and(|x| *x != 0.0) { return "held"; }
+        if self.held.get(c).is_some_and(|x| *x != 0.0) && !trades::family_holds(c) { return "held"; }
         if self.state.last_fill.get(c).is_some_and(|x| now() - x < AGAIN_AFTER_S) { return "after its fill"; }
-        if !trades::can_open(c, trades::risk_usd(self.p.risk_usd)) { return "family cap"; }
+        if !trades::can_open(c, "wick", 1.0, trades::risk_usd(self.p.risk_usd)) { return "family cap"; }
         if !h3 && self.hot(c, minute) { return "hot"; }
         "other"
     }
@@ -318,9 +318,9 @@ impl Wick {
         let risk = trades::risk_usd(self.p.risk_usd);
         let t = now();
         let free = |c: &str| {
-            self.held.get(c).is_none_or(|x| *x == 0.0)
+            (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
                 && self.state.last_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
-                && trades::can_open(c, risk)
+                && trades::can_open(c, "wick", 1.0, risk)
         };
         if self.btc_calm(minute) && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
             for c in self.picked.clone() {
@@ -484,7 +484,7 @@ impl Wick {
             Ok(tr) => {
                 self.event(json!({"what": "open", "coin": coin, "pct": pct, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
                     "stop_px": tr.stop_px, "hold_min": self.p.hold_s / 60.0}));
-                trades::register(coin, "wick", tr.risk());
+                trades::register(coin, "wick", tr.risk(), tr.size);
                 self.state.open.push(tr);
             }
             Err(e) => {
@@ -608,7 +608,7 @@ impl Wick {
                     }
                 }
             } else if read.contains(dex_of(&tr.coin)) {
-                trades::gone(&self.venue, &tr, self.held.get(&tr.coin).copied().unwrap_or(0.0)).await
+                trades::gone(&self.venue, &tr, self.held.get(&tr.coin).copied().unwrap_or(0.0), "wick").await
             } else {
                 None
             };
@@ -617,7 +617,7 @@ impl Wick {
                     let ret = tr.ret(px);
                     self.event(json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
                         "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_min": (t - tr.at) / 60.0}));
-                    trades::unregister(&tr.coin);
+                    trades::unregister(&tr.coin, "wick");
                     changed = true;
                 }
                 None => keep.push(tr),
@@ -664,7 +664,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         }
     }
     for tr in &state.open {
-        trades::register(&tr.coin, "wick", tr.risk());
+        trades::register(&tr.coin, "wick", tr.risk(), tr.size);
     }
     log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}% (HIP-3 {:.0}%), stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
         venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.h3_take * 100.0, p.stop * 100.0,

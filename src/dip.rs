@@ -1,4 +1,4 @@
-//! The dip-buy on the live account (`DIP_ENABLED=1`, with `LIVE_KEY`, `LIVE_ACCOUNT`, `LIVE_NET`
+//! The dip-buy on the live account (`DIP_ENABLED`: on unless "0"; with `LIVE_KEY`, `LIVE_ACCOUNT`, `LIVE_NET`
 //! as for `live`): a perp with `DIP_MIN_VOL_USD` (16M; 20M until 2026-10-28) or more traded over the last 24 h whose mid
 //! fell `DIP_DROP_PCT` (8) or more (`DIP_FUNDING_DROP_PCT` (5.6; 0: off) while the coin's funding is
 //! at or over 0: V2, see below) over the last `DIP_WINDOW_MIN` (15) minutes, by the minutes'
@@ -41,7 +41,7 @@
 //! neighbouring setting (5-8%, 5-15 min, 1-4 h) in profit, and a walk-forward choice of the
 //! setting too. Fading rises the same way loses: their tails are fatal.
 //!
-//! The same family's other side (`PUMP_ENABLED=1`, off by default; DIP V1 above is untouched by
+//! The same family's other side (`PUMP_ENABLED`: on unless "0"; DIP V1 above is untouched by
 //! it): a perp with `PUMP_MIN_VOL_USD` (10M) or more a day, traded `PUMP_MIN_AGE_DAYS` (14)+, whose
 //! mid rose `PUMP_RISE_PCT` (20) or more over the same window is shorted at market; out at market
 //! `PUMP_HOLD_MIN` (240) later, no take, a resting stop `PUMP_STOP_PCT` (50) above our fill, sized
@@ -102,7 +102,7 @@ struct Params {
     rsi_max: f64,
     /// `DIP_FUNDING_DROP_PCT` (0: off): the fall bought while the coin's funding is at or over 0.
     funding_drop: f64,
-    /// V2's trial: its first `DIP_TRIAL` (3; 0: none) live entries, then the signals only (as `DIP_DRY`).
+    /// V2's trial: its first `DIP_TRIAL` (0: none, the default from 2026-10-31) live entries, then the signals only (as `DIP_DRY`).
     trial: Option<u32>,
     pump: PumpParams,
 }
@@ -147,7 +147,7 @@ fn risk_label(pct: f64, usd: f64, stop: f64) -> String {
 struct PumpParams {
     enabled: bool,
     dry: bool,
-    /// The trial (`PUMP_ENABLED` unset): its live trades at most, then the signals only.
+    /// The trial (`PUMP_ENABLED` set empty): its live trades at most, then the signals only.
     trial: Option<u32>,
     rise: f64,
     min_vol: f64,
@@ -168,7 +168,7 @@ impl Params {
             min_vol: v("DIP_MIN_VOL_USD", 16e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 5.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
-            trial: Some(v("DIP_TRIAL", 3.0) as u32).filter(|n| *n > 0),
+            trial: Some(v("DIP_TRIAL", 0.0) as u32).filter(|n| *n > 0),
             pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 240.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
@@ -320,10 +320,10 @@ struct Dip {
     old_enough: HashMap<String, bool>,
 }
 
-/// Starts the dip-buy if `DIP_ENABLED` is "1" and the live account is set (see the module).
+/// Starts the dip-buy unless `DIP_ENABLED` is "0", with the live account set (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books) -> Result<()> {
-    if std::env::var("DIP_ENABLED").unwrap_or_default().trim() != "1" {
-        log!("dip: off (DIP_ENABLED=1 to trade it)");
+    if crate::trades::switch("DIP_ENABLED").is_none() {
+        log!("dip: off (DIP_ENABLED=0)");
         return Ok(());
     }
     let Some((venue, unified)) = crate::live::venue_from_env(Some(books.clone())).await? else {

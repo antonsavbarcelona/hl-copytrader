@@ -55,7 +55,7 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { days: v("TREND_DAYS", 20.0) as usize, atr_k: v("TREND_ATR_K", 3.0), max_days: v("TREND_MAX_DAYS", 90.0),
             btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
-            max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch_on("TREND_ENABLED").flatten() }
+            max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch("TREND_ENABLED").flatten() }
     }
 }
 
@@ -320,7 +320,7 @@ impl TrendLong {
 
 /// Starts the trend long unless `TREND_ENABLED` is "0" (unset or "1": live; set empty: the trial).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch_on("TREND_ENABLED").is_none() {
+    if trades::switch("TREND_ENABLED").is_none() {
         log!("trend: off (TREND_ENABLED=0)");
         return Ok(());
     }

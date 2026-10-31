@@ -1,4 +1,4 @@
-//! The listing short (`LIST_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the
+//! The listing short (`LIST_ENABLED`: on unless "0"; with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the
 //! dip): a perp newly listed on the main dex (its first daily candle), `LIST_DELAY_DAYS` (7) on,
 //! with `LIST_MIN_VOL_USD` (5M) or more a day, is shorted at market; a resting stop `LIST_STOP_PCT`
 //! (25) over, a resting take `LIST_TAKE_PCT` (30; 20 until 2026-10-27) under, out at market `LIST_HOLD_DAYS` (14) later;
@@ -41,7 +41,7 @@ struct Params {
     hold_s: f64,
     risk_usd: f64,
     max_open: usize,
-    /// The trial (`LIST_ENABLED` unset): its live trades at most.
+    /// The trial (`LIST_ENABLED` set empty): its live trades at most.
     trial: Option<u32>,
 }
 
@@ -251,7 +251,7 @@ impl Listing {
     }
 }
 
-/// Starts the listing short if `LIST_ENABLED` is "1" (see the module).
+/// Starts the listing short unless `LIST_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     if trades::switch("LIST_ENABLED").is_none() {
         log!("listing: off (LIST_ENABLED=0)");

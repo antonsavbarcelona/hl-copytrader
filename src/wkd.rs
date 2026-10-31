@@ -6,7 +6,7 @@
 //! the mids, less 9 bp taker + 5 bp slippage a side. Events kind `hip3`, `wkd_signal` / `wkd_close`, to the chat too.
 //! Run inside the HIP-3 loop (its 10 s mids, its volumes); its state with the `hip3` doc.
 //!
-//! Traded (`WKD_LIVE`: unset the trial, its first `TRIAL_TRADES` (3) live, then the shadow only; "1" live; "0" the shadow
+//! Traded (`WKD_LIVE`: unset or "1" live; set empty the trial, its first `TRIAL_TRADES` (3) live, then the shadow only; "0" the shadow
 //! only; the HIP-3 venue needed, as the HIP-3 dip's): at the paper entry (the close of the minute after the signal) bought
 //! at market, a resting stop -`WKD_STOP_PCT` and a resting take +`WKD_TAKE_PCT` (reduce-only), out at market `WKD_HOLD_H`
 //! on; the stop losing `WKD_RISK_USD` ($20; `FAMILY_RISK_PCT` of the equity when set), at most `WKD_MAX_OPEN` (3) and the

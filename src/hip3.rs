@@ -1,4 +1,4 @@
-//! The dip family on the HIP-3 perps (`HIP3_ENABLED=1`, off by default): a coin of a HIP-3 dex
+//! The dip family on the HIP-3 perps (`HIP3_ENABLED`: on unless "0"): a coin of a HIP-3 dex
 //! (xyz's stocks, vntl's pre-IPO names, ...) with `HIP3_MIN_VOL_USD` (10M) or more a day whose mid
 //! fell `HIP3_DROP_PCT` (8) or more over 5 or over 15 minutes, by the minutes' closes, while BTC
 //! moved less than `HIP3_BTC_MAX_PCT` (2) over the same minutes; a coin not again for 240 min after
@@ -51,7 +51,7 @@ struct Params {
     risk_usd: f64,
     stop: f64,
     max_open: usize,
-    /// The trial (`HIP3_LIVE` unset): its live trades at most.
+    /// The trial (`HIP3_LIVE` set empty): its live trades at most.
     trial: Option<u32>,
 }
 
@@ -82,7 +82,7 @@ struct State {
     last_move: HashMap<String, i64>,
     #[serde(default)]
     signals: u64,
-    /// The trades held (`HIP3_LIVE=1`).
+    /// The trades held (`HIP3_LIVE` on unless "0").
     #[serde(default)]
     open: Vec<crate::trades::Trade>,
     /// The live trades opened (the trial's count).
@@ -135,7 +135,7 @@ fn message(ev: &Value) -> Option<String> {
     })
 }
 
-/// Starts the HIP-3 dip's signals if `HIP3_ENABLED` is "1" (see the module).
+/// Starts the HIP-3 dip's signals unless `HIP3_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::trades::switch("HIP3_ENABLED").is_none() {
         log!("hip3: off (HIP3_ENABLED=0)");
@@ -145,7 +145,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
-    // The live venue with the HIP-3 perps (HIP3_LIVE=1): without it the signals only.
+    // The live venue with the HIP-3 perps (HIP3_LIVE on unless "0"): without it the signals only.
     let mut venue: Option<(crate::live::Venue, HashMap<String, u32>)> = None;
     if p.live {
         match crate::live::venue_from_env(None).await {
@@ -374,7 +374,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     event(&store, json!({"what": "signal", "coin": coin, "fall": fall, "window": w, "mid": mid, "volume": volume.get(&coin).copied().unwrap_or(0.0),
                         "btc": closes.change("BTC", minute - 1, w)}));
                     changed = true;
-                    // Traded (HIP3_LIVE=1): a coin of a USDC dex, within the limits.
+                    // Traded (HIP3_LIVE on): a coin of a USDC dex, within the limits.
                     let Some((v, max_lev)) = &venue else { continue };
                     if !crate::trades::trial_open(p.trial, state.opened) {
                         log!("hip3: {coin} not traded (the trial's {} trades done)", state.opened);

@@ -92,7 +92,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let picks = store::load_picks(&cfg).await?;
     let store = store::open(&cfg).await?;
     let live = live::start(&cfg, store.clone(), false, Some(books.clone())).await?;
-    // The dip-buy on the same account (off unless DIP_ENABLED=1): its own positions, on the books.
+    // The dip-buy on the same account (on unless DIP_ENABLED=0): its own positions, on the books.
     dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
     hip3::start(&cfg, store.clone(), api.clone()).await?;
     wick::start(&cfg, store.clone(), api.clone()).await?;

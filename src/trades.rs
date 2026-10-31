@@ -58,20 +58,10 @@ static EQUITY: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
 /// Coin -> its trades: (strategy, the trade's risk in $: its stop's loss, its side +1 / -1).
 static OPEN: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<(String, f64, f64)>>>> = std::sync::Mutex::new(None);
 
-/// A strategy's switch `var`: "1" on; unset (or empty) the trial: on for its first `TRIAL_TRADES`
-/// (3) live trades, then the signals only; anything else ("0") off. None off, Some(None) on,
-/// Some(Some(n)) the trial of n trades.
+/// A strategy's switch `var`, all on by default (2026-10-31, the user's call: the config lives in the code, not in
+/// the env): unset or "1" on; set empty the trial: on for its first `TRIAL_TRADES` (3) live trades, then the signals
+/// only; anything else ("0") off. None off, Some(None) on, Some(Some(n)) the trial of n trades.
 pub(crate) fn switch(var: &str) -> Option<Option<u32>> {
-    match std::env::var(var).map(|x| x.trim().to_string()) {
-        Ok(x) if x == "1" => Some(None),
-        Ok(x) if !x.is_empty() => None,
-        _ => Some(Some(env_f("TRIAL_TRADES", 3.0) as u32)),
-    }
-}
-
-/// A switch on by default (the trend, the squeeze long / short from 2026-10-31, the user's call: all the strategies live
-/// at the family's 2%): unset or "1" on; set empty the trial of `TRIAL_TRADES`; anything else ("0") off.
-pub(crate) fn switch_on(var: &str) -> Option<Option<u32>> {
     match std::env::var(var).map(|x| x.trim().to_string()) {
         Err(_) => Some(None),
         Ok(x) if x.is_empty() => Some(Some(env_f("TRIAL_TRADES", 3.0) as u32)),
@@ -313,17 +303,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_switch_on_by_default() {
+    fn a_switch_is_on_by_default() {
         let v = "TEST_SWITCH_ON_X";
         // SAFETY: a test-only variable no other code reads.
         unsafe { std::env::remove_var(v); }
-        assert_eq!(switch_on(v), Some(None));
+        assert_eq!(switch(v), Some(None));
         unsafe { std::env::set_var(v, "1"); }
-        assert_eq!(switch_on(v), Some(None));
+        assert_eq!(switch(v), Some(None));
         unsafe { std::env::set_var(v, ""); }
-        assert_eq!(switch_on(v), Some(Some(3)));
+        assert_eq!(switch(v), Some(Some(3)));
         unsafe { std::env::set_var(v, "0"); }
-        assert_eq!(switch_on(v), None);
+        assert_eq!(switch(v), None);
         unsafe { std::env::remove_var(v); }
     }
 

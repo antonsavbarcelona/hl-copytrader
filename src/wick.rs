@@ -1,4 +1,4 @@
-//! The wick bids (`WICK_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
+//! The wick bids (`WICK_ENABLED`: on unless "0"; with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
 //! a resting buy `WICK_PCT` (7) under each liquid perp's anchor - the last minute's close, or its
 //! oracle when lower - on `WICK_MAX_COINS` (30) of the coins with a day volume of `WICK_MIN_VOL_USD`
 //! (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the last minute's close
@@ -93,7 +93,7 @@ struct Params {
     risk_usd: f64,
     max_open: usize,
     h3_max_open: usize,
-    /// The trial (`WICK_ENABLED` unset): each side's live trades at most.
+    /// The trial (`WICK_ENABLED` set empty): each side's live trades at most.
     trial: Option<u32>,
     /// The coins picked by the 24 h deviation (else by the day volume).
     by_spread: bool,
@@ -630,7 +630,7 @@ impl Wick {
     }
 }
 
-/// Starts the wick bids if `WICK_ENABLED` is "1" (see the module).
+/// Starts the wick bids unless `WICK_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if trades::switch("WICK_ENABLED").is_none() {
         log!("wick: off (WICK_ENABLED=0)");

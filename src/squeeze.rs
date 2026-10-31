@@ -73,14 +73,14 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch_on("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
+            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
     }
 
     fn short_from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch_on("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
+            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
     }
 }
 
@@ -353,12 +353,12 @@ impl Squeeze {
 /// Starts the squeeze breakout long unless `SQZ_ENABLED` is "0" (unset or "1": live; set empty: the trial), and the
 /// breakdown short likewise by `SQZS_ENABLED`.
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch_on("SQZ_ENABLED").is_none() {
+    if trades::switch("SQZ_ENABLED").is_none() {
         log!("squeeze: off (SQZ_ENABLED=0)");
     } else {
         launch(cfg, store.clone(), Params::from_env()).await?;
     }
-    if trades::switch_on("SQZS_ENABLED").is_none() {
+    if trades::switch("SQZS_ENABLED").is_none() {
         log!("squeeze_short: off (SQZS_ENABLED=0)");
     } else {
         launch(cfg, store, Params::short_from_env()).await?;

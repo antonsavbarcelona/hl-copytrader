@@ -21,6 +21,7 @@ mod notify;
 mod report;
 mod rollstats;
 mod rsidip;
+mod squeeze;
 mod stable;
 mod stats;
 mod store;
@@ -78,7 +79,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         wick::start(&cfg, store.clone(), api.clone()).await?;
         rsidip::start(&cfg, store.clone(), api.clone()).await?;
         listing::start(&cfg, store.clone()).await?;
-        trend::start(&cfg, store).await?;
+        trend::start(&cfg, store.clone()).await?;
+        squeeze::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
         log!("stopped");
@@ -97,6 +99,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     rsidip::start(&cfg, store.clone(), api.clone()).await?;
     listing::start(&cfg, store.clone()).await?;
     trend::start(&cfg, store.clone()).await?;
+    squeeze::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

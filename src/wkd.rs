@@ -1,5 +1,6 @@
 //! The HIP-3 weekend dips (V85 hypothesis 47, V87): on Saturday or Sunday (UTC) a stock of a
-//! USDC-margined HIP-3 dex (xyz, para, mkts, io, abcd; not the commodities, FX, indices or the Asian names) with
+//! USDC-margined HIP-3 dex (xyz, para, mkts, io, abcd; US, Asian and pre-IPO stocks and the indices; not the commodities, FX,
+//! the rates or the crypto-linked names) with
 //! `WKD_MIN_VOL_USD` ($100k)+ a day whose mid goes `WKD_DROP_PCT` (4) or more under the highest close of the 15
 //! minutes before: a signal; a coin not again for 120 min. Bought on paper at the close of the minute after (the
 //! research's entry), out at +`WKD_TAKE_PCT` (5; a maker 3 bp), -`WKD_STOP_PCT` (10) or `WKD_HOLD_H` (24) h on, by
@@ -26,12 +27,13 @@ use serde_json::{Value, json};
 use crate::dip::Closes;
 
 const DEXES: [&str; 5] = ["xyz", "para", "mkts", "io", "abcd"];
-/// The HIP-3 names that are not US stocks (the research's: the commodities, FX, the indices, the Asian and pre-IPO names).
-const NONEQ: [&str; 69] = ["GOLD", "SILVER", "CL", "OIL", "WTI", "BRENTOIL", "COPPER", "NATGAS", "GAS", "PLATINUM", "PALLADIUM", "URANIUM", "EUR",
-    "JPY", "DXY", "GBP", "CORN", "WHEAT", "SOY", "COFFEE", "COCOA", "SUGAR", "USDE", "XMR", "ALUMINIUM", "ALUMINUM", "NICKEL", "ZINC", "LITHIUM", "HO",
-    "SP500", "XYZ100", "JP225", "KR200", "USBOND", "10Y", "2Y", "BTCD", "OTHERS", "TOTAL2", "BVIV", "SMALL2000", "US500", "USTECH", "USA100", "USA500",
-    "SKHX", "SKHY", "SMSN", "KIOXIA", "SOFTBANK", "HYUNDAI", "CXMT", "ZHIPU", "MINIMAX", "UNITREE", "GIGADEV", "DRAM", "SHEIN", "OAI", "ANTH",
-    "SPCX", "PURRDAT", "TREAD", "ANSEM", "BIRD", "CBRS", "EWJ", "EWT"];
+/// The HIP-3 names left out: the commodities, FX, the rates and the crypto-linked ones (their markets do not close for
+/// the weekend). The Asian stocks, the pre-IPO names and the indices are in since 2026-10-31 (V182 / V183, HL 1m
+/// 2025-10 .. 2026-10, the USDC dexes, the 4% dip: 33 trades +217 bp, w/o the 5 best +205, 6 of 8 months up; on the
+/// weekdays the same dips lose; with them the HL portfolio at 2% x9.4 -> x12.1 at the same drawdown 28%).
+const EXCLUDED: &[&str] = &["GOLD", "SILVER", "CL", "OIL", "USOIL", "WTI", "BRENTOIL", "COPPER", "NATGAS", "GAS", "PLATINUM", "PALLADIUM",
+    "URANIUM", "CORN", "WHEAT", "SOY", "COFFEE", "COCOA", "SUGAR", "ALUMINIUM", "ALUMINUM", "NICKEL", "ZINC", "LITHIUM", "HO", "EUR", "JPY",
+    "DXY", "GBP", "USBOND", "10Y", "2Y", "USDE", "XMR", "BTCD", "OTHERS", "TOTAL2", "BVIV", "PURRDAT", "TREAD", "ANSEM", "BIRD", "CBRS"];
 const REF_MIN: i64 = 15;
 const GAP_MIN: i64 = 120;
 const TAKER: f64 = 9e-4 + 5e-4;
@@ -111,9 +113,9 @@ fn weekend(minute: i64) -> bool {
     (minute.div_euclid(1440) + 3).rem_euclid(7) >= 5
 }
 
-/// A US stock of a USDC dex.
-fn equity(coin: &str) -> bool {
-    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !NONEQ.contains(&n))
+/// A stock or an index of a USDC dex (US, Asian, pre-IPO).
+fn tradable(coin: &str) -> bool {
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n))
 }
 
 impl Book {
@@ -124,7 +126,7 @@ impl Book {
         let mut entries = Vec::new();
         if weekend(minute) {
             for (c, &(m, lo)) in lows {
-                if m != minute || !equity(c) || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || self.last.get(c).is_some_and(|x| minute - x < GAP_MIN) {
+                if m != minute || !tradable(c) || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || self.last.get(c).is_some_and(|x| minute - x < GAP_MIN) {
                     continue;
                 }
                 let Some(q) = closes.0.get(c) else { continue };
@@ -216,7 +218,8 @@ mod tests {
         let sat = 29_890_080 + 600;
         let thu = sat - 2 * 1440;
         assert!(weekend(sat) && weekend(sat + 1440) && !weekend(thu) && !weekend(sat + 2 * 1440));
-        assert!(equity("xyz:NVDA") && !equity("xyz:GOLD") && !equity("flx:NVDA") && !equity("NVDA"));
+        assert!(tradable("xyz:NVDA") && tradable("xyz:SKHX") && tradable("io:OAI") && tradable("xyz:SP500") && !tradable("xyz:GOLD") && !tradable("para:TOTAL2")
+            && !tradable("flx:NVDA") && !tradable("NVDA"));
         let vol: HashMap<String, f64> = [("xyz:NVDA".to_string(), 2e5), ("xyz:GOLD".to_string(), 1e7)].into();
         for m0 in [thu, sat] {
             let mut c = Closes::default();

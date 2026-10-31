@@ -1,4 +1,4 @@
-//! The 4h squeeze breakout long (`SQZ_ENABLED=1`, with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
+//! The 4h squeeze breakout long (`SQZ_ENABLED`: unset or "1" live, "0" off; with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip):
 //! after each 4h candle's close (UTC 00, 04, ...), a main-dex perp with `SQZ_MIN_VOL_USD` (10M) or more a day is
 //! bought at market when the candle before was a squeeze (the 20-day Bollinger width, std / mean of 120 closes, in its
 //! lowest `SQZ_QUANTILE` (0.2) of the last 120 days) and this candle closed over the upper band (mean + 2 std), while
@@ -14,7 +14,7 @@
 //! trend long at the same drawdown 18%: x33 -> x55 (3 slots; 5 slots worse). HL 2025-10 .. 2026-10: +0.27 R a trade.
 //! Win 40%: the profit is in the few runs.
 //!
-//! The SHORT side (`SQZS_ENABLED`, as the long's: "1" live, unset the trial of 3, "0" off): the mirror, a 4h close under the lower
+//! The SHORT side (`SQZS_ENABLED`, as the long's): the mirror, a 4h close under the lower
 //! band after a squeeze (the lowest `SQZS_QUANTILE` (0.1) width), any BTC; out on a 4h close `SQZS_ATR_K` (2) ATR over the
 //! entry or `SQZS_HOLD_DAYS` (5) on; `SQZS_RISK_SHARE` (1: the family's 2%, the user's call) of the family's risk; at most `SQZS_MAX_OPEN` (3). V144 / V145
 //! (Binance 2020-26): +0.32 R a trade vs -0.04 on random bars, 6 of 7 years (2022 +128 R), +0.36 R on the untouched
@@ -58,7 +58,7 @@ struct Params {
     /// drawdown 10% -> 19%; 0.5 halves it).
     share: f64,
     max_open: usize,
-    /// The trial (`SQZ_ENABLED` unset): its live trades at most.
+    /// The trial (`SQZ_ENABLED` / `SQZS_ENABLED` set empty): its live trades at most.
     trial: Option<u32>,
     /// +1 the breakout long, -1 the breakdown short.
     side: f64,
@@ -73,14 +73,14 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
+            trial: trades::switch_on("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
     }
 
     fn short_from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
+            trial: trades::switch_on("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
     }
 }
 
@@ -350,15 +350,15 @@ impl Squeeze {
     }
 }
 
-/// Starts the squeeze breakout long if `SQZ_ENABLED` is "1" (unset: the trial), and the breakdown short likewise by
-/// `SQZS_ENABLED`.
+/// Starts the squeeze breakout long unless `SQZ_ENABLED` is "0" (unset or "1": live; set empty: the trial), and the
+/// breakdown short likewise by `SQZS_ENABLED`.
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch("SQZ_ENABLED").is_none() {
+    if trades::switch_on("SQZ_ENABLED").is_none() {
         log!("squeeze: off (SQZ_ENABLED=0)");
     } else {
         launch(cfg, store.clone(), Params::from_env()).await?;
     }
-    if trades::switch("SQZS_ENABLED").is_none() {
+    if trades::switch_on("SQZS_ENABLED").is_none() {
         log!("squeeze_short: off (SQZS_ENABLED=0)");
     } else {
         launch(cfg, store, Params::short_from_env()).await?;

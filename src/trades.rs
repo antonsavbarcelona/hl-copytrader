@@ -69,6 +69,17 @@ pub(crate) fn switch(var: &str) -> Option<Option<u32>> {
     }
 }
 
+/// A switch on by default (the trend, the squeeze long / short from 2026-10-31, the user's call: all the strategies live
+/// at the family's 2%): unset or "1" on; set empty the trial of `TRIAL_TRADES`; anything else ("0") off.
+pub(crate) fn switch_on(var: &str) -> Option<Option<u32>> {
+    match std::env::var(var).map(|x| x.trim().to_string()) {
+        Err(_) => Some(None),
+        Ok(x) if x.is_empty() => Some(Some(env_f("TRIAL_TRADES", 3.0) as u32)),
+        Ok(x) if x == "1" => Some(None),
+        _ => None,
+    }
+}
+
 /// Whether one more live trade fits the trial (`used` opened so far; no trial: always).
 pub(crate) fn trial_open(trial: Option<u32>, used: u32) -> bool {
     trial.is_none_or(|n| used < n)
@@ -300,6 +311,21 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_switch_on_by_default() {
+        let v = "TEST_SWITCH_ON_X";
+        // SAFETY: a test-only variable no other code reads.
+        unsafe { std::env::remove_var(v); }
+        assert_eq!(switch_on(v), Some(None));
+        unsafe { std::env::set_var(v, "1"); }
+        assert_eq!(switch_on(v), Some(None));
+        unsafe { std::env::set_var(v, ""); }
+        assert_eq!(switch_on(v), Some(Some(3)));
+        unsafe { std::env::set_var(v, "0"); }
+        assert_eq!(switch_on(v), None);
+        unsafe { std::env::remove_var(v); }
+    }
 
     #[test]
     fn a_coin_shared_by_two_strategies_on_one_side_only() {

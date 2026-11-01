@@ -87,6 +87,15 @@
 //! the spikes Binance did not share (its high < +2% that minute) +265 bp, 98% up; those it shared (+4%+) +67: an HL book's hole, which
 //! is why Binance 2020-26 shows ~0. The HL portfolio (2%, the top 5) x41.7 -> x69.7, the drawdown 26.1% -> 22.8% (a short side: it
 //! hedges the long book); with the HIP-3 session ladder x81.1.
+//! The HIP-3 asks (V263 .. V267): on the picked HIP-3 coins a resting SELL over the minute before's close, short, stop 20%, take = its level:
+//! a US stock while the US market is shut `WICK_H3_ASK_SHUT_PCT` (4, 240 min), while open `WICK_H3_ASK_OPEN_PCT` (7, 60 min); an Asian
+//! stock while the US market is open `WICK_H3_ASIA_ASK_PCT` (3, 60 min); `WICK_H3_ASK_MAX_OPEN` (3) slots. The tape (HL 2025-10 .. 2026-10,
+//! the USDC dexes): the US shut 4% 185 fills +286 bp (t 15.1), 88% up, the halves +247 / +324, w/o the 5 best +276 (53 stocks); the US open
+//! 7% 111 +361 (t 7.6); the Asian 3% 160 +124 (t 6.7); the stop 20% as good as 10% (+238 vs +231 on the bars). And the non-equity bids
+//! (the commodities / FX / the crypto-linked names) while the US market is shut: `WICK_H3_NONEQ_SHUT_PCT` (3) under, take 3%, stop 20%, 240
+//! min, the shut-hours slots; the tape 283 fills +170 bp (t 9.4), the halves +178 / +162. The HL portfolio at 2% over the bot (x81.1): the
+//! US shut asks (the top 10) x133 at the same drawdown 22.8% (h2 x15.0 -> x22.7); + the non-equity bids x200 (h2's drawdown 15.6 -> 14.6%);
+//! + the Asian asks x194; + the US open asks x188.
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -173,6 +182,12 @@ struct Params {
     ask_stop: f64,
     ask_hold_s: f64,
     ask_max_open: usize,
+    /// The HIP-3 asks' levels (0: none) and their slots; the non-equity shut-hours bid.
+    h3_ask_shut_pct: f64,
+    h3_ask_open_pct: f64,
+    asia_ask_pct: f64,
+    h3_ask_max_open: usize,
+    noneq_shut_pct: f64,
 }
 
 impl Params {
@@ -191,7 +206,9 @@ impl Params {
             cry_deep3_pct: v("WICK_DEEP3_PCT", 12.0) / 100.0, cry_deep3_take: v("WICK_DEEP3_TAKE_PCT", 6.0) / 100.0,
             cry_deep3_max_open: v("WICK_DEEP3_MAX_OPEN", 3.0) as usize, h3_session_deep_pct: v("WICK_H3_SESSION_DEEP_PCT", 7.0) / 100.0,
             ask_pct: v("WICK_ASK_PCT", 5.0) / 100.0, ask_coins: v("WICK_ASK_MAX_COINS", 5.0) as usize, ask_take: v("WICK_ASK_TAKE_PCT", 3.0) / 100.0,
-            ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize }
+            ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize,
+            h3_ask_shut_pct: v("WICK_H3_ASK_SHUT_PCT", 4.0) / 100.0, h3_ask_open_pct: v("WICK_H3_ASK_OPEN_PCT", 7.0) / 100.0, asia_ask_pct: v("WICK_H3_ASIA_ASK_PCT", 3.0) / 100.0,
+            h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0 }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -212,7 +229,9 @@ impl Params {
     fn rung_exits(&self, coin: &str, rung: usize, shut: bool, pct: f64) -> (f64, f64, f64) {
         let (take, stop, hold) = self.exits(coin, shut, pct);
         match rung {
+            ASK if coin.contains(':') => (pct, 0.20, if shut { 240.0 * 60.0 } else { 60.0 * 60.0 }),
             ASK => (self.ask_take, self.ask_stop, self.ask_hold_s),
+            0 if shut && crate::wkd::non_equity(coin) => (pct, 0.20, 240.0 * 60.0),
             2 => (self.cry_deep3_take, stop, hold),
             1 if coin.contains(':') && !shut => (pct, stop, hold),
             _ => (take, stop, hold),
@@ -484,7 +503,9 @@ impl Wick {
         if self.p.h3_max_coins > 0 && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in self.h3_picked.clone() {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
-                let shut = self.p.shut_pct(&c, minute);
+                // the non-equity names while the US market is shut: their own level, the shut-hours slots
+                let noneq = self.p.noneq_shut_pct > 0.0 && crate::wkd::non_equity(&c) && crate::wkd::us_shut(minute);
+                let shut = if noneq { Some(self.p.noneq_shut_pct) } else { self.p.shut_pct(&c, minute) };
                 // the shut-hours trades their own slots (held up to a day, they would keep the 4% bids off)
                 let room = if shut.is_some() { n_shut < self.p.shut_max_open } else { n_h3 < self.p.h3_max_open };
                 if room && free(&c) {
@@ -567,19 +588,37 @@ impl Wick {
     /// the coin not hot, while their slots last.
     fn wanted_asks(&self, minute: i64) -> HashMap<String, (f64, f64, bool)> {
         let mut out = HashMap::new();
-        if self.p.ask_pct <= 0.0 || self.state.asks_open.len() >= self.p.ask_max_open || !self.btc_calm(minute) || !trades::trial_open(self.p.trial, self.state.opened) {
-            return out;
-        }
         let (risk, t) = (trades::risk_usd(self.p.risk_usd), now());
-        for c in self.picked.iter().take(self.p.ask_coins) {
-            let (Some(close), o) = (self.closes.at(c, minute - 1), self.oracle.get(c).copied().unwrap_or(0.0)) else { continue };
-            if !self.state.asks_open.iter().any(|x| &x.coin == c)
+        let free = |c: &str| {
+            !self.state.asks_open.iter().any(|x| x.coin == c)
                 && (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
                 && self.state.ask_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
                 && trades::can_open(c, KINDS[ASK], -1.0, risk)
-                && !self.hot(c, minute)
-            {
-                out.insert(c.clone(), (close.max(o) * (1.0 + self.p.ask_pct), self.p.ask_pct, false));
+        };
+        let n_h3 = self.state.asks_open.iter().filter(|x| x.coin.contains(':')).count();
+        if self.p.ask_pct > 0.0 && self.state.asks_open.len() - n_h3 < self.p.ask_max_open && self.btc_calm(minute) && trades::trial_open(self.p.trial, self.state.opened) {
+            for c in self.picked.iter().take(self.p.ask_coins) {
+                let (Some(close), o) = (self.closes.at(c, minute - 1), self.oracle.get(c).copied().unwrap_or(0.0)) else { continue };
+                if free(c) && !self.hot(c, minute) {
+                    out.insert(c.clone(), (close.max(o) * (1.0 + self.p.ask_pct), self.p.ask_pct, false));
+                }
+            }
+        }
+        // the HIP-3 asks: a US stock shut / open, an Asian stock while the US market is open
+        if n_h3 < self.p.h3_ask_max_open && trades::trial_open(self.p.trial, self.state.h3_opened) {
+            let shut = crate::wkd::us_shut(minute);
+            for c in &self.h3_picked {
+                let Some(close) = self.closes.at(c, minute - 1) else { continue };
+                let pct = if crate::wkd::us_stock(c) {
+                    if shut { self.p.h3_ask_shut_pct } else { self.p.h3_ask_open_pct }
+                } else if crate::wkd::asian_stock(c) && !shut {
+                    self.p.asia_ask_pct
+                } else {
+                    0.0
+                };
+                if pct > 0.0 && free(c) {
+                    out.insert(c.clone(), (close * (1.0 + pct), pct, shut && crate::wkd::us_stock(c)));
+                }
             }
         }
         out
@@ -1007,6 +1046,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 крипта, выносы вверх: лимитка на ПРОДАЖУ на {:.0}% выше на {} самых дёрганых монетах (шорт), тейк −{:.0}%, стоп +{:.0}%, выход через {:.0} мин, до {} позиций",
             p.ask_pct * 100.0, p.ask_coins, p.ask_take * 100.0, p.ask_stop * 100.0, p.ask_hold_s / 60.0, p.ask_max_open));
     }
+    if p.h3_ask_shut_pct > 0.0 || p.h3_ask_open_pct > 0.0 || p.asia_ask_pct > 0.0 || p.noneq_shut_pct > 0.0 {
+        crate::notify::send(format!("🎣 HIP-3 выносы вверх: лимитка на ПРОДАЖУ у акций США на {:.0}% выше, пока биржа закрыта, и на {:.0}% в сессию, у азиатских на {:.0}% в часы США (шорт, тейк = отступ, стоп 20%, до {} позиций); сырьё и крипто-связанные: покупка на {:.0}% ниже, пока биржа США закрыта",
+            p.h3_ask_shut_pct * 100.0, p.h3_ask_open_pct * 100.0, p.asia_ask_pct * 100.0, p.h3_ask_max_open, p.noneq_shut_pct * 100.0));
+    }
     if p.h3_session_deep_pct > 0.0 {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
             p.h3_session_deep_pct * 100.0, p.stop * 100.0, p.hold_s / 60.0));
@@ -1102,6 +1145,11 @@ mod tests {
         assert!((p.cry_deep_pct - 0.10).abs() < 1e-12 && p.cry_deep_coins == 10 && p.cry_deep_max_open == 3);
         let (take, stop, hold) = p.exits("SOL", false, p.cry_deep_pct);
         assert!((take - 0.05).abs() < 1e-12 && (stop - 0.20).abs() < 1e-12 && (hold - 3600.0).abs() < 1e-9);
+        // the HIP-3 asks: take = the level, stop 20%, 240 min shut / 60 min open; the non-equity shut bids 3%, 240 min
+        assert_eq!(p.rung_exits("xyz:NVDA", ASK, true, p.h3_ask_shut_pct), (0.04, 0.20, 14_400.0));
+        assert_eq!(p.rung_exits("xyz:NVDA", ASK, false, p.h3_ask_open_pct), (0.07, 0.20, 3_600.0));
+        assert_eq!(p.rung_exits("xyz:GOLD", 0, true, p.noneq_shut_pct), (0.03, 0.20, 14_400.0));
+        assert!(crate::wkd::non_equity("xyz:GOLD") && crate::wkd::asian_stock("xyz:SMSN") && !crate::wkd::non_equity("xyz:NVDA"));
         // the asks: 5% over on the 5 most restless, take 3%, stop 10%, 240 min, 2 slots; the HIP-3 session ladder 7%, take = its level
         assert!((p.ask_pct - 0.05).abs() < 1e-12 && p.ask_coins == 5 && p.ask_max_open == 2);
         assert_eq!(p.rung_exits("SOL", ASK, false, p.ask_pct), (0.03, 0.10, 14_400.0));

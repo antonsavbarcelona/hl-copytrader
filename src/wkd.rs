@@ -169,6 +169,25 @@ pub(crate) fn us_stock(coin: &str) -> bool {
     tradable(coin) && coin.split_once(':').is_some_and(|(_, n)| !NON_US.contains(&n))
 }
 
+/// The Asian stocks (their markets shut while the US one is open).
+const ASIAN: &[&str] = &["CXMT", "DRAM", "EWJ", "EWT", "GIGADEV", "HYUNDAI", "JP225", "KIOXIA", "KORU", "EWY", "KR200", "MINIMAX", "SKHX", "SKHY",
+    "SMSN", "SOFTBANK", "UNITREE", "ZHIPU"];
+
+/// An Asian stock of a USDC dex.
+pub(crate) fn asian_stock(coin: &str) -> bool {
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && ASIAN.contains(&n))
+}
+
+/// A non-equity name of a USDC dex: the commodities, FX, the rates and the crypto-linked ones.
+pub(crate) fn non_equity(coin: &str) -> bool {
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && EXCLUDED.contains(&n))
+}
+
+/// The US market shut: the UTC weekend, the US weeknights, Sunday night in New York.
+pub(crate) fn us_shut(minute: i64) -> bool {
+    weekend(minute) || us_night(minute) || us_sunday_night(minute)
+}
+
 impl Book {
     /// One poll: `lows` the current minute's lowest mid a coin; the events to log and the paper entries made now (coin,
     /// px: the live buys). `minute` the current minute, `t` now (s).

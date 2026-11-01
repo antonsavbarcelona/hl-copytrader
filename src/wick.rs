@@ -273,7 +273,6 @@ fn message(ev: &Value) -> Option<String> {
 
 struct Wick {
     venue: Venue,
-    max_lev: HashMap<String, u32>,
     unified: bool,
     api: Api,
     cfg: Config,
@@ -285,7 +284,6 @@ struct Wick {
     volume: HashMap<String, f64>,
     h3_volume: HashMap<String, f64>,
     held: HashMap<String, f64>,
-    lev_set: HashSet<String>,
     /// The coins bid on (crypto, HIP-3), picked every `VOLUME_EVERY_S`; the coins whose candles were read.
     picked: Vec<String>,
     h3_picked: Vec<String>,
@@ -568,12 +566,6 @@ impl Wick {
                 self.book(deep).remove(&c);
                 changed = true;
             }
-            if c.contains(':') {
-                if let Err(e) = trades::h3_leverage(&self.venue, &c, self.max_lev.get(&c).copied().unwrap_or(1), &mut self.lev_set).await {
-                    log!("wick: {c} leverage not set: {e:#}");
-                    continue;
-                }
-            }
             let t_sent = now();
             let placed = self.venue.limit(&c, size, lvl, false, "Alo").await;
             let t_ack = now();
@@ -805,16 +797,16 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         return Ok(());
     };
     let p = Params::from_env();
-    let (venue, max_lev) = if p.h3_max_coins > 0 {
+    let venue = if p.h3_max_coins > 0 {
         match core.with_hip3().await {
-            Ok(x) => x,
+            Ok(x) => x.0,
             Err(e) => {
                 log!("wick: the HIP-3 perps not read, the main dex only: {e:#}");
-                (core.clone(), HashMap::new())
+                core.clone()
             }
         }
     } else {
-        (core.clone(), HashMap::new())
+        core.clone()
     };
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     if state.trial_round < TRIAL_ROUND {
@@ -847,8 +839,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 крипта, лесенка: вторая лимитка на {:.0}% ниже на {} самых дёрганых монетах, тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, до {} позиций",
             p.cry_deep_pct * 100.0, p.cry_deep_coins, p.take * 100.0, p.stop * 100.0, p.hold_s / 60.0, p.cry_deep_max_open));
     }
-    let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
-        volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new(),
+    let mut w = Wick { venue, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
+        volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
         picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     tokio::spawn(async move {

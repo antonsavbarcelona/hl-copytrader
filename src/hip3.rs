@@ -191,7 +191,6 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut checked = false;
         let started = now();
-        let mut lev_set: std::collections::HashSet<String> = Default::default();
         let mut pos_at = 0.0;
         let mut wkd_pos_at = 0.0;
         let event = |store: &Store, mut ev: Value| {
@@ -265,7 +264,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 event(&store, ev);
             }
             // Traded (WKD_LIVE): bought at the paper entry, within the trial, the slots and the family's cap.
-            if let Some((v, max_lev)) = &venue {
+            if let Some((v, _)) = &venue {
                 for (coin, px) in wentries {
                     let Some(trial) = wp.live else { continue };
                     if !crate::trades::trial_open(trial, state.wkd.opened) {
@@ -279,10 +278,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     }
                     let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
                     let size = crate::trades::size_for(risk, wp.stop(), mid);
-                    let r = async {
-                        crate::trades::h3_leverage(v, &coin, max_lev.get(&coin).copied().unwrap_or(1), &mut lev_set).await?;
-                        crate::trades::open_market(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s()).await
-                    }.await;
+                    let r = crate::trades::open_market(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s()).await;
                     match r {
                         Ok(tr) => {
                             event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "size": tr.size, "notional": tr.size * tr.entry_px,
@@ -375,7 +371,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         "btc": closes.change("BTC", minute - 1, w)}));
                     changed = true;
                     // Traded (HIP3_LIVE on): a coin of a USDC dex, within the limits.
-                    let Some((v, max_lev)) = &venue else { continue };
+                    let Some((v, _)) = &venue else { continue };
                     if !crate::trades::trial_open(p.trial, state.opened) {
                         log!("hip3: {coin} not traded (the trial's {} trades done)", state.opened);
                         continue;
@@ -386,10 +382,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                         continue;
                     }
                     let size = crate::trades::size_for(risk, p.stop, mid);
-                    let r = async {
-                        crate::trades::h3_leverage(v, &coin, max_lev.get(&coin).copied().unwrap_or(1), &mut lev_set).await?;
-                        crate::trades::open_market(v, &coin, size, p.stop, None, p.hold_s).await
-                    }.await;
+                    let r = crate::trades::open_market(v, &coin, size, p.stop, None, p.hold_s).await;
                     match r {
                         Ok(tr) => {
                             event(&store, json!({"what": "open", "coin": coin, "fall": fall, "window": w, "mid": mid, "px": tr.entry_px, "size": tr.size,

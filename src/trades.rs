@@ -2,11 +2,9 @@
 //! listing short): a position with its resting stop (and take) on the exchange and an exit time.
 //! A trade is opened at market (`open_market`) or from a bid's fill (`protect`); out at market
 //! when its time is up (`close`); a position gone from the account (its stop or take filled, a
-//! liquidation) ends it (`gone`). The HIP-3 perps go cross at `H3_LEVERAGE` (10; the coin's max when
-//! lower) first; a coin the dex keeps isolated only at `H3_ISOLATED_LEVERAGE` (3), so its stop is hit before
-//! its liquidation.
-
-use std::collections::HashSet;
+//! liquidation) ends it (`gone`). Every coin goes cross at its max leverage before its first opening order
+//! (`Venue::ensure_leverage`); a HIP-3 coin the dex keeps isolated only at `H3_ISOLATED_LEVERAGE` (3), so its stop is
+//! hit before its liquidation.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,10 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::api::now;
 use crate::live::{Placed, Venue};
 
-/// The HIP-3 perps' leverage: cross at 10 (2026-10-28, V77: the bids' margin a third of the isolated 3x's, so the
-/// family's margin no longer skips trades at a higher risk; on cross the liquidation is the account's, far past the
-/// stops within the family's cap); a coin only isolated at 3 (the liquidation ~30% away, past the 20-25% stops).
-pub(crate) const H3_LEVERAGE: u32 = 10;
+/// A HIP-3 coin only isolated: at 3 (the liquidation ~30% away, past the 20-25% stops). The cross ones at their max
+/// (2026-11-01; was 10 from 2026-10-28, V77: the bids' margin a third of the isolated 3x's; on cross the liquidation is
+/// the account's, far past the stops within the family's cap).
 pub(crate) const H3_ISOLATED_LEVERAGE: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -208,20 +205,6 @@ pub(crate) fn sizing_label(usd: f64, stop: f64) -> String {
 /// The size for a `risk_usd` loss at a `stop` (fraction) from `px`: positive.
 pub(crate) fn size_for(risk_usd: f64, stop: f64, px: f64) -> f64 {
     if px > 0.0 && stop > 0.0 { risk_usd / stop / px } else { 0.0 }
-}
-
-/// Sets a HIP-3 coin's leverage once (`done` remembers the coins set): cross at `H3_LEVERAGE` (the coin's max when
-/// lower); refused (a coin the dex keeps isolated only): isolated at `H3_ISOLATED_LEVERAGE`.
-pub(crate) async fn h3_leverage(v: &Venue, coin: &str, max_lev: u32, done: &mut HashSet<String>) -> Result<()> {
-    if !coin.contains(':') || done.contains(coin) {
-        return Ok(());
-    }
-    if let Err(e) = v.leverage(coin, H3_LEVERAGE.min(max_lev.max(1)), true).await {
-        crate::log!("trades: {coin} cross refused ({e:#}): isolated {H3_ISOLATED_LEVERAGE}x");
-        v.leverage(coin, H3_ISOLATED_LEVERAGE.min(max_lev.max(1)), false).await?;
-    }
-    done.insert(coin.to_string());
-    Ok(())
 }
 
 /// The stop (and the take, a resting reduce-only limit) for a position of `size` (signed) filled at

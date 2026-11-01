@@ -180,6 +180,10 @@ pub(crate) struct Venue {
     mids: Arc<std::sync::RwLock<HashMap<String, f64>>>,
     /// Our account (its orders' status).
     pub(crate) account: String,
+    /// Coin -> its max leverage (the main dex's and, after `with_hip3`, the HIP-3 perps'), and the coins whose leverage
+    /// this venue has set (`ensure_leverage`).
+    max_lev: Arc<HashMap<String, u32>>,
+    lev_set: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Venue {
@@ -202,10 +206,38 @@ impl Venue {
         Ok(m)
     }
 
+    /// The coin's leverage at its max on cross, once a venue (2026-11-01, the user's call: the margin an order holds is its
+    /// notional / the leverage, and on cross the liquidation is the account's, not the leverage's: the max saves margin and
+    /// the risk stays the stops'). A coin the dex keeps isolated only: isolated at `H3_ISOLATED_LEVERAGE` (3), the
+    /// liquidation ~30% away, past the stops. Not set on the main dex (an error): the order goes on at the account's
+    /// leverage; a HIP-3 coin neither cross nor isolated took: the error.
+    pub(crate) async fn ensure_leverage(&self, coin: &str) -> Result<()> {
+        if self.lev_set.lock().unwrap().contains(coin) {
+            return Ok(());
+        }
+        let Some(max) = self.max_lev.get(coin).copied().filter(|x| *x > 0) else {
+            self.lev_set.lock().unwrap().insert(coin.to_string());
+            return Ok(());
+        };
+        if let Err(e) = self.leverage(coin, max, true).await {
+            if !coin.contains(':') {
+                log!("live: {coin} leverage {max}x cross not set: {e:#}");
+                return Ok(());
+            }
+            log!("live: {coin} cross refused ({e:#}): isolated {}x", crate::trades::H3_ISOLATED_LEVERAGE.min(max));
+            self.leverage(coin, crate::trades::H3_ISOLATED_LEVERAGE.min(max), false).await?;
+        }
+        self.lev_set.lock().unwrap().insert(coin.to_string());
+        Ok(())
+    }
+
     /// A market order (IOC through the mid): the size filled (signed), its average price and
-    /// its order id.
+    /// its order id. An opening one: the coin's leverage first (`ensure_leverage`).
     pub(crate) async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
         let (asset, dec) = self.coins[coin];
+        if !reduce {
+            self.ensure_leverage(coin).await?;
+        }
         let mid = self.mid(coin).await?;
         let buy = size > 0.0;
         let sz = round_size(size.abs(), dec);
@@ -276,9 +308,13 @@ impl Venue {
         Ok(r["data"]["statuses"][0]["resting"]["oid"].as_u64().map(|o| (o, px)))
     }
 
-    /// A limit order for `size` (signed) at `px` (`tif` "Gtc" / "Alo" / "Ioc"): what it did.
+    /// A limit order for `size` (signed) at `px` (`tif` "Gtc" / "Alo" / "Ioc"): what it did. An opening one: the
+    /// coin's leverage first (`ensure_leverage`).
     pub(crate) async fn limit(&self, coin: &str, size: f64, px: f64, reduce: bool, tif: &str) -> Result<Placed> {
         let (asset, dec) = self.coins[coin];
+        if !reduce {
+            self.ensure_leverage(coin).await?;
+        }
         let sz = round_size(size.abs(), dec);
         if sz <= 0.0 {
             bail!("{coin}: size {size} rounds to 0");
@@ -300,7 +336,7 @@ impl Venue {
     pub(crate) async fn with_hip3(&self) -> Result<(Venue, HashMap<String, u32>)> {
         let dexes = self.ex.info(json!({"type": "perpDexs"})).await.context("perpDexs")?;
         let mut coins = (*self.coins).clone();
-        let mut max_lev = HashMap::new();
+        let mut max_lev = (*self.max_lev).clone();
         for (di, d) in dexes.as_array().into_iter().flatten().enumerate() {
             let Some(name) = d["name"].as_str() else { continue };
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -323,7 +359,7 @@ impl Venue {
                 max_lev.insert(n.to_string(), u["maxLeverage"].as_u64().unwrap_or(1) as u32);
             }
         }
-        Ok((Venue { coins: Arc::new(coins), ..self.clone() }, max_lev))
+        Ok((Venue { coins: Arc::new(coins), max_lev: Arc::new(max_lev.clone()), ..self.clone() }, max_lev))
     }
 
     /// The account's positions on a HIP-3 dex (coin -> signed size).
@@ -629,7 +665,14 @@ pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Op
         .filter_map(|(i, u)| Some((u["name"].as_str()?.to_string(), (i as u32, u["szDecimals"].as_u64()? as u32))))
         .collect::<HashMap<_, _>>();
     let unified = ex.info(json!({"type": "userAbstraction", "user": account})).await.map(|v| v == "unifiedAccount").unwrap_or(false);
-    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account }, unified)))
+    let max_lev = Arc::new(max_leverage(&meta));
+    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account, max_lev, lev_set: Default::default() }, unified)))
+}
+
+/// A meta's coins' max leverage.
+fn max_leverage(meta: &Value) -> HashMap<String, u32> {
+    meta["universe"].as_array().into_iter().flatten()
+        .filter_map(|u| Some((u["name"].as_str()?.to_string(), u["maxLeverage"].as_u64()? as u32))).collect()
 }
 
 /// Starts the live trader if `LIVE_ENABLED` is "1" (or `force`, for `live-check`) and
@@ -662,7 +705,8 @@ pub async fn start(cfg: &Config, store: Store, force: bool, books: Option<crate:
     let status = Arc::new(Mutex::new(json!({})));
     let (stx, mut srx) = mpsc::unbounded_channel::<StopPlaced>();
     let (ctx, mut crx) = mpsc::unbounded_channel::<LimitClosed>();
-    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account: account.clone() };
+    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account: account.clone(), max_lev: Arc::new(max_leverage(&meta)),
+        lev_set: Default::default() };
     let limits = Limits::from_env(cfg);
     log!("live: entries {}% each{}; exits {}", limits.risk, if limits.rank_weight { " times the trader's weight by his place" } else { "" },
         if limits.exit_limit_s > 0.0 { format!("post-only, at market after {} s", limits.exit_limit_s) } else { "at market".into() });

@@ -120,7 +120,7 @@ pub(crate) struct Book {
 }
 
 /// Saturday or Sunday (UTC) for an epoch minute.
-fn weekend(minute: i64) -> bool {
+pub(crate) fn weekend(minute: i64) -> bool {
     (minute.div_euclid(1440) + 3).rem_euclid(7) >= 5
 }
 
@@ -145,7 +145,7 @@ fn us_dst(day: i64) -> bool {
 }
 
 /// A US weeknight (the cash market shut): Mon-Thu 20:00 .. the next day's 04:00, New York time.
-fn us_night(minute: i64) -> bool {
+pub(crate) fn us_night(minute: i64) -> bool {
     let et = minute - if us_dst(minute.div_euclid(1440)) { 240 } else { 300 };
     let (wd, m) = ((et.div_euclid(1440) + 3).rem_euclid(7), et.rem_euclid(1440));
     (wd <= 3 && m >= 1200) || ((1..=4).contains(&wd) && m < 240)
@@ -157,7 +157,7 @@ fn tradable(coin: &str) -> bool {
 }
 
 /// A tradable US stock (for the nights).
-fn us_stock(coin: &str) -> bool {
+pub(crate) fn us_stock(coin: &str) -> bool {
     tradable(coin) && coin.split_once(':').is_some_and(|(_, n)| !NON_US.contains(&n))
 }
 

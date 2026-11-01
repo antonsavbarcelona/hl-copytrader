@@ -45,6 +45,16 @@
 //! the mid now, the reason, our clock at the level's calculation, the order's send and the exchange's answer, the
 //! quotes' age); `wickwatch` logs the exchange's side (orderUpdates, userFills) and the research's shadow.
 //!
+//! The shut hours (2026-11-01, V197 .. V201): while the US market is shut - Saturday / Sunday UTC and the US weeknights
+//! (Mon-Thu 20:00 .. 04:00 New York time; `wkd`'s clock) - a picked US stock (`wkd::us_stock`) is bid closer:
+//! `WICK_H3_WKD_PCT` (2.5) on the weekend, `WICK_H3_NIGHT_PCT` (3) at night; that trade's take = its level, its stop
+//! 2.5x it, its hold `WICK_H3_SHUT_HOLD_H` (24) h, at most `WICK_H3_SHUT_MAX_OPEN` (3) of them besides the HIP-3 slots. The tape (HL 2025-12 .. 2026-10, the US stocks of the USDC dexes, a fill
+//! only when a print trades under the bid; maker in, the take maker, else taker out): the weekend 2.5% 187 fills +154 bp
+//! (t 9.4), 88% up, w/o the 10 best stocks +131; the night 3% 102 fills +167 bp, w/o the 10 best +126; the same bids in
+//! the session / the pre-market lose. The top 10 by the deviation (this pick) hold 64% (the weekend) / 43% (the night) of
+//! the sum. On the HL portfolio at 2% (3 slots) with this pick's fills (the top 10) x13.4 -> x21.7 at the same drawdown 28%
+//! (h1 +9%, h2 +23%; the top 20 x26.8; all the US stocks x32.8).
+//!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
 use std::collections::{HashMap, HashSet};
@@ -99,6 +109,11 @@ struct Params {
     by_spread: bool,
     /// `WICK_HOT_X` (2.5; 0: off): no crypto bid while the last hour's 1-minute deviation is over this many times the day's.
     hot_x: f64,
+    /// The US stocks' levels while the US market is shut (the weekend, the nights) and those trades' hold.
+    h3_wkd_pct: f64,
+    h3_night_pct: f64,
+    shut_hold_s: f64,
+    shut_max_open: usize,
 }
 
 impl Params {
@@ -109,7 +124,26 @@ impl Params {
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
-            by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true), hot_x: v("WICK_HOT_X", 2.5) }
+            by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true), hot_x: v("WICK_HOT_X", 2.5),
+            h3_wkd_pct: v("WICK_H3_WKD_PCT", 2.5) / 100.0, h3_night_pct: v("WICK_H3_NIGHT_PCT", 3.0) / 100.0, shut_hold_s: v("WICK_H3_SHUT_HOLD_H", 24.0) * 3600.0,
+            shut_max_open: v("WICK_H3_SHUT_MAX_OPEN", 3.0) as usize }
+    }
+
+    /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend or a US night), else None.
+    fn shut_pct(&self, coin: &str, minute: i64) -> Option<f64> {
+        if !crate::wkd::us_stock(coin) {
+            return None;
+        }
+        if crate::wkd::weekend(minute) { Some(self.h3_wkd_pct) } else if crate::wkd::us_night(minute) { Some(self.h3_night_pct) } else { None }
+    }
+
+    /// A trade's (take, stop, hold s): a shut-hours bid's at its level `pct`, else the side's.
+    fn exits(&self, coin: &str, shut: bool, pct: f64) -> (f64, f64, f64) {
+        if shut {
+            (pct, 2.5 * pct, self.shut_hold_s)
+        } else {
+            (if coin.contains(':') { self.h3_take } else { self.take }, self.stop, self.hold_s)
+        }
     }
 }
 
@@ -118,6 +152,11 @@ struct Bid {
     oid: u64,
     px: f64,
     size: f64,
+    /// The level under the anchor, and whether a shut-hours bid (its own exits).
+    #[serde(default)]
+    pct: f64,
+    #[serde(default)]
+    shut: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -235,14 +274,21 @@ impl Wick {
         self.store.event(ev);
     }
 
+    /// The open trades: (crypto, HIP-3, the HIP-3 shut-hours ones; a shut one: held over twice the side's hold).
+    fn counts(&self) -> (usize, usize, usize) {
+        let shut = |x: &Trade| x.coin.contains(':') && x.exit_at - x.at > 2.0 * self.p.hold_s;
+        let n_shut = self.state.open.iter().filter(|x| shut(x)).count();
+        let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count() - n_shut;
+        (self.state.open.len() - n_h3 - n_shut, n_h3, n_shut)
+    }
+
     /// Why `coin` gets no bid now (the checks of `wanted`, in its order).
     fn why_not(&self, c: &str, minute: i64) -> &'static str {
         let h3 = c.contains(':');
-        let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count();
-        let n_crypto = self.state.open.len() - n_h3;
+        let (n_crypto, n_h3, n_shut) = self.counts();
         if h3 {
             if !self.h3_picked.iter().any(|x| x == c) { return "unpicked"; }
-            if n_h3 >= self.p.h3_max_open { return "slots"; }
+            if self.p.shut_pct(c, minute).map_or(n_h3 >= self.p.h3_max_open, |_| n_shut >= self.p.shut_max_open) { return "slots"; }
             if !trades::trial_open(self.p.trial, self.state.h3_opened) { return "trial"; }
         } else {
             if !self.btc_calm(minute) { return "btc"; }
@@ -311,10 +357,10 @@ impl Wick {
         }
     }
 
-    fn wanted(&self, minute: i64) -> HashMap<String, f64> {
+    /// The coins to bid now: (the level, its pct under the anchor, a shut-hours bid).
+    fn wanted(&self, minute: i64) -> HashMap<String, (f64, f64, bool)> {
         let mut out = HashMap::new();
-        let n_h3 = self.state.open.iter().filter(|x| x.coin.contains(':')).count();
-        let n_crypto = self.state.open.len() - n_h3;
+        let (n_crypto, n_h3, n_shut) = self.counts();
         let risk = trades::risk_usd(self.p.risk_usd);
         let t = now();
         let free = |c: &str| {
@@ -329,14 +375,18 @@ impl Wick {
                     continue;
                 }
                 let anchor = if o > 0.0 { close.min(o) } else { close };
-                out.insert(c, level(anchor, self.p.pct));
+                out.insert(c, (level(anchor, self.p.pct), self.p.pct, false));
             }
         }
-        if self.p.h3_max_coins > 0 && n_h3 < self.p.h3_max_open && trades::trial_open(self.p.trial, self.state.h3_opened) {
+        if self.p.h3_max_coins > 0 && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in self.h3_picked.clone() {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
-                if free(&c) {
-                    out.insert(c, level(close, self.p.h3_pct));
+                let shut = self.p.shut_pct(&c, minute);
+                // the shut-hours trades their own slots (held up to a day, they would keep the 4% bids off)
+                let room = if shut.is_some() { n_shut < self.p.shut_max_open } else { n_h3 < self.p.h3_max_open };
+                if room && free(&c) {
+                    let pct = shut.unwrap_or(self.p.h3_pct);
+                    out.insert(c, (level(close, pct), pct, shut.is_some()));
                 }
             }
         }
@@ -412,11 +462,12 @@ impl Wick {
                 changed = true;
             }
         }
-        for (c, lvl) in want {
-            let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.stop, lvl);
+        for (c, (lvl, pct, shut)) in want {
+            let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.exits(&c, shut, pct).1, lvl);
             let mut old = None;
             if let Some(b) = self.state.bids.get(&c).cloned() {
-                if !drifted(b.px, lvl, self.p.reprice, self.p.reprice_down) {
+                // the level's kind changed (the US market shut or open again): moved whichever way
+                if b.shut == shut && !drifted(b.px, lvl, self.p.reprice, self.p.reprice_down) {
                     continue;
                 }
                 let t_sent = now();
@@ -443,12 +494,12 @@ impl Wick {
                 Err(e) => ("error", None, Some(format!("{e:#}"))),
             };
             self.trace(json!({"what": "place", "coin": c, "oid": oid, "result": result, "error": err, "px": lvl, "size": size, "old_px": old,
-                "pct": if c.contains(':') { self.p.h3_pct } else { self.p.pct }, "anchor_close": self.closes.at(&c, minute - 1),
+                "pct": pct, "shut": shut, "anchor_close": self.closes.at(&c, minute - 1),
                 "oracle": (!c.contains(':')).then(|| self.oracle.get(&c).copied()).flatten(), "mid": self.closes.at(&c, i64::MAX),
                 "mids_age_s": t_sent - self.mids_at, "ctx_age_s": t_sent - self.ctx_at, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_ack": t_ack}));
             match placed {
                 Ok(Placed::Resting(oid)) => {
-                    self.state.bids.insert(c.clone(), Bid { oid, px: lvl, size });
+                    self.state.bids.insert(c.clone(), Bid { oid, px: lvl, size, pct, shut });
                     crate::wickwatch::set_bid(&c, Some(crate::wickwatch::BidView { px: lvl, oid, since: t_ack }));
                     changed = true;
                 }
@@ -465,6 +516,7 @@ impl Wick {
     /// A bid filled for `got` at `px`: the trade protected (or out again).
     async fn filled(&mut self, coin: &str, got: f64, px: f64) {
         let oid = self.state.bids.get(coin).map(|b| b.oid);
+        let (bpct, shut) = self.state.bids.get(coin).map_or((0.0, false), |b| (b.pct, b.shut));
         self.trace(json!({"what": "fill", "coin": coin, "oid": oid, "got": got, "px": px, "t_detect": now()}));
         crate::wickwatch::set_bid(coin, None);
         self.state.bids.remove(coin);
@@ -479,11 +531,12 @@ impl Wick {
         if !trades::trial_open(self.p.trial, n) {
             crate::notify::send(format!("🏁 проколы ({side}): проба окончена ({n} сделки), лимитки сняты"));
         }
-        let (pct, take) = if coin.contains(':') { (self.p.h3_pct, self.p.h3_take) } else { (self.p.pct, self.p.take) };
-        match trades::protect(&self.venue, coin, got, px, self.p.stop, Some(take), self.p.hold_s).await {
+        let pct = if bpct > 0.0 { bpct } else if coin.contains(':') { self.p.h3_pct } else { self.p.pct };
+        let (take, stop, hold_s) = self.p.exits(coin, shut, pct);
+        match trades::protect(&self.venue, coin, got, px, stop, Some(take), hold_s).await {
             Ok(tr) => {
-                self.event(json!({"what": "open", "coin": coin, "pct": pct, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
-                    "stop_px": tr.stop_px, "hold_min": self.p.hold_s / 60.0}));
+                self.event(json!({"what": "open", "coin": coin, "pct": pct, "shut": shut, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
+                    "stop_px": tr.stop_px, "hold_min": hold_s / 60.0}));
                 trades::register(coin, "wick", tr.risk(), tr.size);
                 self.state.open.push(tr);
             }
@@ -674,6 +727,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open,
         if p.by_spread { "самые дёрганые за сутки (по разбросу минутных движений)" } else { "с наибольшим оборотом" })
         + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));
+    crate::notify::send(format!("🎣 акции США, пока биржа закрыта: лимитка на {:.1}% ниже в выходные и на {:.0}% ночью, тейк = отступ, стоп ×2.5, до {:.0} ч, до {} позиций",
+        p.h3_wkd_pct * 100.0, p.h3_night_pct * 100.0, p.shut_hold_s / 3600.0, p.shut_max_open));
     let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new(),
         picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
@@ -738,6 +793,23 @@ mod tests {
         let (h, d) = (c.spread("X", 1499, 60, 30), c.spread("X", 1499, 1440, 600));
         assert!(is_hot(h, d, 2.5), "{h:?} {d:?}");
         assert!(!is_hot(c.spread("X", 1400, 60, 30), c.spread("X", 1400, 1440, 600), 2.5));
+    }
+
+    #[test]
+    fn the_shut_hours_bids() {
+        let p = Params::from_env();
+        // Sat 2026-10-31 00:10 UTC; Wed 22:00 EDT (Thu 02:00 UTC); Thu 11:00 EDT (15:00 UTC, the session)
+        let (sat, night, sess) = (29_890_090, 29_887_320, 29_888_100);
+        assert_eq!(p.shut_pct("xyz:NVDA", sat), Some(0.025));
+        assert_eq!(p.shut_pct("xyz:NVDA", night), Some(0.03));
+        assert_eq!(p.shut_pct("xyz:NVDA", sess), None);
+        assert_eq!(p.shut_pct("xyz:SKHX", night), None);       // Seoul open then
+        assert_eq!(p.shut_pct("xyz:GOLD", sat), None);         // not a stock
+        assert_eq!(p.shut_pct("BTC", sat), None);
+        let (take, stop, hold) = p.exits("xyz:NVDA", true, 0.03);
+        assert!((take - 0.03).abs() < 1e-12 && (stop - 0.075).abs() < 1e-12 && (hold - 86_400.0).abs() < 1e-9);
+        assert_eq!(p.exits("xyz:NVDA", false, 0.04), (p.h3_take, p.stop, p.hold_s));
+        assert_eq!(p.exits("ETH", false, 0.07), (p.take, p.stop, p.hold_s));
     }
 
     #[test]

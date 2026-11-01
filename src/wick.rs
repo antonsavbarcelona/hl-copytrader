@@ -101,6 +101,12 @@
 //! `wickm`. Binance 1m 2020-26 (the bars, the hot filter): 251 fills +120 bp (t 3.1), 82% up, every one of the 7 years up (3%: 566 +98, 2025
 //! -16); HL 2025-05 .. 2026-10 (the bars) 18 fills +303 bp, 94% up, both years up; the Binance portfolio (the bot's set, 2%) at the same
 //! drawdown 2020-23 +15..22%, 2023-26 +15%. The first crypto rule of the round that both venues and six years agree on.
+//! The low-volume bids (V280 .. V283): the `WICK_LOWVOL_MAX_COINS` (20) most restless of the coins under the $10M floor (a day volume of
+//! `WICK_LOWVOL_MIN_VOL_USD` $1M+; thinner books, more HL-only wicks) bid `WICK_LOWVOL_PCT` (7) under the crypto anchor, the crypto exits (take
+//! 5%, stop 20%, 60 min), `WICK_LOWVOL_MAX_OPEN` (3) slots, the BTC / hot checks, the registry's `wickl`. The tape (HL 2025-05 .. 2026-10): the
+//! $3-10M band 177 fills +339 bp (t 9.8), 89% up, the halves +457 / +223, w/o the 10 best coins +283 (92 coins); the $1-3M band 200 +273 (t 6.6);
+//! Binance 1m (its $10-30M / $3-10M bands) 231 +223 (t 5.8) / 146 +200, every year with fills since 2022 up; the HL portfolio (2%) x410 ->
+//! x958 at the drawdown 22.8 -> 21.5% (1%: x22.8 -> x35.1, the drawdown 12.4 -> 14.3%).
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -122,10 +128,11 @@ const DOC: &str = "wick";
 /// The ladder's trades in the family's registry: a strategy of their own, so a coin holds a shallow and a deep one.
 const DEEP: &str = "wick2";
 /// The registry's kinds of the rungs: the shallow bid, the ladder's second and third, the asks (short).
-const KINDS: [&str; 5] = ["wick", DEEP, trades::RUNG3, "wicka", "wickm"];
-/// The asks' rung; the majors' bids' rung.
+const KINDS: [&str; 6] = ["wick", DEEP, trades::RUNG3, "wicka", "wickm", "wickl"];
+/// The asks' rung; the majors' bids' rung; the low-volume bids' rung.
 const ASK: usize = 3;
 const MAJ: usize = 4;
+const LOW: usize = 5;
 /// The majors bid on their own (BTC is the calm filter's reference).
 const MAJORS: [&str; 5] = ["ETH", "SOL", "XRP", "BNB", "DOGE"];
 const POLL_S: f64 = 5.0;
@@ -200,6 +207,11 @@ struct Params {
     maj_pct: f64,
     maj_hold_s: f64,
     maj_max_open: usize,
+    /// The low-volume bids: the level (0: none), the volume floor, the coins, the slots.
+    lowvol_pct: f64,
+    lowvol_min_vol: f64,
+    lowvol_coins: usize,
+    lowvol_max_open: usize,
 }
 
 impl Params {
@@ -221,7 +233,9 @@ impl Params {
             ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize,
             h3_ask_shut_pct: v("WICK_H3_ASK_SHUT_PCT", 4.0) / 100.0, h3_ask_open_pct: v("WICK_H3_ASK_OPEN_PCT", 7.0) / 100.0, asia_ask_pct: v("WICK_H3_ASIA_ASK_PCT", 3.0) / 100.0,
             h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
-            maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize }
+            maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize,
+            lowvol_pct: v("WICK_LOWVOL_PCT", 7.0) / 100.0, lowvol_min_vol: v("WICK_LOWVOL_MIN_VOL_USD", 1e6), lowvol_coins: v("WICK_LOWVOL_MAX_COINS", 20.0) as usize,
+            lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -310,6 +324,13 @@ struct State {
     maj_open: Vec<Trade>,
     #[serde(default)]
     maj_fill: HashMap<String, f64>,
+    /// The low-volume bids, their trades, their coins' last fills (the registry's kind `wickl`).
+    #[serde(default)]
+    low: HashMap<String, Bid>,
+    #[serde(default)]
+    low_open: Vec<Trade>,
+    #[serde(default)]
+    low_fill: HashMap<String, f64>,
     /// The fills on each side (the trial's counts).
     #[serde(default)]
     opened: u32,
@@ -393,6 +414,8 @@ struct Wick {
     /// The coins bid on (crypto, HIP-3), picked every `VOLUME_EVERY_S`; the coins whose candles were read.
     picked: Vec<String>,
     h3_picked: Vec<String>,
+    /// The low-volume coins picked (under the crypto floor).
+    low_picked: Vec<String>,
     backfilled: HashSet<String>,
     /// When the mids and the contexts (the oracles) were read last (the trace's quote ages).
     mids_at: f64,
@@ -670,14 +693,38 @@ impl Wick {
         out
     }
 
-    /// A rung's bids: the shallow ones (0), the ladder's second (1) and third (2), the asks (3), the majors' (4).
+    /// The low-volume bids now: the picked low-volume coins `lowvol_pct` under the crypto anchor, BTC calm, the coin not hot, while their
+    /// slots last.
+    fn wanted_low(&self, minute: i64) -> HashMap<String, (f64, f64, bool)> {
+        let mut out = HashMap::new();
+        if self.p.lowvol_pct <= 0.0 || self.state.low_open.len() >= self.p.lowvol_max_open || !self.btc_calm(minute) || !trades::trial_open(self.p.trial, self.state.opened) {
+            return out;
+        }
+        let (risk, t) = (trades::risk_usd(self.p.risk_usd), now());
+        for c in &self.low_picked {
+            let (Some(close), o) = (self.closes.at(c, minute - 1), self.oracle.get(c).copied().unwrap_or(0.0)) else { continue };
+            if !self.state.low_open.iter().any(|x| &x.coin == c)
+                && (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
+                && self.state.low_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
+                && trades::can_open(c, KINDS[LOW], 1.0, risk)
+                && !self.hot(c, minute)
+            {
+                let anchor = if o > 0.0 { close.min(o) } else { close };
+                out.insert(c.clone(), (level(anchor, self.p.lowvol_pct), self.p.lowvol_pct, false));
+            }
+        }
+        out
+    }
+
+    /// A rung's bids: the shallow ones (0), the ladder's second (1) and third (2), the asks (3), the majors' (4), the low-volume (5).
     fn book(&mut self, rung: usize) -> &mut HashMap<String, Bid> {
         match rung {
             0 => &mut self.state.bids,
             1 => &mut self.state.deep,
             2 => &mut self.state.deep3,
             ASK => &mut self.state.asks,
-            _ => &mut self.state.maj,
+            MAJ => &mut self.state.maj,
+            _ => &mut self.state.low,
         }
     }
 
@@ -688,7 +735,8 @@ impl Wick {
             1 => &mut self.state.deep_open,
             2 => &mut self.state.deep3_open,
             ASK => &mut self.state.asks_open,
-            _ => &mut self.state.maj_open,
+            MAJ => &mut self.state.maj_open,
+            _ => &mut self.state.low_open,
         }
     }
 
@@ -699,6 +747,12 @@ impl Wick {
         let spread = |c: &str| if by_spread { closes.spread(c, minute - 1, HIST as i64 - 1, MIN_HIST) } else { None };
         let coins = &self.venue.coins;
         self.picked = pick(&self.volume, self.p.min_vol, self.p.max_coins, |c| c == "BTC" || !coins.contains_key(c), spread);
+        let under: HashMap<String, f64> = self.volume.iter().filter(|(_, v)| **v < self.p.min_vol).map(|(c, v)| (c.clone(), *v)).collect();
+        self.low_picked = if self.p.lowvol_pct > 0.0 {
+            pick(&under, self.p.lowvol_min_vol, self.p.lowvol_coins, |c| !coins.contains_key(c) || MAJORS.contains(&c), spread)
+        } else {
+            Vec::new()
+        };
         self.h3_picked = if self.p.h3_max_coins > 0 {
             pick(&self.h3_volume, self.p.h3_min_vol, self.p.h3_max_coins, |c| c.starts_with("hyna:") || !coins.contains_key(c), spread)
         } else {
@@ -714,7 +768,8 @@ impl Wick {
     async fn backfill(&mut self) {
         let (coins, closes, done) = (&self.venue.coins, &self.closes, &self.backfilled);
         let short = |c: &String| !done.contains(c) && coins.contains_key(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_HIST);
-        let mut todo: Vec<(&String, &f64)> = self.volume.iter().filter(|(c, x)| **x >= self.p.min_vol && c.as_str() != "BTC" && short(c))
+        let floor = if self.p.lowvol_pct > 0.0 { self.p.min_vol.min(self.p.lowvol_min_vol) } else { self.p.min_vol };
+        let mut todo: Vec<(&String, &f64)> = self.volume.iter().filter(|(c, x)| **x >= floor && c.as_str() != "BTC" && short(c))
             .chain(self.h3_volume.iter().filter(|(c, x)| **x >= self.p.h3_min_vol && !c.starts_with("hyna:") && short(c))).collect();
         todo.sort_by(|a, b| b.1.total_cmp(a.1));
         let Some(c) = todo.first().map(|x| x.0.clone()) else { return };
@@ -749,7 +804,7 @@ impl Wick {
     /// The bids put right: off where not wanted, placed where missing, moved where drifted (the shallow ones, then
     /// the ladder's rungs).
     async fn place(&mut self, minute: i64) {
-        for rung in 0..=MAJ {
+        for rung in 0..=LOW {
             self.place_book(minute, rung).await;
         }
     }
@@ -762,7 +817,8 @@ impl Wick {
             1 => self.wanted_deep(minute),
             2 => self.wanted_deep3(minute),
             ASK => self.wanted_asks(minute),
-            _ => self.wanted_majors(minute),
+            MAJ => self.wanted_majors(minute),
+            _ => self.wanted_low(minute),
         };
         let mut changed = false;
         for (c, b) in self.book(rung).clone() {
@@ -837,7 +893,9 @@ impl Wick {
         let (bpct, shut) = self.book(rung).get(coin).map_or((0.0, deep && coin.contains(':')), |b| (b.pct, b.shut));
         self.trace(json!({"what": "fill", "coin": coin, "oid": oid, "deep": deep, "rung": rung, "got": got, "px": px, "t_detect": now()}));
         self.book(rung).remove(coin);
-        if rung == MAJ {
+        if rung == LOW {
+            self.state.low_fill.insert(coin.to_string(), now());
+        } else if rung == MAJ {
             self.state.maj_fill.insert(coin.to_string(), now());
         } else if rung == ASK {
             self.state.ask_fill.insert(coin.to_string(), now());
@@ -863,6 +921,8 @@ impl Wick {
         }
         let pct = if bpct > 0.0 {
             bpct
+        } else if rung == LOW {
+            self.p.lowvol_pct
         } else if rung == MAJ {
             self.p.maj_pct
         } else if rung == ASK {
@@ -894,8 +954,8 @@ impl Wick {
 
     /// The bids' fills (from the open orders) and the trades' ends; the account's positions.
     async fn check(&mut self) {
-        let mut dexes: HashSet<String> = self.state.bids.keys().chain(self.state.deep.keys()).chain(self.state.deep3.keys()).chain(self.state.asks.keys()).chain(self.state.maj.keys())
-            .chain(self.state.open.iter().chain(&self.state.deep_open).chain(&self.state.deep3_open).chain(&self.state.asks_open).chain(&self.state.maj_open).map(|x| &x.coin))
+        let mut dexes: HashSet<String> = self.state.bids.keys().chain(self.state.deep.keys()).chain(self.state.deep3.keys()).chain(self.state.asks.keys()).chain(self.state.maj.keys()).chain(self.state.low.keys())
+            .chain(self.state.open.iter().chain(&self.state.deep_open).chain(&self.state.deep3_open).chain(&self.state.asks_open).chain(&self.state.maj_open).chain(&self.state.low_open).map(|x| &x.coin))
             .map(|c| dex_of(c).to_string()).collect();
         dexes.insert(String::new());
         let mut resting: HashMap<u64, (f64, f64)> = HashMap::new();
@@ -905,7 +965,7 @@ impl Wick {
         // check, 29.10): only this module rests orders that are not reduce-only, so a buy not
         // reduce-only, not ours and older than a minute is cancelled.
         let mut strays: Vec<(String, u64)> = Vec::new();
-        let ours: HashSet<u64> = self.state.bids.values().chain(self.state.deep.values()).chain(self.state.deep3.values()).chain(self.state.asks.values()).chain(self.state.maj.values()).map(|b| b.oid).collect();
+        let ours: HashSet<u64> = self.state.bids.values().chain(self.state.deep.values()).chain(self.state.deep3.values()).chain(self.state.asks.values()).chain(self.state.maj.values()).chain(self.state.low.values()).map(|b| b.oid).collect();
         let t0 = now();
         for d in &dexes {
             let q = if d.is_empty() { json!({"type": "frontendOpenOrders", "user": self.venue.account}) } else { json!({"type": "frontendOpenOrders", "user": self.venue.account, "dex": d}) };
@@ -952,7 +1012,7 @@ impl Wick {
             }
         }
         // The bids: gone from the book (filled, or cancelled by the exchange) or partly filled.
-        let all: Vec<(usize, String, Bid)> = (0..=MAJ).flat_map(|r| self.book(r).clone().into_iter().map(move |(c, b)| (r, c, b))).collect();
+        let all: Vec<(usize, String, Bid)> = (0..=LOW).flat_map(|r| self.book(r).clone().into_iter().map(move |(c, b)| (r, c, b))).collect();
         for (rung, c, b) in all {
             if !read.contains(dex_of(&c)) {
                 continue;
@@ -999,7 +1059,7 @@ impl Wick {
         // The trades: out on time; gone (the stop or the take filled).
         let t = now();
         let mut changed = false;
-        for rung in 0..=MAJ {
+        for rung in 0..=LOW {
             let (kind, deep) = (KINDS[rung], rung > 0);
             let mut keep = Vec::new();
             for tr in std::mem::take(self.opens(rung)) {
@@ -1063,7 +1123,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         (state.opened, state.h3_opened, state.trial_round) = (0, 0, TRIAL_ROUND);
     }
     // The bids a restart left: off (placed again at the levels now).
-    for (c, b) in std::mem::take(&mut state.bids).into_iter().chain(std::mem::take(&mut state.deep)).chain(std::mem::take(&mut state.deep3)).chain(std::mem::take(&mut state.asks)).chain(std::mem::take(&mut state.maj)) {
+    for (c, b) in std::mem::take(&mut state.bids).into_iter().chain(std::mem::take(&mut state.deep)).chain(std::mem::take(&mut state.deep3)).chain(std::mem::take(&mut state.asks)).chain(std::mem::take(&mut state.maj)).chain(std::mem::take(&mut state.low)) {
         if venue.coins.contains_key(&c) {
             venue.cancel(&c, b.oid).await;
         }
@@ -1082,6 +1142,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     for tr in &state.maj_open {
         trades::register(&tr.coin, KINDS[MAJ], tr.risk(), tr.size);
+    }
+    for tr in &state.low_open {
+        trades::register(&tr.coin, KINDS[LOW], tr.risk(), tr.size);
     }
     log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}% (HIP-3 {:.0}%), stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
         venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.h3_take * 100.0, p.stop * 100.0,
@@ -1106,6 +1169,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 HIP-3 выносы вверх: лимитка на ПРОДАЖУ у акций США на {:.0}% выше, пока биржа закрыта, и на {:.0}% в сессию, у азиатских на {:.0}% в часы США (шорт, тейк = отступ, стоп 20%, до {} позиций); сырьё и крипто-связанные: покупка на {:.0}% ниже, пока биржа США закрыта",
             p.h3_ask_shut_pct * 100.0, p.h3_ask_open_pct * 100.0, p.asia_ask_pct * 100.0, p.h3_ask_max_open, p.noneq_shut_pct * 100.0));
     }
+    if p.lowvol_pct > 0.0 {
+        crate::notify::send(format!("🎣 монеты с малым оборотом (${:.0}M .. ${:.0}M в день, {} самых дёрганых): лимитка на {:.0}% ниже, тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, до {} позиций",
+            p.lowvol_min_vol / 1e6, p.min_vol / 1e6, p.lowvol_coins, p.lowvol_pct * 100.0, p.take * 100.0, p.stop * 100.0, p.hold_s / 60.0, p.lowvol_max_open));
+    }
     if p.maj_pct > 0.0 {
         crate::notify::send(format!("🎣 крупные монеты (ETH, SOL, XRP, BNB, DOGE): лимитка на {:.0}% ниже, тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, до {} позиций",
             p.maj_pct * 100.0, p.maj_pct * 100.0, p.stop * 100.0, p.maj_hold_s / 60.0, p.maj_max_open));
@@ -1116,7 +1183,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let mut w = Wick { venue, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
+        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     tokio::spawn(async move {
         let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at) = (0.0, 0.0, 0.0, 0.0, 0.0);
@@ -1219,7 +1286,9 @@ mod tests {
         assert_eq!(p.rung_exits("xyz:NVDA", 1, true, p.deep_pct).0, p.deep_pct);
         // the crypto ladder's third rung: 12% under, take 6%, 3 slots
         assert!((p.cry_deep3_pct - 0.12).abs() < 1e-12 && (p.cry_deep3_take - 0.06).abs() < 1e-12 && p.cry_deep3_max_open == 3);
-        assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm"]);
+        assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm", "wickl"]);
+        assert_eq!(p.rung_exits("WIF", LOW, false, p.lowvol_pct), (0.05, 0.20, 3_600.0));
+        assert!((p.lowvol_pct - 0.07).abs() < 1e-12 && p.lowvol_coins == 20 && p.lowvol_max_open == 3);
         assert_eq!(p.rung_exits("SOL", MAJ, false, p.maj_pct), (0.04, 0.20, 14_400.0));
         // the ladder's deeper bid: 5% under, take 5%, stop 12.5%, a day, 3 slots
         assert!((p.deep_pct - 0.05).abs() < 1e-12 && p.deep_max_open == 3);

@@ -96,6 +96,11 @@
 //! min, the shut-hours slots; the tape 283 fills +170 bp (t 9.4), the halves +178 / +162. The HL portfolio at 2% over the bot (x81.1): the
 //! US shut asks (the top 10) x133 at the same drawdown 22.8% (h2 x15.0 -> x22.7); + the non-equity bids x200 (h2's drawdown 15.6 -> 14.6%);
 //! + the Asian asks x194; + the US open asks x188.
+//! The majors' bids (V273 .. V276): ETH / SOL / XRP / BNB / DOGE (`MAJORS`; seldom among the most restless picked) bid `WICK_MAJ_PCT` (4) under
+//! the crypto anchor, take = its level, stop 20%, `WICK_MAJ_HOLD_MIN` (240), `WICK_MAJ_MAX_OPEN` (2) slots, the BTC / hot checks, the registry's
+//! `wickm`. Binance 1m 2020-26 (the bars, the hot filter): 251 fills +120 bp (t 3.1), 82% up, every one of the 7 years up (3%: 566 +98, 2025
+//! -16); HL 2025-05 .. 2026-10 (the bars) 18 fills +303 bp, 94% up, both years up; the Binance portfolio (the bot's set, 2%) at the same
+//! drawdown 2020-23 +15..22%, 2023-26 +15%. The first crypto rule of the round that both venues and six years agree on.
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -117,9 +122,12 @@ const DOC: &str = "wick";
 /// The ladder's trades in the family's registry: a strategy of their own, so a coin holds a shallow and a deep one.
 const DEEP: &str = "wick2";
 /// The registry's kinds of the rungs: the shallow bid, the ladder's second and third, the asks (short).
-const KINDS: [&str; 4] = ["wick", DEEP, trades::RUNG3, "wicka"];
-/// The asks' rung.
+const KINDS: [&str; 5] = ["wick", DEEP, trades::RUNG3, "wicka", "wickm"];
+/// The asks' rung; the majors' bids' rung.
 const ASK: usize = 3;
+const MAJ: usize = 4;
+/// The majors bid on their own (BTC is the calm filter's reference).
+const MAJORS: [&str; 5] = ["ETH", "SOL", "XRP", "BNB", "DOGE"];
 const POLL_S: f64 = 5.0;
 const ORDERS_EVERY_S: f64 = 15.0;
 const VOLUME_EVERY_S: f64 = 300.0;
@@ -188,6 +196,10 @@ struct Params {
     asia_ask_pct: f64,
     h3_ask_max_open: usize,
     noneq_shut_pct: f64,
+    /// The majors' bids: the level (0: none), the hold, the slots.
+    maj_pct: f64,
+    maj_hold_s: f64,
+    maj_max_open: usize,
 }
 
 impl Params {
@@ -208,7 +220,8 @@ impl Params {
             ask_pct: v("WICK_ASK_PCT", 5.0) / 100.0, ask_coins: v("WICK_ASK_MAX_COINS", 5.0) as usize, ask_take: v("WICK_ASK_TAKE_PCT", 3.0) / 100.0,
             ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize,
             h3_ask_shut_pct: v("WICK_H3_ASK_SHUT_PCT", 4.0) / 100.0, h3_ask_open_pct: v("WICK_H3_ASK_OPEN_PCT", 7.0) / 100.0, asia_ask_pct: v("WICK_H3_ASIA_ASK_PCT", 3.0) / 100.0,
-            h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0 }
+            h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
+            maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -229,6 +242,7 @@ impl Params {
     fn rung_exits(&self, coin: &str, rung: usize, shut: bool, pct: f64) -> (f64, f64, f64) {
         let (take, stop, hold) = self.exits(coin, shut, pct);
         match rung {
+            MAJ => (pct, stop, self.maj_hold_s),
             ASK if coin.contains(':') => (pct, 0.20, if shut { 240.0 * 60.0 } else { 60.0 * 60.0 }),
             ASK => (self.ask_take, self.ask_stop, self.ask_hold_s),
             0 if shut && crate::wkd::non_equity(coin) => (pct, 0.20, 240.0 * 60.0),
@@ -289,6 +303,13 @@ struct State {
     asks_open: Vec<Trade>,
     #[serde(default)]
     ask_fill: HashMap<String, f64>,
+    /// The majors' bids, their trades, their coins' last fills (the registry's kind `wickm`).
+    #[serde(default)]
+    maj: HashMap<String, Bid>,
+    #[serde(default)]
+    maj_open: Vec<Trade>,
+    #[serde(default)]
+    maj_fill: HashMap<String, f64>,
     /// The fills on each side (the trial's counts).
     #[serde(default)]
     opened: u32,
@@ -348,7 +369,7 @@ fn message(ev: &Value) -> Option<String> {
         "open" if ev["ask"] == true => format!("🎣 ВЫНОС {coin}: лимитка на продажу {:.0}% выше исполнилась по {} (шорт), на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
             f("pct") * 100.0, f("px"), f("notional").abs(), f("take_px"), f("stop_px"), f("hold_min")),
         "open" => format!("🎣 ПРОКОЛ {coin}: лимитка {:.0}% ниже{} исполнилась по {}, на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
-            f("pct") * 100.0, if ev["deep"] == true { " (лесенка)" } else { "" }, f("px"), f("notional"), f("take_px"), f("stop_px"), f("hold_min")),
+            f("pct") * 100.0, if ev["major"] == true { " (крупная монета)" } else if ev["deep"] == true { " (лесенка)" } else { "" }, f("px"), f("notional"), f("take_px"), f("stop_px"), f("hold_min")),
         "close" => format!("{} прокол {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
             match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
@@ -624,13 +645,39 @@ impl Wick {
         out
     }
 
-    /// A rung's bids: the shallow ones (0), the ladder's second (1) and third (2), the asks (3).
+    /// The majors' bids now: `MAJORS` `maj_pct` under the crypto anchor, BTC calm, the coin not hot, while their slots last.
+    fn wanted_majors(&self, minute: i64) -> HashMap<String, (f64, f64, bool)> {
+        let mut out = HashMap::new();
+        if self.p.maj_pct <= 0.0 || self.state.maj_open.len() >= self.p.maj_max_open || !self.btc_calm(minute) || !trades::trial_open(self.p.trial, self.state.opened) {
+            return out;
+        }
+        let (risk, t) = (trades::risk_usd(self.p.risk_usd), now());
+        for c in MAJORS {
+            if !self.venue.coins.contains_key(c) {
+                continue;
+            }
+            let (Some(close), o) = (self.closes.at(c, minute - 1), self.oracle.get(c).copied().unwrap_or(0.0)) else { continue };
+            if !self.state.maj_open.iter().any(|x| x.coin == c)
+                && (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
+                && self.state.maj_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
+                && trades::can_open(c, KINDS[MAJ], 1.0, risk)
+                && !self.hot(c, minute)
+            {
+                let anchor = if o > 0.0 { close.min(o) } else { close };
+                out.insert(c.to_string(), (level(anchor, self.p.maj_pct), self.p.maj_pct, false));
+            }
+        }
+        out
+    }
+
+    /// A rung's bids: the shallow ones (0), the ladder's second (1) and third (2), the asks (3), the majors' (4).
     fn book(&mut self, rung: usize) -> &mut HashMap<String, Bid> {
         match rung {
             0 => &mut self.state.bids,
             1 => &mut self.state.deep,
             2 => &mut self.state.deep3,
-            _ => &mut self.state.asks,
+            ASK => &mut self.state.asks,
+            _ => &mut self.state.maj,
         }
     }
 
@@ -640,7 +687,8 @@ impl Wick {
             0 => &mut self.state.open,
             1 => &mut self.state.deep_open,
             2 => &mut self.state.deep3_open,
-            _ => &mut self.state.asks_open,
+            ASK => &mut self.state.asks_open,
+            _ => &mut self.state.maj_open,
         }
     }
 
@@ -701,7 +749,7 @@ impl Wick {
     /// The bids put right: off where not wanted, placed where missing, moved where drifted (the shallow ones, then
     /// the ladder's rungs).
     async fn place(&mut self, minute: i64) {
-        for rung in 0..=ASK {
+        for rung in 0..=MAJ {
             self.place_book(minute, rung).await;
         }
     }
@@ -713,7 +761,8 @@ impl Wick {
             0 => self.wanted(minute),
             1 => self.wanted_deep(minute),
             2 => self.wanted_deep3(minute),
-            _ => self.wanted_asks(minute),
+            ASK => self.wanted_asks(minute),
+            _ => self.wanted_majors(minute),
         };
         let mut changed = false;
         for (c, b) in self.book(rung).clone() {
@@ -788,7 +837,9 @@ impl Wick {
         let (bpct, shut) = self.book(rung).get(coin).map_or((0.0, deep && coin.contains(':')), |b| (b.pct, b.shut));
         self.trace(json!({"what": "fill", "coin": coin, "oid": oid, "deep": deep, "rung": rung, "got": got, "px": px, "t_detect": now()}));
         self.book(rung).remove(coin);
-        if rung == ASK {
+        if rung == MAJ {
+            self.state.maj_fill.insert(coin.to_string(), now());
+        } else if rung == ASK {
             self.state.ask_fill.insert(coin.to_string(), now());
         } else if rung == 2 {
             self.state.deep3_fill.insert(coin.to_string(), now());
@@ -812,6 +863,8 @@ impl Wick {
         }
         let pct = if bpct > 0.0 {
             bpct
+        } else if rung == MAJ {
+            self.p.maj_pct
         } else if rung == ASK {
             self.p.ask_pct
         } else if rung == 2 {
@@ -826,7 +879,7 @@ impl Wick {
         let (take, stop, hold_s) = self.p.rung_exits(coin, rung, shut, pct);
         match trades::protect(&self.venue, coin, got, px, stop, Some(take), hold_s).await {
             Ok(tr) => {
-                self.event(json!({"what": "open", "coin": coin, "pct": pct, "shut": shut, "deep": deep, "rung": rung, "ask": rung == ASK, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
+                self.event(json!({"what": "open", "coin": coin, "pct": pct, "shut": shut, "deep": deep, "rung": rung, "ask": rung == ASK, "major": rung == MAJ, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
                     "stop_px": tr.stop_px, "hold_min": hold_s / 60.0}));
                 trades::register(coin, KINDS[rung], tr.risk(), tr.size);
                 self.opens(rung).push(tr);
@@ -841,8 +894,8 @@ impl Wick {
 
     /// The bids' fills (from the open orders) and the trades' ends; the account's positions.
     async fn check(&mut self) {
-        let mut dexes: HashSet<String> = self.state.bids.keys().chain(self.state.deep.keys()).chain(self.state.deep3.keys()).chain(self.state.asks.keys())
-            .chain(self.state.open.iter().chain(&self.state.deep_open).chain(&self.state.deep3_open).chain(&self.state.asks_open).map(|x| &x.coin))
+        let mut dexes: HashSet<String> = self.state.bids.keys().chain(self.state.deep.keys()).chain(self.state.deep3.keys()).chain(self.state.asks.keys()).chain(self.state.maj.keys())
+            .chain(self.state.open.iter().chain(&self.state.deep_open).chain(&self.state.deep3_open).chain(&self.state.asks_open).chain(&self.state.maj_open).map(|x| &x.coin))
             .map(|c| dex_of(c).to_string()).collect();
         dexes.insert(String::new());
         let mut resting: HashMap<u64, (f64, f64)> = HashMap::new();
@@ -852,7 +905,7 @@ impl Wick {
         // check, 29.10): only this module rests orders that are not reduce-only, so a buy not
         // reduce-only, not ours and older than a minute is cancelled.
         let mut strays: Vec<(String, u64)> = Vec::new();
-        let ours: HashSet<u64> = self.state.bids.values().chain(self.state.deep.values()).chain(self.state.deep3.values()).chain(self.state.asks.values()).map(|b| b.oid).collect();
+        let ours: HashSet<u64> = self.state.bids.values().chain(self.state.deep.values()).chain(self.state.deep3.values()).chain(self.state.asks.values()).chain(self.state.maj.values()).map(|b| b.oid).collect();
         let t0 = now();
         for d in &dexes {
             let q = if d.is_empty() { json!({"type": "frontendOpenOrders", "user": self.venue.account}) } else { json!({"type": "frontendOpenOrders", "user": self.venue.account, "dex": d}) };
@@ -899,7 +952,7 @@ impl Wick {
             }
         }
         // The bids: gone from the book (filled, or cancelled by the exchange) or partly filled.
-        let all: Vec<(usize, String, Bid)> = (0..=ASK).flat_map(|r| self.book(r).clone().into_iter().map(move |(c, b)| (r, c, b))).collect();
+        let all: Vec<(usize, String, Bid)> = (0..=MAJ).flat_map(|r| self.book(r).clone().into_iter().map(move |(c, b)| (r, c, b))).collect();
         for (rung, c, b) in all {
             if !read.contains(dex_of(&c)) {
                 continue;
@@ -946,7 +999,7 @@ impl Wick {
         // The trades: out on time; gone (the stop or the take filled).
         let t = now();
         let mut changed = false;
-        for rung in 0..=ASK {
+        for rung in 0..=MAJ {
             let (kind, deep) = (KINDS[rung], rung > 0);
             let mut keep = Vec::new();
             for tr in std::mem::take(self.opens(rung)) {
@@ -1010,7 +1063,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         (state.opened, state.h3_opened, state.trial_round) = (0, 0, TRIAL_ROUND);
     }
     // The bids a restart left: off (placed again at the levels now).
-    for (c, b) in std::mem::take(&mut state.bids).into_iter().chain(std::mem::take(&mut state.deep)).chain(std::mem::take(&mut state.deep3)).chain(std::mem::take(&mut state.asks)) {
+    for (c, b) in std::mem::take(&mut state.bids).into_iter().chain(std::mem::take(&mut state.deep)).chain(std::mem::take(&mut state.deep3)).chain(std::mem::take(&mut state.asks)).chain(std::mem::take(&mut state.maj)) {
         if venue.coins.contains_key(&c) {
             venue.cancel(&c, b.oid).await;
         }
@@ -1026,6 +1079,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     for tr in &state.asks_open {
         trades::register(&tr.coin, KINDS[ASK], tr.risk(), tr.size);
+    }
+    for tr in &state.maj_open {
+        trades::register(&tr.coin, KINDS[MAJ], tr.risk(), tr.size);
     }
     log!("wick: account {}: crypto {:.0}% under on {} coins (${:.0}M+), HIP-3 {:.0}% under on {} (${:.0}M+); take {:.0}% (HIP-3 {:.0}%), stop {:.0}%, {:.0} min, risk {}, at most {} + {}; picked by {}; {} held",
         venue.account, p.pct * 100.0, p.max_coins, p.min_vol / 1e6, p.h3_pct * 100.0, p.h3_max_coins, p.h3_min_vol / 1e6, p.take * 100.0, p.h3_take * 100.0, p.stop * 100.0,
@@ -1049,6 +1105,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if p.h3_ask_shut_pct > 0.0 || p.h3_ask_open_pct > 0.0 || p.asia_ask_pct > 0.0 || p.noneq_shut_pct > 0.0 {
         crate::notify::send(format!("🎣 HIP-3 выносы вверх: лимитка на ПРОДАЖУ у акций США на {:.0}% выше, пока биржа закрыта, и на {:.0}% в сессию, у азиатских на {:.0}% в часы США (шорт, тейк = отступ, стоп 20%, до {} позиций); сырьё и крипто-связанные: покупка на {:.0}% ниже, пока биржа США закрыта",
             p.h3_ask_shut_pct * 100.0, p.h3_ask_open_pct * 100.0, p.asia_ask_pct * 100.0, p.h3_ask_max_open, p.noneq_shut_pct * 100.0));
+    }
+    if p.maj_pct > 0.0 {
+        crate::notify::send(format!("🎣 крупные монеты (ETH, SOL, XRP, BNB, DOGE): лимитка на {:.0}% ниже, тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, до {} позиций",
+            p.maj_pct * 100.0, p.maj_pct * 100.0, p.stop * 100.0, p.maj_hold_s / 60.0, p.maj_max_open));
     }
     if p.h3_session_deep_pct > 0.0 {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
@@ -1159,7 +1219,8 @@ mod tests {
         assert_eq!(p.rung_exits("xyz:NVDA", 1, true, p.deep_pct).0, p.deep_pct);
         // the crypto ladder's third rung: 12% under, take 6%, 3 slots
         assert!((p.cry_deep3_pct - 0.12).abs() < 1e-12 && (p.cry_deep3_take - 0.06).abs() < 1e-12 && p.cry_deep3_max_open == 3);
-        assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka"]);
+        assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm"]);
+        assert_eq!(p.rung_exits("SOL", MAJ, false, p.maj_pct), (0.04, 0.20, 14_400.0));
         // the ladder's deeper bid: 5% under, take 5%, stop 12.5%, a day, 3 slots
         assert!((p.deep_pct - 0.05).abs() < 1e-12 && p.deep_max_open == 3);
         let (take, stop, hold) = p.exits("xyz:NVDA", true, p.deep_pct);

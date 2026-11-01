@@ -13,6 +13,7 @@ mod config;
 mod dip;
 mod engine;
 mod exchange;
+mod expiry;
 mod hip3;
 mod liq;
 mod listing;
@@ -80,6 +81,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         rsidip::start(&cfg, store.clone(), api.clone()).await?;
         listing::start(&cfg, store.clone()).await?;
         trend::start(&cfg, store.clone()).await?;
+        expiry::start(&cfg, store.clone()).await?;
         squeeze::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
@@ -99,6 +101,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     rsidip::start(&cfg, store.clone(), api.clone()).await?;
     listing::start(&cfg, store.clone()).await?;
     trend::start(&cfg, store.clone()).await?;
+    expiry::start(&cfg, store.clone()).await?;
     squeeze::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;

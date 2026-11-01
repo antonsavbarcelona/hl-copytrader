@@ -151,6 +151,14 @@ pub(crate) fn us_night(minute: i64) -> bool {
     (wd <= 3 && m >= 1200) || ((1..=4).contains(&wd) && m < 240)
 }
 
+/// Sunday night in New York after the UTC weekend (Mon 00:00 UTC .. Mon 04:00 ET): the cash market still shut, the
+/// hours the UTC weekend and the weeknights leave out (the wick's shut bids only: the dips there flip between halves).
+pub(crate) fn us_sunday_night(minute: i64) -> bool {
+    let et = minute - if us_dst(minute.div_euclid(1440)) { 240 } else { 300 };
+    let (wd, m) = ((et.div_euclid(1440) + 3).rem_euclid(7), et.rem_euclid(1440));
+    !weekend(minute) && (wd == 6 || (wd == 0 && m < 240))
+}
+
 /// A stock or an index of a USDC dex (US, Asian, pre-IPO).
 fn tradable(coin: &str) -> bool {
     coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n))

@@ -53,7 +53,10 @@
 //! (t 9.4), 88% up, w/o the 10 best stocks +131; the night 3% 102 fills +167 bp, w/o the 10 best +126; the same bids in
 //! the session / the pre-market lose. The top 10 by the deviation (this pick) hold 64% (the weekend) / 43% (the night) of
 //! the sum. On the HL portfolio at 2% (3 slots) with this pick's fills (the top 10) x13.4 -> x21.7 at the same drawdown 28%
-//! (h1 +9%, h2 +23%; the top 20 x26.8; all the US stocks x32.8).
+//! (h1 +9%, h2 +23%; the top 20 x26.8; all the US stocks x32.8). Sunday night in New York too (Mon 00:00 UTC .. 04:00
+//! ET, `wkd::us_sunday_night`; V203 .. V209) at the night's level: Sunday evening's on the tape 38 fills +206 bp (t 5.3),
+//! the halves +245 / +167, w/o the 5 best +174; Monday 00-04 ET 10 fills +188 bp (the bars); the portfolio with both
+//! (this pick) x21.7 -> x25.7 at the same drawdown (h1 +4%, h2 +14%).
 //!
 //! Its state is the store's doc `wick` (the bids resting, the trades, the coins' last fills).
 
@@ -129,12 +132,18 @@ impl Params {
             shut_max_open: v("WICK_H3_SHUT_MAX_OPEN", 3.0) as usize }
     }
 
-    /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend or a US night), else None.
+    /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
     fn shut_pct(&self, coin: &str, minute: i64) -> Option<f64> {
         if !crate::wkd::us_stock(coin) {
             return None;
         }
-        if crate::wkd::weekend(minute) { Some(self.h3_wkd_pct) } else if crate::wkd::us_night(minute) { Some(self.h3_night_pct) } else { None }
+        if crate::wkd::weekend(minute) {
+            Some(self.h3_wkd_pct)
+        } else if crate::wkd::us_night(minute) || crate::wkd::us_sunday_night(minute) {
+            Some(self.h3_night_pct)
+        } else {
+            None
+        }
     }
 
     /// A trade's (take, stop, hold s): a shut-hours bid's at its level `pct`, else the side's.
@@ -727,7 +736,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         trades::sizing_label(p.risk_usd, p.stop), p.max_open, p.h3_max_open,
         if p.by_spread { "самые дёрганые за сутки (по разбросу минутных движений)" } else { "с наибольшим оборотом" })
         + &trades::trial_label(p.trial, state.opened.max(state.h3_opened)).replace("сделки", "сделки на каждой стороне"));
-    crate::notify::send(format!("🎣 акции США, пока биржа закрыта: лимитка на {:.1}% ниже в выходные и на {:.0}% ночью, тейк = отступ, стоп ×2.5, до {:.0} ч, до {} позиций",
+    crate::notify::send(format!("🎣 акции США, пока биржа закрыта: лимитка на {:.1}% ниже в выходные и на {:.0}% ночью (и в ночь на понедельник по Нью-Йорку), тейк = отступ, стоп ×2.5, до {:.0} ч, до {} позиций",
         p.h3_wkd_pct * 100.0, p.h3_night_pct * 100.0, p.shut_hold_s / 3600.0, p.shut_max_open));
     let mut w = Wick { venue, max_lev, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(), lev_set: HashSet::new(),
@@ -803,6 +812,12 @@ mod tests {
         assert_eq!(p.shut_pct("xyz:NVDA", sat), Some(0.025));
         assert_eq!(p.shut_pct("xyz:NVDA", night), Some(0.03));
         assert_eq!(p.shut_pct("xyz:NVDA", sess), None);
+        // Sunday night: Sun 2026-11-01 19:30 EST (Mon 00:30 UTC), Mon 00:30 EST (05:30 UTC), Mon 2026-06-01 03:59 UTC (Sun
+        // 23:59 EDT); not the UTC weekend (Sun 23:30 UTC), not Mon 04:00 EST (09:00 UTC, the pre-market)
+        assert_eq!(p.shut_pct("xyz:NVDA", 29_892_990), Some(0.03));
+        assert_eq!(p.shut_pct("xyz:NVDA", 29_893_290), Some(0.03));
+        assert!(crate::wkd::us_sunday_night(29_892_990) && crate::wkd::us_sunday_night(29_893_290) && crate::wkd::us_sunday_night(29_671_439));
+        assert!(!crate::wkd::us_sunday_night(29_892_930) && !crate::wkd::us_sunday_night(29_893_500) && !crate::wkd::us_night(29_893_290));
         assert_eq!(p.shut_pct("xyz:SKHX", night), None);       // Seoul open then
         assert_eq!(p.shut_pct("xyz:GOLD", sat), None);         // not a stock
         assert_eq!(p.shut_pct("BTC", sat), None);

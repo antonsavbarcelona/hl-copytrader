@@ -133,10 +133,16 @@ pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64, f64)>)
     }
 }
 
+/// The crypto wick ladder's third rung (2026-11-01, V234): outside the per-coin limit - the coin its 7% and 10% rungs hold
+/// takes it (the same side, not twice, the family's risk cap as any), and it takes no other strategy's place there.
+pub(crate) const RUNG3: &str = "wick3";
+
 /// Whether the coin may take one more trade of `kind` on side `dir`: free, or held by fewer than `per_coin`
-/// trades, none of them `kind`'s, all on the same side.
+/// trades (the third rung not counted), none of them `kind`'s, all on the same side; the third rung: any number held.
 fn coin_fits(held: &[(String, f64, f64)], kind: &str, dir: f64, per_coin: usize) -> bool {
-    held.is_empty() || (held.len() < per_coin && held.iter().all(|k| k.0 != kind && k.2 * dir > 0.0))
+    let same = held.iter().all(|k| k.0 != kind && k.2 * dir > 0.0);
+    let n = held.iter().filter(|k| k.0 != RUNG3).count();
+    if kind == RUNG3 { same } else { held.is_empty() || (n < per_coin && same) }
 }
 
 /// Whether one more trade of `kind` on side `dir` (+1 long, -1 short) risking `risk` $ fits: the coin free (or
@@ -309,6 +315,12 @@ mod tests {
         assert!(!coin_fits(&[k("wick", 1.0)], "dip", -1.0, 2));                // a short against a long: never
         assert!(!coin_fits(&[k("dip", 1.0)], "dip", 1.0, 2));                  // not the same strategy twice
         assert!(!coin_fits(&[k("wick", 1.0), k("rsidip", 1.0)], "dip", 1.0, 2));
+        // the ladder's third rung: past the two (the 7% and 10% rungs), not twice, not against a short; it takes no place
+        assert!(coin_fits(&[k("wick", 1.0), k("wick2", 1.0)], RUNG3, 1.0, 2));
+        assert!(!coin_fits(&[k("wick", 1.0), k(RUNG3, 1.0)], RUNG3, 1.0, 2));
+        assert!(!coin_fits(&[k("pump", -1.0)], RUNG3, 1.0, 2));
+        assert!(coin_fits(&[k("wick", 1.0), k(RUNG3, 1.0)], "wick2", 1.0, 2));
+        assert!(!coin_fits(&[k("wick", 1.0), k("wick2", 1.0), k(RUNG3, 1.0)], "dip", 1.0, 2));
     }
 
     #[test]

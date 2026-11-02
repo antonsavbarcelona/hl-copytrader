@@ -216,6 +216,11 @@ struct Params {
     lowvol_coins: usize,
     lowvol_max_open: usize,
     lowvol_deep_pct: f64,
+    /// The margin the resting orders may hold, % of the equity (0: no limit).
+    margin_budget_pct: f64,
+    /// The thin coins among the low-volume ones: the floor (0: none) and how many (their 7% bid only, the lowest priority).
+    thin_min_vol: f64,
+    thin_coins: usize,
 }
 
 impl Params {
@@ -239,7 +244,8 @@ impl Params {
             h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
             maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize,
             lowvol_pct: v("WICK_LOWVOL_PCT", 7.0) / 100.0, lowvol_min_vol: v("WICK_LOWVOL_MIN_VOL_USD", 1e6), lowvol_coins: v("WICK_LOWVOL_MAX_COINS", 20.0) as usize,
-            lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize, lowvol_deep_pct: v("WICK_LOWVOL_DEEP_PCT", 12.0) / 100.0 }
+            lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize, lowvol_deep_pct: v("WICK_LOWVOL_DEEP_PCT", 12.0) / 100.0,
+            margin_budget_pct: v("WICK_MARGIN_BUDGET_PCT", 50.0), thin_min_vol: v("WICK_THIN_MIN_VOL_USD", 0.3e6), thin_coins: v("WICK_THIN_MAX_COINS", 20.0) as usize }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -383,6 +389,29 @@ fn pick(volume: &HashMap<String, f64>, min_vol: f64, n: usize, skip: impl Fn(&st
         (None, None) => b.2.total_cmp(&a.2),
     });
     v.into_iter().take(n).map(|x| x.0.clone()).collect()
+}
+
+/// The thin coins' bids ($0.3-1M; V285 .. V289: the tape 210 fills +285 bp, t 7.0, the halves +347 / +223, w/o the 10 best +238;
+/// the portfolio x1121 -> x1767 at the drawdown 21.2 -> 19.9%, but 5x and less: ~2.4% of the equity's margin a bid): last.
+const THIN_PRIORITY: f64 = 0.074;
+
+/// A resting order's worth per $ of the margin it holds (V289, HL 2025-05 .. 2026-10: the fills a month x the mean x the
+/// notional over the orders resting x their margin): the HIP-3 shallow bids 0.48, the crypto asks 0.33, the HIP-3 asks
+/// 0.19, the low-volume bids 0.16, the crypto ladder 0.13, the majors 0.12, the third rung 0.115, the HIP-3 ladders 0.11,
+/// the crypto shallow bids 0.10, the low-volume ladder 0.06. The budget keeps the first.
+fn priority(rung: usize, hip3: bool) -> f64 {
+    match (rung, hip3) {
+        (0, true) => 0.48,
+        (ASK, false) => 0.33,
+        (ASK, true) => 0.19,
+        (LOW, _) => 0.16,
+        (1, false) => 0.13,
+        (MAJ, _) => 0.12,
+        (2, _) => 0.115,
+        (1, true) => 0.11,
+        (0, false) => 0.10,
+        _ => 0.06,
+    }
 }
 
 /// The hour's deviation over `x` times the day's (`x` 0: off; either unknown: not hot).
@@ -714,6 +743,9 @@ impl Wick {
         }
         let (risk, t) = (trades::risk_usd(self.p.risk_usd), now());
         for c in &self.low_picked {
+            if rung == LOW2 && self.thin(c) {
+                continue;
+            }
             let (Some(close), o) = (self.closes.at(c, minute - 1), self.oracle.get(c).copied().unwrap_or(0.0)) else { continue };
             if !open.iter().any(|x| &x.coin == c)
                 && (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
@@ -763,7 +795,13 @@ impl Wick {
         self.picked = pick(&self.volume, self.p.min_vol, self.p.max_coins, |c| c == "BTC" || !coins.contains_key(c), spread);
         let under: HashMap<String, f64> = self.volume.iter().filter(|(_, v)| **v < self.p.min_vol).map(|(c, v)| (c.clone(), *v)).collect();
         self.low_picked = if self.p.lowvol_pct > 0.0 {
-            pick(&under, self.p.lowvol_min_vol, self.p.lowvol_coins, |c| !coins.contains_key(c) || MAJORS.contains(&c), spread)
+            let mut v = pick(&under, self.p.lowvol_min_vol, self.p.lowvol_coins, |c| !coins.contains_key(c) || MAJORS.contains(&c), spread);
+            // the thin ones ($0.3-1M): their own 20 most restless
+            if self.p.thin_min_vol > 0.0 && self.p.thin_min_vol < self.p.lowvol_min_vol {
+                let thin: HashMap<String, f64> = under.iter().filter(|(_, v)| **v < self.p.lowvol_min_vol).map(|(c, v)| (c.clone(), *v)).collect();
+                v.extend(pick(&thin, self.p.thin_min_vol, self.p.thin_coins, |c| !coins.contains_key(c) || MAJORS.contains(&c), spread));
+            }
+            v
         } else {
             Vec::new()
         };
@@ -782,7 +820,7 @@ impl Wick {
     async fn backfill(&mut self) {
         let (coins, closes, done) = (&self.venue.coins, &self.closes, &self.backfilled);
         let short = |c: &String| !done.contains(c) && coins.contains_key(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_HIST);
-        let floor = if self.p.lowvol_pct > 0.0 { self.p.min_vol.min(self.p.lowvol_min_vol) } else { self.p.min_vol };
+        let floor = if self.p.lowvol_pct > 0.0 { self.p.min_vol.min(self.p.lowvol_min_vol).min(if self.p.thin_min_vol > 0.0 { self.p.thin_min_vol } else { f64::MAX }) } else { self.p.min_vol };
         let mut todo: Vec<(&String, &f64)> = self.volume.iter().filter(|(c, x)| **x >= floor && c.as_str() != "BTC" && short(c))
             .chain(self.h3_volume.iter().filter(|(c, x)| **x >= self.p.h3_min_vol && !c.starts_with("hyna:") && short(c))).collect();
         todo.sort_by(|a, b| b.1.total_cmp(a.1));
@@ -818,22 +856,58 @@ impl Wick {
     /// The bids put right: off where not wanted, placed where missing, moved where drifted (the shallow ones, then
     /// the ladder's rungs).
     async fn place(&mut self, minute: i64) {
-        for rung in 0..=LOW2 {
-            self.place_book(minute, rung).await;
+        let mut wants: Vec<HashMap<String, (f64, f64, bool)>> = (0..=LOW2)
+            .map(|rung| match rung {
+                0 => self.wanted(minute),
+                1 => self.wanted_deep(minute),
+                2 => self.wanted_deep3(minute),
+                ASK => self.wanted_asks(minute),
+                MAJ => self.wanted_majors(minute),
+                _ => self.wanted_low(minute, rung),
+            })
+            .collect();
+        self.within_budget(&mut wants);
+        for (rung, want) in wants.into_iter().enumerate() {
+            self.place_book(minute, rung, want).await;
         }
     }
 
-    async fn place_book(&mut self, minute: i64, rung: usize) {
+    /// A thin coin: the day's volume under the low-volume floor.
+    fn thin(&self, c: &str) -> bool {
+        self.volume.get(c).is_some_and(|v| *v < self.p.lowvol_min_vol)
+    }
+
+    /// The wanted orders cut to the margin budget (each holds its notional / its coin's leverage): kept by
+    /// `priority` (what an order earns a month per $ of the margin it holds), the rest not placed (or taken off).
+    fn within_budget(&self, wants: &mut [HashMap<String, (f64, f64, bool)>]) {
+        let budget = self.p.margin_budget_pct / 100.0 * trades::equity();
+        if self.p.margin_budget_pct <= 0.0 || budget <= 0.0 {
+            return;
+        }
+        let risk = trades::risk_usd(self.p.risk_usd);
+        // within a priority the most restless first (the pick's order)
+        let rank = |c: &str| [&self.picked, &self.h3_picked, &self.low_picked].iter().find_map(|v| v.iter().position(|x| x == c)).unwrap_or(usize::MAX);
+        let mut all: Vec<(f64, usize, String, f64)> = wants.iter().enumerate()
+            .flat_map(|(rung, w)| w.iter().map(move |(c, (_, pct, shut))| (rung, c, *pct, *shut)))
+            .map(|(rung, c, pct, shut)| {
+                let stop = self.p.rung_exits(c, rung, shut, pct).1;
+                (if rung == LOW && self.thin(c) { THIN_PRIORITY } else { priority(rung, c.contains(':')) }, rung, c.clone(), risk / stop.max(1e-9) / self.venue.leverage_of(c))
+            })
+            .collect();
+        all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(rank(&a.2).cmp(&rank(&b.2))).then(a.2.cmp(&b.2)));
+        let mut used = 0.0;
+        for (_, rung, c, m) in all {
+            if used + m > budget {
+                wants[rung].remove(&c);
+            } else {
+                used += m;
+            }
+        }
+    }
+
+    async fn place_book(&mut self, minute: i64, rung: usize, want: HashMap<String, (f64, f64, bool)>) {
         let t_calc = now();
         let deep = rung > 0;
-        let want = match rung {
-            0 => self.wanted(minute),
-            1 => self.wanted_deep(minute),
-            2 => self.wanted_deep3(minute),
-            ASK => self.wanted_asks(minute),
-            MAJ => self.wanted_majors(minute),
-            _ => self.wanted_low(minute, rung),
-        };
         let mut changed = false;
         for (c, b) in self.book(rung).clone() {
             if !want.contains_key(&c) {
@@ -1312,7 +1386,12 @@ mod tests {
         assert!((p.cry_deep3_pct - 0.12).abs() < 1e-12 && (p.cry_deep3_take - 0.06).abs() < 1e-12 && p.cry_deep3_max_open == 3);
         assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm", "wickl", "wickl2"]);
         assert_eq!(p.rung_exits("WIF", LOW2, false, p.lowvol_deep_pct), (0.05, 0.20, 3_600.0));
-        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12);
+        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12 && (p.margin_budget_pct - 50.0).abs() < 1e-12);
+        // the budget's order: the HIP-3 shallow bids first, the low-volume ladder last
+        let order = [(0, true), (ASK, false), (ASK, true), (LOW, false), (1, false), (MAJ, false), (2, false), (1, true), (0, false), (LOW2, false)];
+        assert!(order.windows(2).all(|w| priority(w[0].0, w[0].1) > priority(w[1].0, w[1].1)));
+        assert!(priority(0, false) > THIN_PRIORITY && THIN_PRIORITY > priority(LOW2, false));
+        assert!((p.thin_min_vol - 0.3e6).abs() < 1e-6 && p.thin_coins == 20);
         assert_eq!(p.rung_exits("WIF", LOW, false, p.lowvol_pct), (0.05, 0.20, 3_600.0));
         assert!((p.lowvol_pct - 0.07).abs() < 1e-12 && p.lowvol_coins == 20 && p.lowvol_max_open == 3);
         assert_eq!(p.rung_exits("SOL", MAJ, false, p.maj_pct), (0.04, 0.20, 14_400.0));

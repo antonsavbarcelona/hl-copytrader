@@ -183,7 +183,8 @@ pub(crate) struct Venue {
     /// Coin -> its max leverage (the main dex's and, after `with_hip3`, the HIP-3 perps'), and the coins whose leverage
     /// this venue has set (`ensure_leverage`).
     max_lev: Arc<HashMap<String, u32>>,
-    lev_set: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The leverage each coin was set to (cross at the max, or the HIP-3 isolated fallback).
+    lev_set: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl Venue {
@@ -212,23 +213,35 @@ impl Venue {
     /// liquidation ~30% away, past the stops. Not set on the main dex (an error): the order goes on at the account's
     /// leverage; a HIP-3 coin neither cross nor isolated took: the error.
     pub(crate) async fn ensure_leverage(&self, coin: &str) -> Result<()> {
-        if self.lev_set.lock().unwrap().contains(coin) {
+        if self.lev_set.lock().unwrap().contains_key(coin) {
             return Ok(());
         }
         let Some(max) = self.max_lev.get(coin).copied().filter(|x| *x > 0) else {
-            self.lev_set.lock().unwrap().insert(coin.to_string());
+            self.lev_set.lock().unwrap().insert(coin.to_string(), 1);
             return Ok(());
         };
+        let mut set = max;
         if let Err(e) = self.leverage(coin, max, true).await {
             if !coin.contains(':') {
                 log!("live: {coin} leverage {max}x cross not set: {e:#}");
                 return Ok(());
             }
-            log!("live: {coin} cross refused ({e:#}): isolated {}x", crate::trades::H3_ISOLATED_LEVERAGE.min(max));
-            self.leverage(coin, crate::trades::H3_ISOLATED_LEVERAGE.min(max), false).await?;
+            set = crate::trades::H3_ISOLATED_LEVERAGE.min(max);
+            log!("live: {coin} cross refused ({e:#}): isolated {set}x");
+            self.leverage(coin, set, false).await?;
         }
-        self.lev_set.lock().unwrap().insert(coin.to_string());
+        self.lev_set.lock().unwrap().insert(coin.to_string(), set);
         Ok(())
+    }
+
+    /// The leverage an order on the coin is margined at: the one set, else what it will be (a HIP-3 coin not set yet: the
+    /// isolated fallback, the worst case; a crypto one: its max; unknown: 1).
+    pub(crate) fn leverage_of(&self, coin: &str) -> f64 {
+        if let Some(x) = self.lev_set.lock().unwrap().get(coin) {
+            return f64::from(*x).max(1.0);
+        }
+        let max = self.max_lev.get(coin).copied().unwrap_or(1).max(1);
+        f64::from(if coin.contains(':') { crate::trades::H3_ISOLATED_LEVERAGE.min(max) } else { max })
     }
 
     /// A market order (IOC through the mid): the size filled (signed), its average price and

@@ -875,6 +875,27 @@ impl Wick {
         self.publish_release();
     }
 
+    /// An order just cancelled: its status read; filled (wholly or in part) before the cancel: the trade opened
+    /// (2026-11-02, xyz:LITE: filled at 12:19:00, repriced at 12:19:05 as if still resting, the position left
+    /// with no stop). True when it was not filled (off the book); the status unread: kept for the check.
+    async fn settle_cancelled(&mut self, c: &str, b: &Bid, rung: usize) -> bool {
+        match self.venue.filled(b.oid).await {
+            Ok((f, _)) if f > 0.0 => {
+                self.trace(json!({"what": "filled before the cancel", "coin": c, "oid": b.oid, "px": b.px, "size": f, "rung": rung, "t_done": now()}));
+                self.filled(c, f, b.px, rung).await;
+                false
+            }
+            Ok(_) => {
+                self.book(rung).remove(c);
+                true
+            }
+            Err(e) => {
+                log!("wick: {c} order {} status not read after the cancel (kept for the check): {e:#}", b.oid);
+                false
+            }
+        }
+    }
+
     /// A resting order's margin $ (its notional / its coin's leverage).
     fn margin_of(&self, c: &str, b: &Bid) -> f64 {
         (b.size * b.px).abs() / self.venue.leverage_of(c)
@@ -948,7 +969,7 @@ impl Wick {
                 }
                 self.venue.cancel(&c, b.oid).await;
                 self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": why, "deep": deep, "rung": rung, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_done": now()}));
-                self.book(rung).remove(&c);
+                self.settle_cancelled(&c, &b, rung).await;
                 changed = true;
             }
         }
@@ -970,8 +991,11 @@ impl Wick {
                 self.trace(json!({"what": "cancel", "coin": c, "oid": b.oid, "px": b.px, "why": if lvl > b.px { "drift up" } else { "drift down" },
                     "deep": deep, "new_px": lvl, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_done": now()}));
                 old = Some(b.px);
-                self.book(rung).remove(&c);
                 changed = true;
+                // filled before the cancel (between the checks): the trade, not a new order
+                if !self.settle_cancelled(&c, &b, rung).await {
+                    continue;
+                }
             }
             let t_sent = now();
             let placed = self.venue.limit(&c, if rung == ASK { -size } else { size }, lvl, false, "Alo").await;

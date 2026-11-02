@@ -230,3 +230,33 @@ impl Paper {
         let _ = now_ms();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn snap(venue: &str, rate: f64, mid: f64, t: i64) -> Snap {
+        Snap { ts: t, asset: "X".into(), venue: venue.into(), symbol: "X".into(), mid, bid: mid - 0.01, ask: mid + 0.01, buy1k: mid + 0.01, sell1k: mid - 0.01,
+            buy10k: mid + 0.02, sell10k: mid - 0.02, rate_h: Some(rate), long_cost_h: None, short_cost_h: None, taker: 0.0002, ts_exchange: None, age_ms: 0 }
+    }
+    #[test]
+    fn enters_accrues_and_exits() {
+        // SHORT on B receives 0.1%/h, LONG on A pays 0: the 24 h edge 2.4% beats the ~0.12% round trip
+        let mut p = Paper::default();
+        let h = 3_600_000;
+        p.step(&[snap("A", 0.0, 100.0, 0), snap("B", 0.001, 100.0, 0)], 0);
+        assert_eq!(p.open.len(), 1);
+        assert_eq!((p.open[0].long.as_str(), p.open[0].short.as_str()), ("A", "B"));
+        // 10 h at 0.1%/h on ~$1k: ~ +$10 of funding
+        p.step(&[snap("A", 0.0, 100.0, 10 * h), snap("B", 0.001, 100.0, 10 * h)], 10 * h);
+        assert!((p.open[0].funding - 10.0).abs() < 0.2, "{}", p.open[0].funding);
+        // the funding flips: three negative rounds -> out
+        for k in 11..=13 {
+            p.step(&[snap("A", 0.0, 100.0, k * h), snap("B", -0.001, 100.0, k * h)], k * h);
+        }
+        assert_eq!(p.open.len(), 0);
+        assert_eq!(p.closed.len(), 1);
+        let c = &p.closed[0];
+        // the net: the funding (10 h at +0.1% less 3 h at -0.1%: ~ +$7) less the fees (~$0.8) less the spreads (~$0.4)
+        assert!(c.net > 5.0 && c.net < 7.0, "net {}", c.net);
+    }
+}

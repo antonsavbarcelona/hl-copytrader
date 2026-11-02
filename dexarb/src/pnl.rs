@@ -197,3 +197,35 @@ pub fn scenarios_from(net_hourly: &[f64], current_net: f64) -> [FundingScenario;
     let base = last.iter().sum::<f64>() / last.len() as f64;
     [mk(pct(0.25).min(base)), mk(base), mk(pct(0.75).max(base))]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn book(bid: i64, ask: i64) -> Book {
+        // prices in cents: one deep level each side
+        Book { bids: vec![(D::new(bid, 2), D::from(1_000))], asks: vec![(D::new(ask, 2), D::from(1_000))], ts_exchange: None, ts_recv: now_ms() }
+    }
+    fn ins(v: &str, taker: &str) -> Instrument {
+        let mut i = crate::venues::inst(crate::venues::V::Hyperliquid, "X", "X");
+        i.venue = v.into();
+        i.fees = Fees { taker: d(taker).unwrap(), maker: D::ZERO, source: Source::Api };
+        i
+    }
+    #[test]
+    fn the_decomposition() {
+        // LONG A at 100.10 (bid 100.00), SHORT B at 100.50 (ask 100.60), $1001 = 10 units, takers 0.05%
+        let (a, b) = (ins("A", "0.0005"), ins("B", "0.0005"));
+        let sc = [FundingScenario { long_pays_h: 0.0, short_gets_h: 0.0001 }; 3];
+        let p = Params { usd: 1001.0, hours: 24.0, leverage: 2.0, reserve: 0.5, treasury_usd: 0.0, basis_change: 0.0 };
+        let (_, _, r) = calc(&a, &book(10000, 10010), &b, &book(10050, 10060), sc, &p).unwrap();
+        assert!((r.q_base - 10.0).abs() < 1e-9);
+        assert!((r.entry_basis_usd - 4.0).abs() < 1e-9); // 10 x (100.50 - 100.10)
+        assert!((r.exit_basis_usd - 6.0).abs() < 1e-9); // 10 x (100.60 - 100.00)
+        assert!((r.basis_pnl + 2.0).abs() < 1e-9); // the two spreads, both ways
+        let fees = 0.0005 * (1001.0 + 1000.0 + 1005.0 + 1006.0);
+        assert!((r.fees - fees).abs() < 1e-9);
+        assert!((r.funding[1] - 24.0 * 0.0001 * 1005.0).abs() < 1e-9); // the short's notional receives
+        assert!((r.net[1] - (-2.0 + 24.0 * 0.0001 * 1005.0 - fees)).abs() < 1e-9);
+        assert!((r.capital - (1001.0 + 1005.0) / 2.0 * 1.5).abs() < 1e-9);
+    }
+}

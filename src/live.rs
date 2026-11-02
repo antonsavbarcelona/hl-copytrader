@@ -246,7 +246,38 @@ impl Venue {
 
     /// A market order (IOC through the mid): the size filled (signed), its average price and
     /// its order id. An opening one: the coin's leverage first (`ensure_leverage`).
+    /// An opening one refused for the margin: the weakest resting orders taken off for it (1.5x its margin), then once
+    /// more (2026-11-02, the user's call: the bids may hold most of the margin, the market entries come first).
     pub(crate) async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
+        match self.market_once(coin, size, reduce).await {
+            Err(e) if !reduce && no_margin(&format!("{e:#}")) => {
+                let need = 1.5 * size.abs() * self.mid(coin).await.unwrap_or(0.0) / self.leverage_of(coin);
+                let freed = self.release(need).await;
+                log!("live: {coin} no margin for the market entry: {freed:.2} of the resting orders' margin taken off (need {need:.2}), once more");
+                self.market_once(coin, size, reduce).await
+            }
+            r => r,
+        }
+    }
+
+    /// The weakest resting orders off until `need` $ of margin is freed; the margin freed.
+    async fn release(&self, need: f64) -> f64 {
+        let mut freed = 0.0;
+        while freed < need {
+            let next = {
+                let mut v = RELEASE.lock().unwrap();
+                if v.is_empty() { None } else { Some(v.remove(0)) }
+            };
+            let Some((c, oid, m)) = next else { break };
+            if self.coins.contains_key(&c) {
+                self.cancel(&c, oid).await;
+                freed += m;
+            }
+        }
+        freed
+    }
+
+    async fn market_once(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
         let (asset, dec) = self.coins[coin];
         if !reduce {
             self.ensure_leverage(coin).await?;
@@ -818,6 +849,19 @@ async fn read_account(ex: &Exchange, account: &str, unified: bool) -> Option<Rea
 /// held as perp margin (it backs the perps too); and its positions.
 /// The HIP-3 dexes margined in USDC (their meta's collateral token 0), read once (not cached when the read fails).
 static USDC_DEXES: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCell::const_new();
+
+/// The resting orders a market entry may take the margin of (the wick's; the weakest first): (coin, order id, margin $).
+static RELEASE: Mutex<Vec<(String, u64, f64)>> = Mutex::new(Vec::new());
+
+/// The wick's resting orders, the weakest first (each minute).
+pub(crate) fn set_release(v: Vec<(String, u64, f64)>) {
+    *RELEASE.lock().unwrap() = v;
+}
+
+/// An HL refusal for the margin.
+pub(crate) fn no_margin(e: &str) -> bool {
+    e.contains("Insufficient margin")
+}
 
 async fn usdc_dexes(ex: &Exchange) -> Vec<String> {
     let read = || async {

@@ -245,7 +245,7 @@ impl Params {
             maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize,
             lowvol_pct: v("WICK_LOWVOL_PCT", 7.0) / 100.0, lowvol_min_vol: v("WICK_LOWVOL_MIN_VOL_USD", 1e6), lowvol_coins: v("WICK_LOWVOL_MAX_COINS", 20.0) as usize,
             lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize, lowvol_deep_pct: v("WICK_LOWVOL_DEEP_PCT", 12.0) / 100.0,
-            margin_budget_pct: v("WICK_MARGIN_BUDGET_PCT", 50.0), thin_min_vol: v("WICK_THIN_MIN_VOL_USD", 0.3e6), thin_coins: v("WICK_THIN_MAX_COINS", 20.0) as usize }
+            margin_budget_pct: v("WICK_MARGIN_BUDGET_PCT", 80.0), thin_min_vol: v("WICK_THIN_MIN_VOL_USD", 0.3e6), thin_coins: v("WICK_THIN_MAX_COINS", 20.0) as usize }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -441,6 +441,8 @@ fn message(ev: &Value) -> Option<String> {
 struct Wick {
     venue: Venue,
     unified: bool,
+    /// The budget HL's refusal set: (the margin $ the orders held then, until when).
+    cap: Option<(f64, f64)>,
     api: Api,
     cfg: Config,
     store: Store,
@@ -870,6 +872,31 @@ impl Wick {
         for (rung, want) in wants.into_iter().enumerate() {
             self.place_book(minute, rung, want).await;
         }
+        self.publish_release();
+    }
+
+    /// A resting order's margin $ (its notional / its coin's leverage).
+    fn margin_of(&self, c: &str, b: &Bid) -> f64 {
+        (b.size * b.px).abs() / self.venue.leverage_of(c)
+    }
+
+    /// The margin the resting orders hold now.
+    fn held_margin(&mut self) -> f64 {
+        let all: Vec<(String, Bid)> = (0..=LOW2).flat_map(|r| self.book(r).clone().into_iter()).collect();
+        all.iter().map(|(c, b)| self.margin_of(c, b)).sum()
+    }
+
+    /// The resting orders the market entries may take off, the weakest first.
+    fn publish_release(&mut self) {
+        let mut v: Vec<(f64, String, u64, f64)> = Vec::new();
+        for rung in 0..=LOW2 {
+            for (c, b) in self.book(rung).clone() {
+                let pr = if rung == LOW && self.thin(&c) { THIN_PRIORITY } else { priority(rung, c.contains(':')) };
+                v.push((pr, c.clone(), b.oid, self.margin_of(&c, &b)));
+            }
+        }
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        crate::live::set_release(v.into_iter().map(|(_, c, o, m)| (c, o, m)).collect());
     }
 
     /// A thin coin: the day's volume under the low-volume floor.
@@ -880,9 +907,13 @@ impl Wick {
     /// The wanted orders cut to the margin budget (each holds its notional / its coin's leverage): kept by
     /// `priority` (what an order earns a month per $ of the margin it holds), the rest not placed (or taken off).
     fn within_budget(&self, wants: &mut [HashMap<String, (f64, f64, bool)>]) {
-        let budget = self.p.margin_budget_pct / 100.0 * trades::equity();
+        let mut budget = self.p.margin_budget_pct / 100.0 * trades::equity();
         if self.p.margin_budget_pct <= 0.0 || budget <= 0.0 {
             return;
+        }
+        // HL refused one for the margin: no more than the orders held then (less one), for an hour
+        if let Some((m, _)) = self.cap.filter(|(_, until)| now() < *until) {
+            budget = budget.min(m);
         }
         let risk = trades::risk_usd(self.p.risk_usd);
         // within a priority the most restless first (the pick's order)
@@ -963,8 +994,18 @@ impl Wick {
                     changed = true;
                 }
                 Ok(Placed::Filled(got, px, _)) => self.filled(&c, got, px, rung).await,
-                // Post-only refused (the price already under the level) or no margin: next time.
-                Err(e) => log!("wick: {c} bid not placed: {e:#}"),
+                // Post-only refused (the price already under the level) or no margin: next time; the margin: the budget
+                // capped at what the orders hold now, for an hour (the market entries keep what is left).
+                Err(e) => {
+                    if crate::live::no_margin(&format!("{e:#}")) {
+                        let held = self.held_margin();
+                        if self.cap.is_none_or(|(_, until)| now() >= until) {
+                            log!("wick: no margin for {c}: the orders capped at their {held:.2} for an hour");
+                        }
+                        self.cap = Some((held, now() + 3_600.0));
+                    }
+                    log!("wick: {c} bid not placed: {e:#}");
+                }
             }
         }
         if changed {
@@ -1279,7 +1320,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
             p.h3_session_deep_pct * 100.0, p.stop * 100.0, p.hold_s / 60.0));
     }
-    let mut w = Wick { venue, unified, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
+    let mut w = Wick { venue, unified, cap: None, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
         picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
@@ -1386,7 +1427,7 @@ mod tests {
         assert!((p.cry_deep3_pct - 0.12).abs() < 1e-12 && (p.cry_deep3_take - 0.06).abs() < 1e-12 && p.cry_deep3_max_open == 3);
         assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm", "wickl", "wickl2"]);
         assert_eq!(p.rung_exits("WIF", LOW2, false, p.lowvol_deep_pct), (0.05, 0.20, 3_600.0));
-        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12 && (p.margin_budget_pct - 50.0).abs() < 1e-12);
+        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12 && (p.margin_budget_pct - 80.0).abs() < 1e-12);
         // the budget's order: the HIP-3 shallow bids first, the low-volume ladder last
         let order = [(0, true), (ASK, false), (ASK, true), (LOW, false), (1, false), (MAJ, false), (2, false), (1, true), (0, false), (LOW2, false)];
         assert!(order.windows(2).all(|w| priority(w[0].0, w[0].1) > priority(w[1].0, w[1].1)));

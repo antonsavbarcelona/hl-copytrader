@@ -245,7 +245,7 @@ impl Params {
             maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize,
             lowvol_pct: v("WICK_LOWVOL_PCT", 7.0) / 100.0, lowvol_min_vol: v("WICK_LOWVOL_MIN_VOL_USD", 1e6), lowvol_coins: v("WICK_LOWVOL_MAX_COINS", 20.0) as usize,
             lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize, lowvol_deep_pct: v("WICK_LOWVOL_DEEP_PCT", 12.0) / 100.0,
-            margin_budget_pct: v("WICK_MARGIN_BUDGET_PCT", 80.0), thin_min_vol: v("WICK_THIN_MIN_VOL_USD", 0.3e6), thin_coins: v("WICK_THIN_MAX_COINS", 20.0) as usize }
+            margin_budget_pct: v("WICK_MARGIN_BUDGET_PCT", 100.0), thin_min_vol: v("WICK_THIN_MIN_VOL_USD", 0.3e6), thin_coins: v("WICK_THIN_MAX_COINS", 20.0) as usize }
     }
 
     /// A shut-hours bid's level for `coin` at `minute` (a US stock on the weekend, a US night or Sunday night), else None.
@@ -1427,7 +1427,7 @@ mod tests {
         assert!((p.cry_deep3_pct - 0.12).abs() < 1e-12 && (p.cry_deep3_take - 0.06).abs() < 1e-12 && p.cry_deep3_max_open == 3);
         assert_eq!(KINDS, ["wick", "wick2", "wick3", "wicka", "wickm", "wickl", "wickl2"]);
         assert_eq!(p.rung_exits("WIF", LOW2, false, p.lowvol_deep_pct), (0.05, 0.20, 3_600.0));
-        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12 && (p.margin_budget_pct - 80.0).abs() < 1e-12);
+        assert!((p.lowvol_deep_pct - 0.12).abs() < 1e-12 && (p.margin_budget_pct - 100.0).abs() < 1e-12);
         // the budget's order: the HIP-3 shallow bids first, the low-volume ladder last
         let order = [(0, true), (ASK, false), (ASK, true), (LOW, false), (1, false), (MAJ, false), (2, false), (1, true), (0, false), (LOW2, false)];
         assert!(order.windows(2).all(|w| priority(w[0].0, w[0].1) > priority(w[1].0, w[1].1)));

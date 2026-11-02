@@ -939,6 +939,24 @@ impl Wick {
         }
     }
 
+    /// An order's worth per $ of its margin: its family's (`priority`, V289) at the leverage the table assumed, scaled by
+    /// the coin's own (2026-11-03: the picked HIP-3 names isolated at 3x hold ~$35 a bid, a cross one at 10x+ a third
+    /// of it for the same fills; a crypto coin at 3x three times its family's $10).
+    fn worth(&self, c: &str, rung: usize) -> f64 {
+        let h3 = c.contains(':');
+        let (base, lev_ref) = if rung == LOW && self.thin(c) {
+            (THIN_PRIORITY, 4.1)
+        } else {
+            (priority(rung, h3), match (rung, h3) {
+                (_, true) => 3.0,
+                (LOW | LOW2, _) => 5.5,
+                (MAJ, _) => 20.0,
+                _ => 10.0,
+            })
+        };
+        base * self.venue.leverage_of(c) / lev_ref
+    }
+
     /// A resting order's margin $ (its notional / its coin's leverage).
     fn margin_of(&self, c: &str, b: &Bid) -> f64 {
         (b.size * b.px).abs() / self.venue.leverage_of(c)
@@ -955,7 +973,7 @@ impl Wick {
         let mut v: Vec<(f64, String, u64, f64)> = Vec::new();
         for rung in 0..=LOW2 {
             for (c, b) in self.book(rung).clone() {
-                let pr = if rung == LOW && self.thin(&c) { THIN_PRIORITY } else { priority(rung, c.contains(':')) };
+                let pr = self.worth(&c, rung);
                 v.push((pr, c.clone(), b.oid, self.margin_of(&c, &b)));
             }
         }
@@ -986,7 +1004,7 @@ impl Wick {
             .flat_map(|(rung, w)| w.iter().map(move |(c, (_, pct, shut))| (rung, c, *pct, *shut)))
             .map(|(rung, c, pct, shut)| {
                 let stop = self.p.rung_exits(c, rung, shut, pct).1;
-                (if rung == LOW && self.thin(c) { THIN_PRIORITY } else { priority(rung, c.contains(':')) }, rung, c.clone(), risk / stop.max(1e-9) / self.venue.leverage_of(c))
+                (self.worth(c, rung), rung, c.clone(), risk / stop.max(1e-9) / self.venue.leverage_of(c))
             })
             .collect();
         all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(rank(&a.2).cmp(&rank(&b.2))).then(a.2.cmp(&b.2)));

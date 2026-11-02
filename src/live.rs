@@ -863,7 +863,7 @@ pub(crate) fn no_margin(e: &str) -> bool {
     e.contains("Insufficient margin")
 }
 
-async fn usdc_dexes(ex: &Exchange) -> Vec<String> {
+pub(crate) async fn usdc_dexes(ex: &Exchange) -> Vec<String> {
     let read = || async {
         let dexes = ex.info(json!({"type": "perpDexs"})).await?;
         let mut out = Vec::new();

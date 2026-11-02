@@ -140,6 +140,13 @@ const LOW2: usize = 6;
 const MAJORS: [&str; 5] = ["ETH", "SOL", "XRP", "BNB", "DOGE"];
 const POLL_S: f64 = 5.0;
 const ORDERS_EVERY_S: f64 = 15.0;
+/// The account's positions against the strategies' trades: every minute; one no strategy holds for `ORPHAN_AFTER_S`
+/// (a fresh trade registers within seconds) is told on Telegram, again every `ORPHAN_AGAIN_S` while it stays; not in
+/// the first `ORPHAN_BOOT_S` (the modules registering their trades as they start).
+const ORPHANS_EVERY_S: f64 = 60.0;
+const ORPHAN_AFTER_S: f64 = 180.0;
+const ORPHAN_AGAIN_S: f64 = 6.0 * 3_600.0;
+const ORPHAN_BOOT_S: f64 = 300.0;
 const VOLUME_EVERY_S: f64 = 300.0;
 const ORACLE_EVERY_S: f64 = 60.0;
 const AGAIN_AFTER_S: f64 = 3600.0;
@@ -443,6 +450,9 @@ struct Wick {
     unified: bool,
     /// The budget HL's refusal set: (the margin $ the orders held then, until when).
     cap: Option<(f64, f64)>,
+    /// The account's positions no strategy holds: (first seen, last told).
+    orphans: HashMap<String, (f64, f64)>,
+    boot: f64,
     api: Api,
     cfg: Config,
     store: Store,
@@ -896,6 +906,39 @@ impl Wick {
         }
     }
 
+    /// The account's positions (the main dex and the HIP-3 dexes margined in USDC) no strategy's trade holds (the
+    /// registry): told on Telegram, not closed (2026-11-02, the user's call, after xyz:LITE). Any dex unread: that
+    /// dex skipped this time.
+    async fn watch_orphans(&mut self) {
+        let t = now();
+        if t - self.boot < ORPHAN_BOOT_S {
+            return;
+        }
+        let mut pos: HashMap<String, f64> = HashMap::new();
+        match crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+            Ok((_, p)) => pos.extend(p),
+            Err(e) => log!("wick: the positions not read for the orphan check: {e:#}"),
+        }
+        for d in crate::live::usdc_dexes(&self.venue.ex).await {
+            match self.venue.dex_positions(&d).await {
+                Ok(p) => pos.extend(p),
+                Err(e) => log!("wick: {d} positions not read for the orphan check: {e:#}"),
+            }
+        }
+        pos.retain(|c, x| *x != 0.0 && !trades::family_holds(c));
+        self.orphans.retain(|c, _| pos.contains_key(c));
+        for (c, size) in pos {
+            let (first, told) = *self.orphans.entry(c.clone()).or_insert((t, 0.0));
+            if t - first >= ORPHAN_AFTER_S && t - told >= ORPHAN_AGAIN_S {
+                let px = self.closes.at(&c, i64::MAX).unwrap_or(0.0);
+                crate::notify::send(format!("🚨 НЕСАНКЦИОНИРОВАННАЯ СДЕЛКА: {c} {} {:.6} (~${:.0}) — ни одна стратегия бота её не ведёт: нет стопа, тейка и выхода по времени. Проверь и закрой руками.",
+                    if size > 0.0 { "лонг" } else { "шорт" }, size.abs(), size.abs() * px));
+                self.trace(json!({"what": "orphan", "coin": c, "size": size, "px": px, "first_seen": first, "t_done": t}));
+                self.orphans.insert(c, (first, t));
+            }
+        }
+    }
+
     /// A resting order's margin $ (its notional / its coin's leverage).
     fn margin_of(&self, c: &str, b: &Bid) -> f64 {
         (b.size * b.px).abs() / self.venue.leverage_of(c)
@@ -1344,12 +1387,12 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
             p.h3_session_deep_pct * 100.0, p.stop * 100.0, p.hold_s / 60.0));
     }
-    let mut w = Wick { venue, unified, cap: None, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
+    let mut w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
         picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     tokio::spawn(async move {
-        let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at, mut orphans_at) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let mut last_minute = (now() / 60.0).floor() as i64;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
@@ -1380,6 +1423,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             if t - orders_at >= ORDERS_EVERY_S {
                 w.check().await;
                 orders_at = t;
+            }
+            if t - orphans_at >= ORPHANS_EVERY_S {
+                w.watch_orphans().await;
+                orphans_at = t;
             }
             // The levels move with the minutes' closes: once a minute (and at once when BTC jumps).
             if minute > last_minute || !w.state.bids.is_empty() && w.wanted(minute).len() < w.state.bids.len() {

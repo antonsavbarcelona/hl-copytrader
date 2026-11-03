@@ -1,5 +1,6 @@
 # Build, then run the binary alone. The run is kept in Postgres (DATABASE_URL), else in /data.
-FROM rust:1-slim AS build
+# bookworm, as the runtime below (rust:1-slim is trixie: its glibc 2.39+ symbols are missing on bookworm)
+FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src

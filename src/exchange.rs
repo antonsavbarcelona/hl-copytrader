@@ -145,14 +145,30 @@ impl Exchange {
         address(&self.key)
     }
 
+    /// A 429 / 5xx retried with a backoff (1, 2, 4, 8, 16 s): on 2026-11-03 a 429 on the startup's meta crashed the
+    /// bot, and Railway's restarts kept the IP over the limit for hours.
     pub async fn info(&self, body: Value) -> Result<Value> {
-        let r = self.http.post(format!("{}/info", self.base)).json(&body).send().await?;
-        let status = r.status();
-        let v: Value = r.json().await?;
-        if !status.is_success() {
-            bail!("info {status}: {v}");
+        let mut wait = 1.0;
+        let mut last = String::new();
+        for _ in 0..6 {
+            match self.http.post(format!("{}/info", self.base)).json(&body).send().await {
+                Ok(r) => {
+                    let status = r.status();
+                    if status.is_success() {
+                        return Ok(r.json().await?);
+                    }
+                    let text = r.text().await.unwrap_or_default();
+                    if status.as_u16() != 429 && !status.is_server_error() {
+                        bail!("info {status}: {text}");
+                    }
+                    last = format!("info {status}: {text}");
+                }
+                Err(e) => last = format!("info: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
+            wait *= 2.0;
         }
-        Ok(v)
+        bail!("{last}")
     }
 
     /// Signs and sends `action`; the reply's `response` (an error if it is not "ok").

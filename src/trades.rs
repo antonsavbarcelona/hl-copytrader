@@ -318,11 +318,30 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
         Some(o) => v.filled(o).await.map(|x| x.0 > 0.0).unwrap_or(false),
         None => false,
     };
-    let other = if took { t.stop_oid } else { t.take_oid };
-    if let Some(o) = other {
+    // the stop filled or triggered; else the position went another way: closed by hand on the exchange, or liquidated
+    // (2026-11-03, xyz:RELIANCE closed by hand at ~13.90 was told "the stop 12.114, -10%, -$21")
+    let stopped = !took && match t.stop_oid {
+        Some(o) => order_done(v, o).await,
+        None => false,
+    };
+    for o in [t.take_oid, t.stop_oid].into_iter().flatten() {
+        if (took && Some(o) == t.take_oid) || (stopped && Some(o) == t.stop_oid) {
+            continue;
+        }
         v.cancel(&t.coin, o).await;
     }
-    Some(if took { ("take", t.take_px) } else { ("stop", t.stop_px) })
+    let fills = v.close_fills(&t.coin, (t.at * 1000.0) as i64).await;
+    Some(if took {
+        ("take", t.take_px)
+    } else if stopped {
+        ("stop", fills.map_or(t.stop_px, |x| x.0))
+    } else {
+        let px = match fills {
+            Some(x) => x.0,
+            None => v.mid(&t.coin).await.unwrap_or(t.entry_px),
+        };
+        ("manual", px)
+    })
 }
 
 #[cfg(test)]

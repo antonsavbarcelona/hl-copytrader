@@ -127,7 +127,7 @@ fn message(ev: &Value) -> Option<String> {
         "signal" => format!("👀 HIP-3 сигнал (без сделки) {coin}: упала на {:.1}% за {} мин, цена {}, оборот ${:.0}M", f("fall") * 100.0, f("window"), f("mid"), f("volume") / 1e6),
         "open" => format!("🟢 HIP-3 КУПИЛ {coin}: упала на {:.1}%, цена {}, на ${:.0}, стоп {}, выход через {:.0} мин", f("fall") * 100.0, f("px"), f("notional"), f("stop_px"), f("hold_min")),
         "close" => format!("{} HIP-3 {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", _ => "ЗАКРЫЛ" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ HIP-3 {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "result" => format!("{} итог HIP-3 сигнала {coin} через {:.0} мин: {} -> {} ({:+.2}% для лонга, до комиссий)",
             if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),

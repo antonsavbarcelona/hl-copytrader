@@ -178,7 +178,7 @@ fn message(ev: &Value) -> Option<String> {
         "open" => format!("🗜 {} {coin}: 4ч закрытие {} полосы, цена {}, на ${:.0}, выход: закрытие 4ч {} {} или через {:.0} дн., аварийный стоп {}",
             nm.to_uppercase(), if short { "под" } else { "над" }, f("px"), f("notional"), if short { "выше" } else { "ниже" }, f("close_stop"), f("hold_days"), f("stop_px")),
         "close" => format!("{} {nm} {} {coin}: {} -> {} ({:+.2}%, {}, {:.1} дн.)", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "close_stop" => "СТОП по закрытию 4ч", _ => "ЗАКРЫЛ по времени" },
+            match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "close_stop" => "СТОП по закрытию 4ч", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" },
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
         "error" => format!("⚠️ {nm} {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("🗜 сигнал: {nm} {coin} по {} (проба окончена, без сделки)", f("px")),

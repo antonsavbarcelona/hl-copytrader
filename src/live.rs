@@ -430,6 +430,20 @@ impl Venue {
         Ok((num(&o["order"]["origSz"]) - num(&o["order"]["sz"]), o["status"] == "open"))
     }
 
+    /// The account's fills closing `coin` since `since_ms`: their size-weighted price and their size (None: none read).
+    pub(crate) async fn close_fills(&self, coin: &str, since_ms: i64) -> Option<(f64, f64)> {
+        let r = self.ex.info(json!({"type": "userFillsByTime", "user": self.account, "startTime": since_ms})).await.ok()?;
+        let (mut q, mut c) = (0.0, 0.0);
+        for x in r.as_array()? {
+            if x["coin"] == coin && x["dir"].as_str().is_some_and(|d| d.starts_with("Close") || d.contains("Liquidat")) {
+                let sz = num(&x["sz"]);
+                q += sz;
+                c += sz * num(&x["px"]);
+            }
+        }
+        (q > 0.0).then(|| (c / q, q))
+    }
+
     /// An order's status ("open", "filled", "triggered", "canceled", ...) and the size filled.
     pub(crate) async fn order_state(&self, oid: u64) -> Result<(String, f64)> {
         let r = self.ex.info(json!({"type": "orderStatus", "user": self.account, "oid": oid})).await?;

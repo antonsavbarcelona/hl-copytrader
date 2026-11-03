@@ -131,7 +131,7 @@ fn message(ev: &Value) -> Option<String> {
         "open" => format!("📈 ТРЕНД ЛОНГ {coin}: пробой {:.0}-дн. максимума, цена {}, на ${:.0}, выход: закрытие дня на {:.0} ATR ниже лучшего (сейчас ~{}), аварийный стоп {}",
             f("days"), f("px"), f("notional"), f("atr_k"), f("chandelier_px"), f("stop_px")),
         "close" => format!("{} тренд лонг {} {coin}: {} -> {} ({:+.2}%, {}, {:.0} дн.)", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "trail" => "выход по трейлу", _ => "ЗАКРЫЛ по времени" },
+            match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "trail" => "выход по трейлу", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" },
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
         "error" => format!("⚠️ тренд лонг {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("📈 сигнал тренд лонга {coin} по {} (проба окончена, без сделки)", f("px")),

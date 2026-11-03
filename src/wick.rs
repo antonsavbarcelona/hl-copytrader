@@ -439,7 +439,7 @@ fn message(ev: &Value) -> Option<String> {
         "open" => format!("🎣 ПРОКОЛ {coin}: лимитка {:.0}% ниже{} исполнилась по {}, на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
             f("pct") * 100.0, if ev["major"] == true { " (крупная монета)" } else if ev["deep"] == true { " (лесенка)" } else { "" }, f("px"), f("notional"), f("take_px"), f("stop_px"), f("hold_min")),
         "close" => format!("{} прокол {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         _ => return None,
     })

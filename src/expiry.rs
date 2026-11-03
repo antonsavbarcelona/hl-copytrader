@@ -88,7 +88,7 @@ fn message(ev: &Value) -> Option<String> {
     Some(match ev["what"].as_str()? {
         "open" => format!("🔻 ШОРТ ЭКСПИРАЦИИ {coin} (последняя пятница месяца): цена {}, на ${:.0}, стоп {}, закроем в 08:00 UTC", f("px"), f("notional"), f("stop_px")),
         "close" => format!("{} шорт экспирации {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            if ev["why"] == "stop" { "СТОП" } else { "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
+            if ev["why"] == "stop" { "СТОП" } else if ev["why"] == "manual" { "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)" } else { "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ шорт экспирации {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("🔻 сигнал шорта экспирации {coin} по {} (проба окончена, без сделки)", f("px")),
         _ => return None,

@@ -323,7 +323,7 @@ fn message(ev: &Value) -> Option<String> {
         "add" => format!("{tag} ДОБОР {coin} №{:.0}: по {}, средняя {}, тейк {} / стоп {} (на весь объём)", f("units"), f("px"), f("avg"), f("take_px"), f("stop_px")),
         "close" => format!("{} {tag} {} {coin}: средняя {} -> {}, покупок {:.0}, {} ({:+.2}%) | всего {:.0} сделок, в плюсе {:.0}, итог {}",
             if f("pnl_usd") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "take" => "ТЕЙК", "stop" => "СТОП", "error" => "ЗАКРЫТ ИЗ-ЗА ОШИБКИ", _ => "ВЫХОД ПО ВРЕМЕНИ" },
+            match ev["why"].as_str().unwrap_or("") { "take" => "ТЕЙК", "stop" => "СТОП", "error" => "ЗАКРЫТ ИЗ-ЗА ОШИБКИ", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ВЫХОД ПО ВРЕМЕНИ" },
             f("avg"), f("px"), f("units"), usd(f("pnl_usd")), f("ret_pct"), f("closed"), f("wins"), usd(f("total_usd"))),
         "error" => format!("⚠️ RSI-дип {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         _ => return None,

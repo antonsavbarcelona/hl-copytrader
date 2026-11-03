@@ -895,7 +895,7 @@ impl Wick {
         for (rung, want) in wants.into_iter().enumerate() {
             self.place_book(minute, rung, want).await;
         }
-        self.publish_release();
+        self.publish_release(minute);
     }
 
     /// An order just cancelled: its status read; filled (wholly or in part) before the cancel: the trade opened
@@ -982,16 +982,23 @@ impl Wick {
     }
 
     /// The resting orders the market entries may take off, the weakest first.
-    fn publish_release(&mut self) {
+    /// The least volatile coins' orders first (their 24 h 1-minute deviation; the user's call 2026-11-03: a market entry
+    /// short of margin takes the orders of the calmest coins - the least likely to be hit).
+    fn publish_release(&mut self, minute: i64) {
         let mut v: Vec<(f64, String, u64, f64)> = Vec::new();
         for rung in 0..=LOW2 {
             for (c, b) in self.book(rung).clone() {
-                let pr = self.worth(&c, rung);
-                v.push((pr, c.clone(), b.oid, self.margin_of(&c, &b)));
+                let vol = self.closes.spread(&c, minute - 1, 1440, 600).unwrap_or(0.0);
+                v.push((vol, c.clone(), b.oid, self.margin_of(&c, &b)));
             }
         }
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
         crate::live::set_release(v.into_iter().map(|(_, c, o, m)| (c, o, m)).collect());
+    }
+
+    /// The margin the account's open positions hold (all strategies'), by the model: notional / the coin's leverage.
+    fn positions_margin(&self) -> f64 {
+        self.held.iter().filter(|(_, x)| **x != 0.0).map(|(c, x)| x.abs() * self.closes.at(c, i64::MAX).unwrap_or(0.0) / self.venue.leverage_of(c)).sum()
     }
 
     /// A thin coin: the day's volume under the low-volume floor.
@@ -1006,7 +1013,10 @@ impl Wick {
         if self.p.margin_budget_pct <= 0.0 || budget <= 0.0 {
             return;
         }
-        // HL refused one for the margin: no more than the orders held then (less one), for an hour
+        // the open positions' margin (every strategy's: a market entry's margin comes out of the orders' budget; when it
+        // closes the orders come back the next minute)
+        budget -= self.positions_margin();
+        // HL refused one for the margin: no more than the orders held then, for 10 minutes
         if let Some((m, _)) = self.cap.filter(|(_, until)| now() < *until) {
             budget = budget.min(m);
         }
@@ -1093,14 +1103,14 @@ impl Wick {
                 }
                 Ok(Placed::Filled(got, px, _)) => self.filled(&c, got, px, rung).await,
                 // Post-only refused (the price already under the level) or no margin: next time; the margin: the budget
-                // capped at what the orders hold now, for an hour (the market entries keep what is left).
+                // capped at what the orders hold now, for 10 minutes (the market entries keep what is left).
                 Err(e) => {
                     if crate::live::no_margin(&format!("{e:#}")) {
                         let held = self.held_margin();
                         if self.cap.is_none_or(|(_, until)| now() >= until) {
-                            log!("wick: no margin for {c}: the orders capped at their {held:.2} for an hour");
+                            log!("wick: no margin for {c}: the orders capped at their {held:.2} for 10 minutes");
                         }
-                        self.cap = Some((held, now() + 3_600.0));
+                        self.cap = Some((held, now() + 600.0));
                     }
                     log!("wick: {c} bid not placed: {e:#}");
                 }

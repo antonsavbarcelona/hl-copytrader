@@ -3,8 +3,8 @@
 //! A trade is opened at market (`open_market`) or from a bid's fill (`protect`); out at market
 //! when its time is up (`close`); a position gone from the account (its stop or take filled, a
 //! liquidation) ends it (`gone`). Every coin goes cross at its max leverage before its first opening order
-//! (`Venue::ensure_leverage`); a HIP-3 coin the dex keeps isolated only at `H3_ISOLATED_LEVERAGE` (3), so its stop is
-//! hit before its liquidation.
+//! (`Venue::ensure_leverage`); a HIP-3 coin the dex keeps isolated only at `isolated_leverage` (10x max -> 5x; was 3): its
+//! liquidation ~15% away, inside a 20% stop for the 0-2.6% of trades that go that far (V298).
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,22 @@ use crate::live::{Placed, Venue};
 /// (2026-11-01; was 10 from 2026-10-28, V77: the bids' margin a third of the isolated 3x's; on cross the liquidation is
 /// the account's, far past the stops within the family's cap).
 pub(crate) const H3_ISOLATED_LEVERAGE: u32 = 3;
+
+/// The liquidation's distance an isolated position keeps at least (fraction of an adverse move).
+pub(crate) const ISOLATED_LIQ_MIN: f64 = 0.15;
+
+/// The isolated leverage of a coin the dex keeps isolated only, its max `max` (2026-11-03, the user's call: the HIP-3 coins
+/// offer 10x isolated). The liquidation comes at ~ 1/L - the maintenance (half the initial margin at the max: 5% at 10x);
+/// L is the highest that keeps it `ISOLATED_LIQ_MIN` (15%) away: 10x max -> 5x (liquidation ~-15%), 20x -> 5x, 50x -> 6x,
+/// 5x -> 4x, 3x -> 3x. V298 (the HIP-3 families' tape legs, their adverse paths): at 5x 0-2.6% of the trades reach the
+/// liquidation (each then loses its margin, 20% of the notional - the stop's loss), the mean result 161 -> 155 bp (the
+/// shallow bids), 216 -> 197 (the wick), the others unchanged; the margin a trade or a resting order holds 33% -> 20% of
+/// the notional (the result per $ of margin +60%). At 10x 12-30% liquidated: worse.
+pub(crate) fn isolated_leverage(max: u32) -> u32 {
+    let max = max.max(1);
+    let l = (1.0 / (ISOLATED_LIQ_MIN + 0.5 / f64::from(max))).floor() as u32;
+    l.clamp(1, max)
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Trade {
@@ -312,6 +328,11 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_isolated_leverage() {
+        assert_eq!([3, 5, 10, 20, 50].map(isolated_leverage), [3, 4, 5, 5, 6]);
+    }
 
     #[test]
     fn a_switch_is_on_by_default() {

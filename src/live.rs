@@ -209,8 +209,8 @@ impl Venue {
 
     /// The coin's leverage at its max on cross, once a venue (2026-11-01, the user's call: the margin an order holds is its
     /// notional / the leverage, and on cross the liquidation is the account's, not the leverage's: the max saves margin and
-    /// the risk stays the stops'). A coin the dex keeps isolated only: isolated at `H3_ISOLATED_LEVERAGE` (3), the
-    /// liquidation ~30% away, past the stops. Not set on the main dex (an error): the order goes on at the account's
+    /// the risk stays the stops'). A coin the dex keeps isolated only: isolated at `trades::isolated_leverage` (10x max -> 5x), the
+    /// liquidation ~15% away (V298: 0-2.6% of the HIP-3 trades reach it, each losing its margin ~ the 20% stop's loss). Not set on the main dex (an error): the order goes on at the account's
     /// leverage; a HIP-3 coin neither cross nor isolated took: the error.
     pub(crate) async fn ensure_leverage(&self, coin: &str) -> Result<()> {
         if self.lev_set.lock().unwrap().contains_key(coin) {
@@ -226,9 +226,15 @@ impl Venue {
                 log!("live: {coin} leverage {max}x cross not set: {e:#}");
                 return Ok(());
             }
-            set = crate::trades::H3_ISOLATED_LEVERAGE.min(max);
+            set = crate::trades::isolated_leverage(max);
             log!("live: {coin} cross refused ({e:#}): isolated {set}x");
-            self.leverage(coin, set, false).await?;
+            if let Err(e2) = self.leverage(coin, set, false).await {
+                // e.g. a position open at the old isolated leverage: the order goes on at the coin's current setting,
+                // counted at the old 3x (the conservative margin) until a later venue sets it
+                log!("live: {coin} isolated {set}x not set ({e2:#}): kept at its current leverage");
+                self.lev_set.lock().unwrap().insert(coin.to_string(), crate::trades::H3_ISOLATED_LEVERAGE.min(max));
+                return Ok(());
+            }
         }
         self.lev_set.lock().unwrap().insert(coin.to_string(), set);
         Ok(())
@@ -241,7 +247,7 @@ impl Venue {
             return f64::from(*x).max(1.0);
         }
         let max = self.max_lev.get(coin).copied().unwrap_or(1).max(1);
-        f64::from(if coin.contains(':') { crate::trades::H3_ISOLATED_LEVERAGE.min(max) } else { max })
+        f64::from(if coin.contains(':') { crate::trades::isolated_leverage(max) } else { max })
     }
 
     /// A market order (IOC through the mid): the size filled (signed), its average price and

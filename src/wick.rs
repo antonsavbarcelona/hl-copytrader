@@ -453,6 +453,8 @@ struct Wick {
     /// The account's positions no strategy holds: (first seen, last told).
     orphans: HashMap<String, (f64, f64)>,
     boot: f64,
+    /// The budget's diagnostic trace, last written.
+    diag_at: f64,
     api: Api,
     cfg: Config,
     store: Store,
@@ -878,7 +880,18 @@ impl Wick {
                 _ => self.wanted_low(minute, rung),
             })
             .collect();
+        let before: Vec<usize> = wants.iter().map(|w| w.len()).collect();
+        let pre0: HashSet<String> = wants[0].keys().cloned().collect();
         self.within_budget(&mut wants);
+        // every 10 minutes: what each rung wanted, what the budget kept, and why the first picked crypto coins get no bid
+        if now() - self.diag_at >= 600.0 {
+            self.diag_at = now();
+            let kept: Vec<usize> = wants.iter().map(|w| w.len()).collect();
+            let held: f64 = self.held_margin();
+            let why: serde_json::Map<String, Value> = self.picked.iter().take(8).map(|c| (c.clone(), json!(if wants[0].contains_key(c) { "wanted" } else if pre0.contains(c) { "budget" } else { self.why_not(c, minute) }))).collect();
+            self.trace(json!({"what": "budget", "wanted": before, "kept": kept, "budget": self.p.margin_budget_pct / 100.0 * trades::equity(), "equity": trades::equity(),
+                "held_margin": held, "cap": self.cap.map(|x| x.0), "btc_calm": self.btc_calm(minute), "picked": self.picked.len(), "low_picked": self.low_picked.len(), "h3_picked": self.h3_picked.len(), "why_not": why}));
+        }
         for (rung, want) in wants.into_iter().enumerate() {
             self.place_book(minute, rung, want).await;
         }
@@ -1405,7 +1418,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
             p.h3_session_deep_pct * 100.0, p.stop * 100.0, p.hold_s / 60.0));
     }
-    let mut w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
+    let mut w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
         picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);

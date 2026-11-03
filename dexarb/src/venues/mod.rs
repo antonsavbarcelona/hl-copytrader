@@ -3,6 +3,7 @@
 
 pub mod apex;
 pub mod aster;
+pub mod candles;
 pub mod edgex;
 pub mod extended;
 pub mod gmx;

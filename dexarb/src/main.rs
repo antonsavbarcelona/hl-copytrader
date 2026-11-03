@@ -6,9 +6,11 @@
 //!   dexarb ladder ASSET LONG SHORT USD STEPS...    the averaging simulator on the live books (deliverable 4)
 //!   dexarb history [--days D] [--assets N]        the funding history of the shared assets to data/funding (deliverable 5)
 //!   dexarb research                    the funding-only / funding+basis studies on that history (deliverables 5, 7)
+//!   dexarb basis [--days D] [--assets N]          the level-B basis study on 15-min closes (deliverables 5, 7)
 //!   dexarb collect [--every S]         the forward collector + the paper engine (deliverables 5 level D, 6)
 
 mod averaging;
+mod basis;
 mod collect;
 mod exec;
 mod history;
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
             .await
         }
         "research" => research::run(),
+        "basis" => basis::run(&h, arg(&args, "--days", 30.0), arg(&args, "--assets", 25.0) as usize).await,
         "collect" => {
             collect::run(
                 &h,

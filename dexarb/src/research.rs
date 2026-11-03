@@ -379,9 +379,9 @@ fn basis_study(snaps: &[Snap], rep: &mut String) -> Result<()> {
     )?;
     writeln!(
         rep,
-        "| asset | LONG | SHORT | snaps | mid basis mean | std | max | executable entry max | half-life (snaps) | D trades | D mean bp |"
+        "| asset | LONG | SHORT | snaps | mid basis mean | std | max | executable entry max | half-life (snaps) | snaps with the executable entry > 0 | D at the signal: n / mean bp | D a snapshot later: n / mean bp / win |"
     )?;
-    writeln!(rep, "|---|---|---|---|---|---|---|---|---|---|---|")?;
+    writeln!(rep, "|---|---|---|---|---|---|---|---|---|---|---|---|")?;
     let mut rows = Vec::new();
     for ((asset, l, s), v) in &series {
         if v.len() < 10 {
@@ -401,29 +401,41 @@ fn basis_study(snaps: &[Snap], rep: &mut String) -> Result<()> {
         } else {
             f64::INFINITY
         };
-        // strategy D on the snapshots: the trailing median + 2 std (no look-ahead), the executable entry must beat it
-        let (mut n, mut tot) = (0usize, 0.0);
-        let mut i = 20;
-        while i < v.len() {
-            let past: Vec<f64> = v[i - 20..i].iter().map(|x| x.1).collect();
-            let (pm, ps) = (mean(&past), std(&past));
-            if v[i].2 > pm + 2.0 * ps && v[i].2 > 0.0 {
-                // out at the first snapshot the mid basis is back to the trailing mean, or 24 h
-                let mut j = i + 1;
-                while j < v.len() && v[j].1 > pm && v[j].0 - v[i].0 < 86_400_000 {
-                    j += 1;
+        // strategy D on the snapshots (executable both ways): the signal at snapshot i (the executable entry above the
+        // trailing mean + 2 std of the mid basis AND positive after the whole round trip's fees), the entry at i + delay
+        // (delay 1 = the next snapshot, ~60 s later: what a REST bot gets), out at the first snapshot the mid basis is
+        // back at the trailing mean, or 24 h; r = the entry's executable basis - the exit's (the mid basis + the exit's spread)
+        let run = |delay: usize| -> (usize, f64, usize) {
+            let (mut n, mut tot, mut wins) = (0usize, 0.0, 0usize);
+            let mut i = 20;
+            while i + delay < v.len() {
+                let past: Vec<f64> = v[i - 20..i].iter().map(|x| x.1).collect();
+                let (pm, ps) = (mean(&past), std(&past));
+                if v[i].2 > pm + 2.0 * ps && v[i].2 > 0.0 {
+                    let e = i + delay;
+                    let mut j = e + 1;
+                    while j < v.len() && v[j].1 > pm && v[j].0 - v[e].0 < 86_400_000 {
+                        j += 1;
+                    }
+                    let j = j.min(v.len() - 1);
+                    let r = v[e].2 - (v[j].1 + v[j].3);
+                    n += 1;
+                    tot += r;
+                    wins += (r > 0.0) as usize;
+                    i = j + 1;
+                } else {
+                    i += 1;
                 }
-                let j = j.min(v.len() - 1);
-                // captured: the entry's executable basis less the exit's basis (the mid basis then + the exit's spread cost)
-                let r = v[i].2 + 2.0 * 0.0 - (v[j].1 + v[j].3);
-                n += 1;
-                tot += r;
-                i = j + 1;
-            } else {
-                i += 1;
             }
-        }
-        rows.push((emax, format!("| {asset} | {l} | {s} | {} | {:+.3}% | {:.3}% | {:+.3}% | {:+.3}% | {} | {n} | {} |", v.len(), m * 100.0, sd * 100.0, mb.iter().copied().fold(f64::MIN, f64::max) * 100.0, emax * 100.0,
+            (n, tot, wins)
+        };
+        let ((n, tot, w0), (n1, tot1, w1)) = (run(0), run(1));
+        let pos_now = v.iter().filter(|x| x.2 > 0.0).count();
+        let pos_next = v.windows(2).filter(|w| w[0].2 > 0.0 && w[1].2 > 0.0).count();
+        let _ = (w0, w1);
+        let d1 = if n1 > 0 { format!("{n1} / {:+.1} / {:.0}%", tot1 / n1 as f64 * 1e4, w1 as f64 / n1 as f64 * 100.0) } else { "-".into() };
+        let persist = if pos_now > 0 { format!("{pos_now} ({:.0}% still > 0 a snapshot later)", pos_next as f64 / pos_now as f64 * 100.0) } else { "0".into() };
+        rows.push((emax, format!("| {asset} | {l} | {s} | {} | {:+.3}% | {:.3}% | {:+.3}% | {:+.3}% | {} | {persist} | {n} / {} | {d1} |", v.len(), m * 100.0, sd * 100.0, mb.iter().copied().fold(f64::MIN, f64::max) * 100.0, emax * 100.0,
             if hl.is_finite() { format!("{hl:.1}") } else { "none".into() }, if n > 0 { format!("{:+.1}", tot / n as f64 * 1e4) } else { "-".into() })));
     }
     rows.sort_by(|a, b| b.0.total_cmp(&a.0));

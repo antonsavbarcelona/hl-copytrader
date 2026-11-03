@@ -261,6 +261,28 @@ pub(crate) async fn close(v: &Venue, t: &Trade) -> Result<f64> {
 /// ended, the price, and its other order cancelled. None: still held. On a coin another strategy holds too
 /// the account's position outlives ours: then ours is gone when its own stop or take has filled.
 pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<(&'static str, f64)> {
+    // The take filled in part (2026-11-03, io:PRL: 140.6 of 145.2 at the take, 4.6 left with the stop and the take's rest):
+    // the rest closed at market at once, the take's rest and the stop cancelled (the user's call).
+    if held * t.size > 0.0 {
+        if let Some(o) = t.take_oid {
+            if let Ok((f, open)) = v.filled(o).await {
+                if f > 0.0 && f < t.size.abs() * (1.0 - 1e-9) {
+                    if open {
+                        v.cancel(&t.coin, o).await;
+                    }
+                    if let Some(s) = t.stop_oid {
+                        v.cancel(&t.coin, s).await;
+                    }
+                    let rest = (t.size.abs() - f).min(held.abs());
+                    match v.market(&t.coin, -t.size.signum() * rest, true).await {
+                        Ok(_) => crate::log!("{kind}: {} the take filled {f} of {}: the rest {rest} closed at market", t.coin, t.size.abs()),
+                        Err(e) => crate::log!("{kind}: {} the take filled {f} of {}: the rest {rest} not closed: {e:#}", t.coin, t.size.abs()),
+                    }
+                    return Some(("take", t.take_px));
+                }
+            }
+        }
+    }
     if held * t.size > 0.0 {
         if !shared(&t.coin, kind) {
             return None;

@@ -169,7 +169,10 @@ impl Params {
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 5.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
             dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
             trial: Some(v("DIP_TRIAL", 0.0) as u32).filter(|n| *n > 0),
-            pump: PumpParams { enabled: crate::trades::switch("PUMP_ENABLED").is_some(), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
+            // the pump short OFF by default (2026-11-04, the user's call after the robustness run: Binance 5m 2020-26, 894
+            // perps point in time, every one of 18 variants negative, the live params -177 R, t by day -1.1, the walk-forward
+            // worse; the 2025-10-10 rebounds alone -152 R): on only with PUMP_ENABLED=1
+            pump: PumpParams { enabled: std::env::var("PUMP_ENABLED").is_ok_and(|x| x.trim() == "1"), dry: on("PUMP_DRY"), trial: crate::trades::switch("PUMP_ENABLED").flatten(), rise: v("PUMP_RISE_PCT", 20.0) / 100.0, min_vol: v("PUMP_MIN_VOL_USD", 10e6),
                 min_age_days: v("PUMP_MIN_AGE_DAYS", 14.0), hold_s: v("PUMP_HOLD_MIN", 240.0) * 60.0, stop: v("PUMP_STOP_PCT", 50.0) / 100.0,
                 risk: v("PUMP_RISK_PCT", 10.0) / 100.0, risk_usd: v("PUMP_RISK_USD", 20.0), max_open: v("PUMP_MAX_OPEN", 3.0) as usize } }
     }

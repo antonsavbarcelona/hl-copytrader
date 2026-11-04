@@ -521,6 +521,10 @@ impl Dip {
 
     async fn signals(&mut self, minute: i64) {
         let Some(btc) = self.closes.change("BTC", minute, self.p.window) else { return };
+        // BTC's last hour for the crash cap of the clusters (crate::clusters)
+        if let Some(h1) = self.closes.change("BTC", minute, 60) {
+            crate::clusters::set_btc_1h(h1);
+        }
         let decided = now();
         let delay_ms = ((decided - (minute + 1) as f64 * 60.0) * 1000.0).max(0.0) as u64;
         // Every coin's move of its drop either way, before the filters: the research's cooldown.

@@ -9,6 +9,7 @@
 mod account;
 mod alloc;
 mod api;
+mod clusters;
 mod config;
 mod dip;
 mod engine;
@@ -75,6 +76,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     if std::env::var("PAPER_ENABLED").unwrap_or_default().trim() != "1" {
         log!("paper: the paper copy is off (PAPER_ENABLED=1 to run it); the dip-buy only");
         let store = store::open(&cfg).await?;
+        clusters::start(&cfg, api.clone()).await?;
         dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
         hip3::start(&cfg, store.clone(), api.clone()).await?;
         wick::start(&cfg, store.clone(), api.clone()).await?;
@@ -95,6 +97,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let store = store::open(&cfg).await?;
     let live = live::start(&cfg, store.clone(), false, Some(books.clone())).await?;
     // The dip-buy on the same account (on unless DIP_ENABLED=0): its own positions, on the books.
+    clusters::start(&cfg, api.clone()).await?;
     dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
     hip3::start(&cfg, store.clone(), api.clone()).await?;
     wick::start(&cfg, store.clone(), api.clone()).await?;

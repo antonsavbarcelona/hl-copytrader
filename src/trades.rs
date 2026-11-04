@@ -175,7 +175,14 @@ pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
         (m.values().map(Vec::len).sum::<usize>(), m.values().flatten().map(|x| x.1).sum::<f64>(),
          coin_fits(m.get(coin).map_or(&[][..], Vec::as_slice), kind, dir, per_coin()))
     });
-    fits && (cap == 0 || n < cap) && (risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9)
+    // the crash cap (crate::clusters): in a crash a dip buyer opens no more than the cap in one cluster of coins
+    let crowded = crate::clusters::capped_kind(kind) && crate::clusters::cap() > 0 && crate::clusters::crash() && {
+        let cl = crate::clusters::cluster_of(coin);
+        cl.is_some() && g.as_ref().is_some_and(|m| m.iter()
+            .filter(|(c, v)| crate::clusters::cluster_of(c) == cl && v.iter().any(|k| crate::clusters::capped_kind(&k.0)))
+            .count() >= crate::clusters::cap())
+    };
+    fits && !crowded && (cap == 0 || n < cap) && (risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9)
 }
 
 pub(crate) fn register(coin: &str, kind: &str, risk: f64, dir: f64) {

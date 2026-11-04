@@ -547,6 +547,9 @@ impl Dip {
             let t = now();
             let why = if btc.abs() >= self.p.btc_max {
                 Some("btc moved")
+            } else if crate::clusters::weak_market() {
+                // the alt market weak (crate::clusters: under half the main dex's coins over their 50-day mean)
+                Some("weak market")
             } else if self.state.open.values().filter(|p| !p.pump).count() >= self.p.max_open {
                 Some("at most open")
             } else if self.state.open.contains_key(&coin) {

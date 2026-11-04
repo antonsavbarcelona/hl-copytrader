@@ -35,6 +35,50 @@ const MIN_VOL: f64 = 10e6;
 static MAP: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 /// BTC's change over the last 60 minutes and when it was read.
 static BTC_1H: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// The market's breadth: the share of the main dex's coins whose last daily close is over their 50-day mean, and the UTC
+/// day it is of (the regime gate of the dip-buy V2, 2026-11-04: under `BREADTH_MIN` (0.5) the dip-buy opens nothing).
+/// The research (robust/regime2.py, regime_half.py): Binance 2020-26, the dip V2 in the regime +385 R t by day 3.3, out of it
+/// -13 R; robust to a lag of 1-7 days; the portfolio (Binance HL coins, dip + RSI dip, 2%) +439% DD 38.5% vs +446% DD 48.0%;
+/// HL 2025-26 (the live legs w/o trend / squeeze) +836% DD 26.8% worst day -9.7% vs +806% DD 34.4% -18.1%. The walk-forward
+/// choice of a gate picked it only from 2026; 2022 was the exception (out of the regime +34 R vs +8 in).
+static BREADTH: Mutex<Option<(f64, i64)>> = Mutex::new(None);
+
+/// The alt market weak: the breadth known (of yesterday or the day before) and under the threshold.
+pub(crate) fn weak_market() -> bool {
+    let today = (now() / 86_400.0) as i64;
+    BREADTH.lock().unwrap().is_some_and(|(b, day)| today - day <= 2 && b < env_f("BREADTH_MIN", 0.5))
+}
+
+pub(crate) fn breadth() -> Option<(f64, i64)> {
+    *BREADTH.lock().unwrap()
+}
+
+/// The breadth from the daily closes: (the share, the day it is of, the coins counted).
+async fn compute_breadth(api: &Api) -> anyhow::Result<(f64, i64, usize)> {
+    let (coins, _) = api.meta().await?;
+    let start = now() - 60.0 * 86_400.0;
+    let today = (now() / 86_400.0) as i64;
+    let day = today - 1;   // the last full day
+    let (mut above, mut n) = (0usize, 0usize);
+    for c in coins.iter().map(|c| c.name.clone()).filter(|c| c != "BTC") {
+        match api.bar_closes(&c, 1440, start).await {
+            Ok(v) => {
+                let closes: HashMap<i64, f64> = v.into_iter().collect();
+                let past: Vec<f64> = ((day - 49)..=day).filter_map(|d| closes.get(&d).copied()).collect();
+                if let Some(&last) = closes.get(&day) {
+                    if past.len() >= 40 {
+                        n += 1;
+                        above += (last > past.iter().sum::<f64>() / past.len() as f64) as usize;
+                    }
+                }
+            }
+            Err(e) => log!("clusters: breadth {c} not read: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    anyhow::ensure!(n >= 30, "only {n} coins with 50 days");
+    Ok((above as f64 / n as f64, day, n))
+}
 
 /// The strategies the crash cap applies to.
 pub(crate) fn capped_kind(kind: &str) -> bool {
@@ -177,6 +221,37 @@ pub async fn start(cfg: &Config, api: Api) -> anyhow::Result<()> {
                 m.len(), m.values().collect::<std::collections::HashSet<_>>().len(), (now() - at) / 86_400.0, env_f("CLUSTER_BTC_DROP_PCT", 2.0), cap());
             *MAP.lock().unwrap() = Some(m);
         }
+    }
+    if let Some(v) = crate::store::load_doc(cfg, "breadth").await.ok().flatten() {
+        if let (Some(b), Some(d)) = (v["breadth"].as_f64(), v["day"].as_i64()) {
+            *BREADTH.lock().unwrap() = Some((b, d));
+            log!("clusters: the breadth {:.0}% (of day {d}): the dip-buy {}", b * 100.0, if weak_market() { "OFF (a weak market)" } else { "on" });
+        }
+    }
+    // the breadth once a day after the UTC close
+    {
+        let (cfg, api) = (cfg.clone(), api.clone());
+        tokio::spawn(async move {
+            loop {
+                let today = (now() / 86_400.0) as i64;
+                if breadth().is_none_or(|(_, d)| d < today - 1) && now() - today as f64 * 86_400.0 > 600.0 {
+                    match compute_breadth(&api).await {
+                        Ok((b, d, n)) => {
+                            let was = weak_market();
+                            *BREADTH.lock().unwrap() = Some((b, d));
+                            log!("clusters: the breadth {:.0}% of {n} coins over their 50-day mean: the dip-buy {}", b * 100.0, if weak_market() { "OFF (a weak market)" } else { "on" });
+                            if was != weak_market() {
+                                crate::notify::send(&format!("📊 Рынок альтов: {:.0}% монет выше своей 50-дневной средней — покупка просадки {}", b * 100.0,
+                                    if weak_market() { "ВЫКЛЮЧЕНА (слабый рынок)" } else { "ВКЛЮЧЕНА" }));
+                            }
+                            let _ = crate::store::save_doc(&cfg, "breadth", &json!({"breadth": b, "day": d, "coins": n})).await;
+                        }
+                        Err(e) => log!("clusters: the breadth not computed: {e:#}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(900)).await;
+            }
+        });
     }
     let cfg = cfg.clone();
     tokio::spawn(async move {

@@ -43,8 +43,8 @@ struct Params {
     min_vol: f64,
     risk_usd: f64,
     /// `TREND_RISK_SHARE` (0.5): the share of the family's risk a trade. 0.5 since 2026-11-04 (robust/hl_port2.py: the HL
-    /// portfolio 2025-26 as the bot runs, 2%: the trend + both squeezes at half risk +718% DD 31.6% worst day -8.7% vs +568%
-    /// DD 44.1% -13.4%, both halves better; the three still earn on Binance 2020-26, t by day 4.4 / 2.8 / 2.8, so halved, not off).
+    /// portfolio 2025-26, 2%: the trend + the squeeze long at half, the short at 1: +662% DD 36.9% worst day -9.3% vs +568% DD
+    /// 44.1% -13.4%; Binance 2021-26 at the same DD 50%: +17024% vs +8446%; see SQZ_RISK_SHARE in squeeze.rs).
     share: f64,
     max_open: usize,
     /// The trial (`TREND_ENABLED` set empty): its live trades at most.

@@ -16,7 +16,7 @@
 //!
 //! The SHORT side (`SQZS_ENABLED`, as the long's): the mirror, a 4h close under the lower
 //! band after a squeeze (the lowest `SQZS_QUANTILE` (0.1) width), any BTC; out on a 4h close `SQZS_ATR_K` (2) ATR over the
-//! entry or `SQZS_HOLD_DAYS` (5) on; `SQZS_RISK_SHARE` (0.5 since 2026-11-04; was 1) of the family's risk; at most `SQZS_MAX_OPEN` (3). V144 / V145
+//! entry or `SQZS_HOLD_DAYS` (5) on; `SQZS_RISK_SHARE` (1: the full family risk; the hedge of the longs, robust/bn_full2.py) of the family's risk; at most `SQZS_MAX_OPEN` (3). V144 / V145
 //! (Binance 2020-26): +0.32 R a trade vs -0.04 on random bars, 6 of 7 years (2022 +128 R), +0.36 R on the untouched
 //! 2023-26; a candle late +0.27, costs x2 +0.29, w/o the 10 best coins +0.24; the daily P&L corr with the live +0.03, the
 //! trend -0.04, the long squeeze -0.01; in the portfolio at half the risk up in all four spans (Binance 2020-23 / 2023-26,
@@ -54,8 +54,10 @@ struct Params {
     btc_ma: usize,
     min_vol: f64,
     risk_usd: f64,
-    /// `SQZ_RISK_SHARE` / `SQZS_RISK_SHARE` (0.5): the share of the family's risk a trade; 0.5 since 2026-11-04 (see
-    /// `TREND_RISK_SHARE` in trend.rs: the HL portfolio 2025-26 +718% DD 31.6% vs +568% DD 44.1% at 1).
+    /// `SQZ_RISK_SHARE` (0.5 for the long since 2026-11-04) / `SQZS_RISK_SHARE` (1): the share of the family's risk a trade.
+    /// robust/bn_full2.py, the full portfolio (dip, RSI dip, trend, both squeezes), the shares trend / long / short at the same
+    /// DD 50%: Binance 2021-26 1/1/1 +8446%, 0.5/0.5/0.5 +5786%, 0.5/0.5/1 +17024%; HL 2025-26 at 2% +568% DD 44.1% / +718% 31.6% /
+    /// +662% 36.9%: the short hedges the longs over the 6 years, so it keeps the full share.
     share: f64,
     max_open: usize,
     /// The trial (`SQZ_ENABLED` / `SQZS_ENABLED` set empty): its live trades at most.
@@ -79,7 +81,7 @@ impl Params {
     fn short_from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
-            min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 0.5), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
+            min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
             trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
     }
 }

@@ -314,16 +314,27 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
             return None;
         }
     }
-    let took = match t.take_oid {
-        Some(o) => v.filled(o).await.map(|x| x.0 > 0.0).unwrap_or(false),
-        None => false,
-    };
-    // the stop filled or triggered; else the position went another way: closed by hand on the exchange, or liquidated
-    // (2026-11-03, xyz:RELIANCE closed by hand at ~13.90 was told "the stop 12.114, -10%, -$21")
-    let stopped = !took && match t.stop_oid {
-        Some(o) => order_done(v, o).await,
-        None => false,
-    };
+    // The exchange's order status and fills lag the position by a few seconds (2026-11-04, xyz:SNXX: the take filled at
+    // 6.4181, the position gone, the take's status and the fills not yet there -> told "closed outside the bot" at the
+    // mid 6.4274): neither the take nor the stop seen done and no closing fill -> asked again, up to 3 times 2 s apart.
+    let mut took = false;
+    let mut stopped = false;
+    for attempt in 0..4 {
+        took = match t.take_oid {
+            Some(o) => v.filled(o).await.map(|x| x.0 > 0.0).unwrap_or(false),
+            None => false,
+        };
+        // the stop filled or triggered; else the position went another way: closed by hand on the exchange, or liquidated
+        // (2026-11-03, xyz:RELIANCE closed by hand at ~13.90 was told "the stop 12.114, -10%, -$21")
+        stopped = !took && match t.stop_oid {
+            Some(o) => order_done(v, o).await,
+            None => false,
+        };
+        if took || stopped || attempt == 3 || v.close_fills(&t.coin, (t.at * 1000.0) as i64).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
     for o in [t.take_oid, t.stop_oid].into_iter().flatten() {
         if (took && Some(o) == t.take_oid) || (stopped && Some(o) == t.stop_oid) {
             continue;
@@ -331,6 +342,10 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
         v.cancel(&t.coin, o).await;
     }
     let fills = v.close_fills(&t.coin, (t.at * 1000.0) as i64).await;
+    // the order status still behind but the closing fills at the take's price: the take
+    if !took && !stopped && fills.is_some_and(|x| t.take_px > 0.0 && (x.0 / t.take_px - 1.0).abs() < 0.002) {
+        took = true;
+    }
     Some(if took {
         ("take", t.take_px)
     } else if stopped {

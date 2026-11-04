@@ -68,6 +68,15 @@ struct Params {
     kind: &'static str,
     /// Only while BTC is over its mean (the long).
     btc_filter: bool,
+    /// `SQZ_OWN_DAYS` (30 for the long; 0 = off, the short): new entries only while the strategy's own paper trades (all
+    /// its signals on the liquid coins, traded by its rules from the 4h candles, see `paper`) closed in the last that many
+    /// days sum under 0 R. The research (2026-11-05, night/stage1-5, Binance 5m 2021-26, the HL coins): the best of ~600
+    /// regime gates on 2021-23 (+113 R), and on the untouched 2023-26 +46 R; a trade's mean +0.86 R vs +0.46 (+0.73 vs
+    /// +0.43 in 2023-26), 6 of 6 years; the other Binance coins 6 of 7; the full portfolio (the live family) at the same
+    /// drawdown both halves better (+7851% vs +3191%, +1628% vs +693%), beats a random removal of the same count (+71k% vs
+    /// a median +17k%); the windows 14 / 60 days the same way. HL 2025-26: a trade +0.27 R in vs +0.01 out, the portfolio
+    /// -11% (322 trades). The other strategies: no such gate survived (the short worse with it).
+    own_days: f64,
 }
 
 impl Params {
@@ -75,14 +84,14 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 0.5), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true }
+            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true, own_days: v("SQZ_OWN_DAYS", 30.0) }
     }
 
     fn short_from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false }
+            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false, own_days: 0.0 }
     }
 }
 
@@ -147,19 +156,57 @@ fn atr(b: &[Bar]) -> Option<f64> {
 /// or under its mean - 2 std (-1).
 fn breakout(b: &[Bar], q: f64, side: f64) -> bool {
     let c: Vec<f64> = b.iter().map(|x| x.3).collect();
-    let k = c.len();
-    if k < N_BAND + N_HIST_MIN + 1 {
+    !c.is_empty() && breakout_at(&c, &widths(&c), c.len() - 1, q, side)
+}
+
+/// `breakout` at the candle `i` of the closes `c` (their widths `w`).
+fn breakout_at(c: &[f64], w: &[Option<f64>], i: usize, q: f64, side: f64) -> bool {
+    if i + 1 < N_BAND + N_HIST_MIN + 1 {
         return false;
     }
-    let w = widths(&c);
-    let prev = k - 2;
+    let prev = i - 1;
     let hist: Vec<f64> = w[prev + 1 - N_HIST.min(prev + 1)..=prev].iter().flatten().copied().collect();
     let Some(wp) = w[prev] else { return false };
     if hist.len() < N_HIST_MIN || wp > quantile(&hist, q) {
         return false;
     }
-    let band = &c[k - N_BAND..];
-    if side > 0.0 { c[k - 1] > mean(band) + 2.0 * std(band) } else { c[k - 1] < mean(band) - 2.0 * std(band) }
+    let band = &c[i + 1 - N_BAND..=i];
+    if side > 0.0 { c[i] > mean(band) + 2.0 * std(band) } else { c[i] < mean(band) - 2.0 * std(band) }
+}
+
+/// The coin's signals in its last `look` candles (the last, the live one, left out) traded on paper by the rules, one at a
+/// time: in at the breakout's close, out on a 4h close `atr_k` ATR against it (R -1 or worse), on the resting stop twice
+/// that far (R -2) or `hold` candles on; only where `btc_ok` (the candle's open time s). -> (the exit candle's close s,
+/// R = the return / the stop's distance) of each closed one.
+fn paper(b: &[Bar], q: f64, side: f64, atr_k: f64, hold: usize, look: usize, btc_ok: &dyn Fn(f64) -> bool) -> Vec<(f64, f64)> {
+    let c: Vec<f64> = b.iter().map(|x| x.3).collect();
+    let w = widths(&c);
+    let mut out = Vec::new();
+    let mut i = c.len().saturating_sub(look + 1).max(1);
+    while i + 1 < c.len() {
+        let dist = atr(&b[..=i]).map(|a| atr_k * a / c[i]).unwrap_or(0.0);
+        if dist > 0.0 && dist < 0.4 && btc_ok(b[i].0) && breakout_at(&c, &w, i, q, side) {
+            let px = c[i];
+            let mut done = None;
+            for j in i + 1..c.len().min(i + hold + 1) {
+                if (side > 0.0 && b[j].2 <= px * (1.0 - 2.0 * dist)) || (side < 0.0 && b[j].1 >= px * (1.0 + 2.0 * dist)) {
+                    done = Some((j, -2.0));
+                    break;
+                }
+                let r = side * (c[j] / px - 1.0) / dist;
+                if r <= -1.0 || j == i + hold {
+                    done = Some((j, r));
+                    break;
+                }
+            }
+            let Some((j, r)) = done else { break };   // still open: no later signal on the coin
+            out.push((b[j].0 + BAR, r));
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether BTC's last close is over the mean of its last `n` closes.
@@ -184,6 +231,8 @@ fn message(ev: &Value) -> Option<String> {
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
         "error" => format!("⚠️ {nm} {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" => format!("🗜 сигнал: {nm} {coin} по {} (проба окончена, без сделки)", f("px")),
+        "own_off" => format!("🗜 {nm} {coin} по {}: пропущен — свои бумажные сделки за {:.0} дн. {:+.1}R ({:.0} шт.), вход только после своего минуса",
+            f("px"), f("days"), f("own_r"), f("papers")),
         _ => return None,
     })
 }
@@ -261,7 +310,12 @@ impl Squeeze {
             }
             self.state.open.push(pos);
         }
-        let btc = self.bars("BTC", self.p.btc_ma + 5).await.unwrap_or_default();
+        // the own gate's paper window: the trades closed in the last `own_days` began up to `hold` before
+        let look = if self.p.own_days > 0.0 { ((self.p.own_days * DAY + self.p.hold_s) / BAR) as usize + 2 } else { 0 };
+        let btc = self.bars("BTC", self.p.btc_ma + 5 + look).await.unwrap_or_default();
+        // BTC over its mean at each of its candles (the open time s -> bool), for the paper trades' filter
+        let btc_at: std::collections::HashMap<i64, bool> = (self.p.btc_ma.max(1) - 1..btc.len())
+            .map(|i| (btc[i].0 as i64, btc_up(&btc[..=i], self.p.btc_ma))).collect();
         if self.p.btc_filter && !btc_up(&btc, self.p.btc_ma) {
             log!("squeeze: BTC under its 50-day mean (or not read): no entries");
         } else if let Ok(ctx) = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
@@ -271,13 +325,36 @@ impl Squeeze {
                 let name = u["name"].as_str()?;
                 (u["isDelisted"] != true && name != "BTC" && self.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol).then(|| name.to_string())
             }).collect();
+            let (mut cands, mut own, mut papers) = (Vec::new(), 0.0, 0usize);
+            let hold = (self.p.hold_s / BAR).round() as usize;
+            let btc_ok = |t: f64| !self.p.btc_filter || btc_at.get(&(t as i64)).copied().unwrap_or(false);
             for coin in liquid {
-                if self.state.open.iter().any(|x| x.tr.coin == coin) {
+                let held = self.state.open.iter().any(|x| x.tr.coin == coin);
+                if held && look == 0 {
                     continue;
                 }
-                let Some(b) = self.bars(&coin, N_BAND + N_HIST + 5).await else { continue };
+                let Some(b) = self.bars(&coin, N_BAND + N_HIST + 5 + look).await else { continue };
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if b.last().is_none_or(|x| (x.0 - bar).abs() > 1.0) || !breakout(&b, self.p.q, self.p.side) {
+                if look > 0 {
+                    for (t, r) in paper(&b, self.p.q, self.p.side, self.p.atr_k, hold, look, &btc_ok) {
+                        if now() - t <= self.p.own_days * DAY {
+                            own += r;
+                            papers += 1;
+                        }
+                    }
+                }
+                if held || b.last().is_none_or(|x| (x.0 - bar).abs() > 1.0) || !breakout(&b, self.p.q, self.p.side) {
+                    continue;
+                }
+                cands.push((coin, b));
+            }
+            let own_ok = look == 0 || own < 0.0;
+            if look > 0 {
+                log!("{}: its paper trades closed in the last {:.0} days: {papers}, {own:+.1} R: new entries {}", self.p.kind, self.p.own_days, if own_ok { "on (under 0)" } else { "off" });
+            }
+            for (coin, b) in cands {
+                if !own_ok {
+                    self.event(json!({"what": "own_off", "coin": coin, "px": b[b.len() - 1].3, "own_r": own, "papers": papers, "days": self.p.own_days}));
                     continue;
                 }
                 let Some(a) = atr(&b) else { continue };
@@ -434,5 +511,23 @@ mod tests {
         wide.push(160.0);
         assert!(!breakout(&bars(&wide), 0.2, 1.0));
         assert!(atr(&bars(&up)).is_some_and(|a| a > 0.0));
+    }
+
+    #[test]
+    fn the_paper_trades_of_the_own_gate() {
+        let mut c: Vec<f64> = (0..600).map(|i| if i % 2 == 0 { 90.0 } else { 110.0 }).collect();
+        c.extend((0..300).map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 }));
+        c.push(103.0);                                          // the breakout
+        c.extend([103.5, 104.0, 100.0, 100.0, 100.0]);          // then a fall through the stops
+        let b: Vec<Bar> = c.iter().enumerate().map(|(i, x)| (i as f64 * BAR, x * 1.001, x * 0.999, *x)).collect();
+        let p = paper(&b, 0.2, 1.0, 3.0, 60, 10, &|_| true);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].1 <= -1.0, "{p:?}");
+        assert!((p[0].0 - (903.0 * BAR + BAR)).abs() < 1.0, "{p:?}");      // out on the candle of the fall
+        assert!(paper(&b, 0.2, 1.0, 3.0, 60, 10, &|_| false).is_empty());  // BTC under its mean: no paper trade
+        assert!(paper(&b, 0.2, 1.0, 3.0, 60, 3, &|_| true).is_empty());    // the breakout before the window
+        // still open at the end: not counted
+        let open: Vec<Bar> = b[..903].to_vec();
+        assert!(paper(&open, 0.2, 1.0, 3.0, 60, 10, &|_| true).is_empty());
     }
 }

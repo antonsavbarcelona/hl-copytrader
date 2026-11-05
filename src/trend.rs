@@ -42,7 +42,7 @@ struct Params {
     btc_ma: usize,
     min_vol: f64,
     risk_usd: f64,
-    /// `TREND_RISK_SHARE` (0.5): the share of the family's risk a trade. 0.5 since 2026-11-04 (robust/hl_port2.py: the HL
+    /// `TREND_RISK_SHARE` (1; 0.5 on 2026-11-04, back to 1 on 2026-11-05 by the user): the share of the family's risk a trade. Was 0.5 (robust/hl_port2.py: the HL
     /// portfolio 2025-26, 2%: the trend + the squeeze long at half, the short at 1: +662% DD 36.9% worst day -9.3% vs +568% DD
     /// 44.1% -13.4%; Binance 2021-26 at the same DD 50%: +17024% vs +8446%; see SQZ_RISK_SHARE in squeeze.rs).
     share: f64,
@@ -55,7 +55,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { days: v("TREND_DAYS", 20.0) as usize, atr_k: v("TREND_ATR_K", 3.0), max_days: v("TREND_MAX_DAYS", 90.0),
-            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 0.5),
+            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
             max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch("TREND_ENABLED").flatten() }
     }
 }

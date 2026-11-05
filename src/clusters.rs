@@ -36,7 +36,8 @@ static MAP: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 /// BTC's change over the last 60 minutes and when it was read.
 static BTC_1H: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// The market's breadth: the share of the main dex's coins whose last daily close is over their 50-day mean, and the UTC
-/// day it is of (the regime gate of the dip-buy V2, 2026-11-04: under `BREADTH_MIN` (0.5) the dip-buy opens nothing).
+/// day it is of (the regime gate of the dip-buy V2, 2026-11-04: under `BREADTH_MIN` the dip-buy opens nothing; 0 = off since
+/// 2026-11-05: the honest holdout night/stage1-4 found it ~neutral on the full Binance portfolio, so only logged).
 /// The research (robust/regime2.py, regime_half.py): Binance 2020-26, the dip V2 in the regime +385 R t by day 3.3, out of it
 /// -13 R; robust to a lag of 1-7 days; the portfolio (Binance HL coins, dip + RSI dip, 2%) +439% DD 38.5% vs +446% DD 48.0%;
 /// HL 2025-26 (the live legs w/o trend / squeeze) +836% DD 26.8% worst day -9.7% vs +806% DD 34.4% -18.1%. The walk-forward
@@ -46,7 +47,7 @@ static BREADTH: Mutex<Option<(f64, i64)>> = Mutex::new(None);
 /// The alt market weak: the breadth known (of yesterday or the day before) and under the threshold.
 pub(crate) fn weak_market() -> bool {
     let today = (now() / 86_400.0) as i64;
-    BREADTH.lock().unwrap().is_some_and(|(b, day)| today - day <= 2 && b < env_f("BREADTH_MIN", 0.5))
+    BREADTH.lock().unwrap().is_some_and(|(b, day)| today - day <= 2 && b < env_f("BREADTH_MIN", 0.0))
 }
 
 pub(crate) fn breadth() -> Option<(f64, i64)> {

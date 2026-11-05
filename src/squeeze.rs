@@ -54,7 +54,7 @@ struct Params {
     btc_ma: usize,
     min_vol: f64,
     risk_usd: f64,
-    /// `SQZ_RISK_SHARE` (0.5 for the long since 2026-11-04) / `SQZS_RISK_SHARE` (1): the share of the family's risk a trade.
+    /// `SQZ_RISK_SHARE` (1; 0.5 for 2026-11-04 only, back to 1 by the user) / `SQZS_RISK_SHARE` (1): the share of the family's risk a trade.
     /// robust/bn_full2.py, the full portfolio (dip, RSI dip, trend, both squeezes), the shares trend / long / short at the same
     /// DD 50%: Binance 2021-26 1/1/1 +8446%, 0.5/0.5/0.5 +5786%, 0.5/0.5/1 +17024%; HL 2025-26 at 2% +568% DD 44.1% / +718% 31.6% /
     /// +662% 36.9%: the short hedges the longs over the 6 years, so it keeps the full share.
@@ -83,7 +83,7 @@ impl Params {
     fn from_env() -> Self {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
-            min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 0.5), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
+            min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
             trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true, own_days: v("SQZ_OWN_DAYS", 30.0) }
     }
 

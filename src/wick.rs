@@ -212,6 +212,10 @@ struct Params {
     h3_ask_open_pct: f64,
     asia_ask_pct: f64,
     h3_ask_max_open: usize,
+    /// No HIP-3 ask while the coin itself fell this much over the last 24 h (0: off): an ask after a crash fills on the
+    /// bounce (2026-11-05 KORU: -30% on the day, the 3% ask filled off the low). HL 1m 2025-26 (night/h3ask_crash.py): the
+    /// asks after a 24 h fall of 10%+ -0.2% a fill (14) vs +2.5% the rest (51); the HL portfolio at DD 40% +275% vs +270%.
+    h3_ask_crash: f64,
     noneq_shut_pct: f64,
     /// The majors' bids: the level (0: none), the hold, the slots.
     maj_pct: f64,
@@ -248,7 +252,7 @@ impl Params {
             ask_pct: v("WICK_ASK_PCT", 5.0) / 100.0, ask_coins: v("WICK_ASK_MAX_COINS", 5.0) as usize, ask_take: v("WICK_ASK_TAKE_PCT", 3.0) / 100.0,
             ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize,
             h3_ask_shut_pct: v("WICK_H3_ASK_SHUT_PCT", 4.0) / 100.0, h3_ask_open_pct: v("WICK_H3_ASK_OPEN_PCT", 7.0) / 100.0, asia_ask_pct: v("WICK_H3_ASIA_ASK_PCT", 3.0) / 100.0,
-            h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
+            h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, h3_ask_crash: v("WICK_H3_ASK_CRASH_PCT", 15.0) / 100.0, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
             maj_pct: v("WICK_MAJ_PCT", 4.0) / 100.0, maj_hold_s: v("WICK_MAJ_HOLD_MIN", 240.0) * 60.0, maj_max_open: v("WICK_MAJ_MAX_OPEN", 2.0) as usize,
             lowvol_pct: v("WICK_LOWVOL_PCT", 7.0) / 100.0, lowvol_min_vol: v("WICK_LOWVOL_MIN_VOL_USD", 1e6), lowvol_coins: v("WICK_LOWVOL_MAX_COINS", 20.0) as usize,
             lowvol_max_open: v("WICK_LOWVOL_MAX_OPEN", 3.0) as usize, lowvol_deep_pct: v("WICK_LOWVOL_DEEP_PCT", 12.0) / 100.0,
@@ -714,7 +718,9 @@ impl Wick {
                 } else {
                     0.0
                 };
-                if pct > 0.0 && free(c) {
+                // the move over the ~24 h the closes keep (HIST: the oldest one at minute - 1440)
+                let crashed = self.p.h3_ask_crash > 0.0 && self.closes.change(c, minute - 1, HIST as i64 - 2).is_some_and(|x| x <= -self.p.h3_ask_crash);
+                if pct > 0.0 && free(c) && !crashed {
                     out.insert(c.clone(), (close * (1.0 + pct), pct, shut && crate::wkd::us_stock(c)));
                 }
             }
@@ -1410,8 +1416,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             p.ask_pct * 100.0, p.ask_coins, p.ask_take * 100.0, p.ask_stop * 100.0, p.ask_hold_s / 60.0, p.ask_max_open));
     }
     if p.h3_ask_shut_pct > 0.0 || p.h3_ask_open_pct > 0.0 || p.asia_ask_pct > 0.0 || p.noneq_shut_pct > 0.0 {
-        crate::notify::send(format!("🎣 HIP-3 выносы вверх: лимитка на ПРОДАЖУ у акций США на {:.0}% выше, пока биржа закрыта, и на {:.0}% в сессию, у азиатских на {:.0}% в часы США (шорт, тейк = отступ, стоп 20%, до {} позиций); сырьё и крипто-связанные: покупка на {:.0}% ниже, пока биржа США закрыта",
-            p.h3_ask_shut_pct * 100.0, p.h3_ask_open_pct * 100.0, p.asia_ask_pct * 100.0, p.h3_ask_max_open, p.noneq_shut_pct * 100.0));
+        crate::notify::send(format!("🎣 HIP-3 выносы вверх: лимитка на ПРОДАЖУ у акций США на {:.0}% выше, пока биржа закрыта, и на {:.0}% в сессию, у азиатских на {:.0}% в часы США (шорт, тейк = отступ, стоп 20%, на изолированной марже внутри ликвидации, до {} позиций; не ставим, если бумага упала на {:.0}%+ за сутки); сырьё и крипто-связанные: покупка на {:.0}% ниже, пока биржа США закрыта",
+            p.h3_ask_shut_pct * 100.0, p.h3_ask_open_pct * 100.0, p.asia_ask_pct * 100.0, p.h3_ask_max_open, p.h3_ask_crash * 100.0, p.noneq_shut_pct * 100.0));
     }
     if p.lowvol_pct > 0.0 {
         crate::notify::send(format!("🎣 монеты с малым оборотом (${:.0}M .. ${:.0}M в день, {} самых дёрганых): лимитка на {:.0}% ниже, тейк +{:.0}%, стоп {:.0}%, выход через {:.0} мин, до {} позиций",

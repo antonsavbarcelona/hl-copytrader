@@ -20,6 +20,15 @@ pub(crate) const H3_ISOLATED_LEVERAGE: u32 = 3;
 /// The liquidation's distance an isolated position keeps at least (fraction of an adverse move).
 pub(crate) const ISOLATED_LIQ_MIN: f64 = 0.15;
 
+/// The share of the way to an isolated position's liquidation its stop sits at most (`Venue::stop_cap`).
+pub(crate) const LIQ_STOP_SHARE: f64 = 0.9;
+
+/// The stop's farthest distance on an isolated position at leverage `l` on a coin of max `max`: `LIQ_STOP_SHARE` of the
+/// liquidation's (~ 1/l - 0.5/max): 10x max at 5x -> 13.5%, 3x at 3x -> 15%.
+pub(crate) fn liq_stop(l: f64, max: f64) -> f64 {
+    (LIQ_STOP_SHARE * (1.0 / l.max(1.0) - 0.5 / max.max(1.0))).max(0.01)
+}
+
 /// The isolated leverage of a coin the dex keeps isolated only, its max `max` (2026-11-03, the user's call: the HIP-3 coins
 /// offer 10x isolated). The liquidation comes at ~ 1/L - the maintenance (half the initial margin at the max: 5% at 10x);
 /// L is the highest that keeps it `ISOLATED_LIQ_MIN` (15%) away: 10x max -> 5x (liquidation ~-15%), 20x -> 5x, 50x -> 6x,
@@ -240,6 +249,8 @@ pub(crate) fn size_for(risk_usd: f64, stop: f64, px: f64) -> f64 {
 /// `px`: the trade, held `hold_s`. A stop not placed is an error (the caller closes the position).
 pub(crate) async fn protect(v: &Venue, coin: &str, size: f64, px: f64, stop: f64, take: Option<f64>, hold_s: f64) -> Result<Trade> {
     let dir = size.signum();
+    // an isolated position: the stop inside its liquidation (a stop past it never fires)
+    let stop = v.stop_cap(coin).map_or(stop, |c| stop.min(c));
     let stop_px = px * (1.0 - dir * stop);
     let stop_oid = v.stop(coin, dir, size, stop_px).await?;
     let (mut take_px, mut take_oid) = (0.0, None);
@@ -373,6 +384,17 @@ mod tests {
     #[test]
     fn the_isolated_leverage() {
         assert_eq!([3, 5, 10, 20, 50].map(isolated_leverage), [3, 4, 5, 5, 6]);
+    }
+
+    #[test]
+    fn an_isolated_stop_sits_inside_the_liquidation() {
+        assert!((liq_stop(5.0, 10.0) - 0.135).abs() < 1e-9);
+        assert!((liq_stop(3.0, 3.0) - 0.15).abs() < 1e-9);
+        for max in [3, 5, 10, 20, 50] {
+            let l = isolated_leverage(max);
+            let liq = 1.0 / f64::from(l) - 0.5 / f64::from(max);
+            assert!(liq_stop(f64::from(l), f64::from(max)) < liq);
+        }
     }
 
     #[test]

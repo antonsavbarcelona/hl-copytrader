@@ -185,6 +185,8 @@ pub(crate) struct Venue {
     max_lev: Arc<HashMap<String, u32>>,
     /// The leverage each coin was set to (cross at the max, or the HIP-3 isolated fallback).
     lev_set: Arc<Mutex<HashMap<String, u32>>>,
+    /// The coins set isolated (the cross refused): their liquidation is the position's own (`stop_cap`).
+    isolated: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Venue {
@@ -233,11 +235,27 @@ impl Venue {
                 // counted at the old 3x (the conservative margin) until a later venue sets it
                 log!("live: {coin} isolated {set}x not set ({e2:#}): kept at its current leverage");
                 self.lev_set.lock().unwrap().insert(coin.to_string(), crate::trades::H3_ISOLATED_LEVERAGE.min(max));
+                self.isolated.lock().unwrap().insert(coin.to_string());
                 return Ok(());
             }
+            self.isolated.lock().unwrap().insert(coin.to_string());
         }
         self.lev_set.lock().unwrap().insert(coin.to_string(), set);
         Ok(())
+    }
+
+    /// The farthest a stop may sit on the coin (a fraction of the entry): an isolated position's liquidation comes at
+    /// ~ 1/L - the maintenance (half the initial margin at the max), and a stop past it never fires (the margin goes
+    /// first; 2026-11-05: 5x on a 10x coin liquidates at ~-15%, the asks' / dips' stops at 20%), so the stop goes
+    /// `trades::LIQ_STOP_SHARE` of the way to it (10x max at 5x: 13.5%). None: cross (the account's liquidation) or not set.
+    pub(crate) fn stop_cap(&self, coin: &str) -> Option<f64> {
+        if !self.isolated.lock().unwrap().contains(coin) {
+            return None;
+        }
+        // the leverage set, or (a coin kept at its old setting, counted at 3x for the margin) the higher one it may be at
+        let max = self.max_lev.get(coin).copied().unwrap_or(1).max(1);
+        let l = (*self.lev_set.lock().unwrap().get(coin)?).max(crate::trades::isolated_leverage(max));
+        Some(crate::trades::liq_stop(f64::from(l), f64::from(max)))
     }
 
     /// The leverage an order on the coin is margined at: the one set, else what it will be (a HIP-3 coin not set yet: the
@@ -730,7 +748,7 @@ pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Op
         .collect::<HashMap<_, _>>();
     let unified = ex.info(json!({"type": "userAbstraction", "user": account})).await.map(|v| v == "unifiedAccount").unwrap_or(false);
     let max_lev = Arc::new(max_leverage(&meta));
-    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account, max_lev, lev_set: Default::default() }, unified)))
+    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account, max_lev, lev_set: Default::default(), isolated: Default::default() }, unified)))
 }
 
 /// A meta's coins' max leverage.
@@ -770,7 +788,7 @@ pub async fn start(cfg: &Config, store: Store, force: bool, books: Option<crate:
     let (stx, mut srx) = mpsc::unbounded_channel::<StopPlaced>();
     let (ctx, mut crx) = mpsc::unbounded_channel::<LimitClosed>();
     let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account: account.clone(), max_lev: Arc::new(max_leverage(&meta)),
-        lev_set: Default::default() };
+        lev_set: Default::default(), isolated: Default::default() };
     let limits = Limits::from_env(cfg);
     log!("live: entries {}% each{}; exits {}", limits.risk, if limits.rank_weight { " times the trader's weight by his place" } else { "" },
         if limits.exit_limit_s > 0.0 { format!("post-only, at market after {} s", limits.exit_limit_s) } else { "at market".into() });

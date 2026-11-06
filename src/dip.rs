@@ -957,7 +957,7 @@ fn gone(held: f64, size: f64) -> bool {
 /// $ depth on our side within 0.5 / 1 / 2% of the best price, on the other side within 1%, the
 /// top 5 levels of our side, the VWAP the whole order would fill at by these levels (`filled`:
 /// the share of the order the levels hold), its age.
-fn snapshot(b: &crate::ws::Book, buy: bool, size: f64, at: f64) -> Value {
+pub(crate) fn snapshot(b: &crate::ws::Book, buy: bool, size: f64, at: f64) -> Value {
     let (ours, theirs) = if buy { (&b.asks, &b.bids) } else { (&b.bids, &b.asks) };
     let (Some(bid), Some(ask)) = (b.bids.first().map(|x| x.0), b.asks.first().map(|x| x.0)) else { return Value::Null };
     let best = if buy { ask } else { bid };

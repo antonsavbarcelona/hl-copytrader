@@ -263,7 +263,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             for ev in wev {
                 event(&store, ev);
             }
-            // Traded (WKD_LIVE): bought at the paper entry, within the trial, the slots and the family's cap.
+            // Traded (WKD_LIVE): bought on the poll after the signal (px: the signal's mid, or the paper entry), within the trial, the slots and the family's cap.
             if let Some((v, _)) = &venue {
                 for (coin, px) in wentries {
                     let Some(trial) = wp.live else { continue };
@@ -278,10 +278,11 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     }
                     let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
                     let size = crate::trades::size_for(risk, wp.stop(), mid);
+                    let book = v.book_now(&coin, true, size).await;
                     let r = crate::trades::open_market(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s()).await;
                     match r {
                         Ok(tr) => {
-                            event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "size": tr.size, "notional": tr.size * tr.entry_px,
+                            event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "mid": mid, "book": book, "size": tr.size, "notional": tr.size * tr.entry_px,
                                 "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": wp.hold_s() / 3600.0}));
                             crate::trades::register(&coin, "wkd", tr.risk(), tr.size);
                             state.wkd.live.push(tr);

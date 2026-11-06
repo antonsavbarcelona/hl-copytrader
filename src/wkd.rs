@@ -9,7 +9,7 @@
 //! Run inside the HIP-3 loop (its 10 s mids, its volumes); its state with the `hip3` doc.
 //!
 //! Traded (`WKD_LIVE`: unset or "1" live; set empty the trial, its first `TRIAL_TRADES` (3) live, then the shadow only; "0" the shadow
-//! only; the HIP-3 venue needed, as the HIP-3 dip's): at the paper entry (the close of the minute after the signal) bought
+//! only; the HIP-3 venue needed, as the HIP-3 dip's): on the poll after the signal (`BUY_DELAY_S`; the book logged) bought
 //! at market, a resting stop -`WKD_STOP_PCT` and a resting take +`WKD_TAKE_PCT` (reduce-only), out at market `WKD_HOLD_H`
 //! on; the stop losing `WKD_RISK_USD` ($20; `FAMILY_RISK_PCT` of the equity when set), at most `WKD_MAX_OPEN` (3) and the
 //! family's cap, the HIP-3 leverage (cross 10x). Events `wkd_open` / `wkd_exit` / `wkd_error`. The paper record goes on
@@ -46,6 +46,11 @@ const EXCLUDED: &[&str] = &["GOLD", "SILVER", "CL", "OIL", "USOIL", "WTI", "BREN
 const NON_US: &[&str] = &["ANTH", "CXMT", "DRAM", "EWJ", "EWT", "GIGADEV", "HYUNDAI", "JP225", "KIOXIA", "KORU", "EWY", "KR200", "MINIMAX", "OAI", "SHEIN",
     "SKHX", "SKHY", "SMALL2000", "SMSN", "SOFTBANK", "SP500", "SPCX", "UNITREE", "US500", "USA100", "USA500", "USTECH", "XYZ100", "ZHIPU"];
 const REF_MIN: i64 = 15;
+/// The live buy goes out on the first poll this long after the signal (10 s polls: 10 .. 20 s after the mid fell through),
+/// not at the paper's entry a minute on. The raw tape 2025-12 .. 2026-10 (night/tape_an.py, the first taker buy print, 155
+/// events common to both): +189 bp a trade -> +216 / +219 bp (10 / 20 s), paired t 1.2-1.5, the weeks' bootstrap P>0 90-95%,
+/// the HL portfolio at DD 40% +119% -> +136% / +129%, DD the same; 3 s after the signal no gain. A small gain, not a proven one.
+const BUY_DELAY_S: f64 = 5.0;
 const GAP_MIN: i64 = 120;
 const TAKER: f64 = 9e-4 + 5e-4;
 const MAKER: f64 = 3e-4;
@@ -98,6 +103,11 @@ pub(crate) struct Pos {
     fall: f64,
     entry: Option<f64>,
     entry_at: f64,
+    /// The signal's time (s; 0: a position saved before 2026-11-06) and whether the live buy went out.
+    #[serde(default)]
+    at: f64,
+    #[serde(default)]
+    bought: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -210,7 +220,7 @@ impl Book {
                 if fall <= -p.drop {
                     self.last.insert(c.clone(), minute);
                     self.signals += 1;
-                    self.open.push(Pos { coin: c.clone(), minute, mid: lo, fall, entry: None, entry_at: 0.0 });
+                    self.open.push(Pos { coin: c.clone(), minute, mid: lo, fall, entry: None, entry_at: 0.0, at: t, bought: false });
                     out.push(json!({"what": "wkd_signal", "coin": c, "night": !wkend, "fall": fall, "mid": lo, "ref": r, "volume": volume.get(c).copied().unwrap_or(0.0)}));
                 }
             }
@@ -218,13 +228,20 @@ impl Book {
         self.last.retain(|_, x| minute - *x < GAP_MIN);
         let mut keep = Vec::new();
         for mut x in std::mem::take(&mut self.open) {
+            if !x.bought && x.at > 0.0 && t - x.at >= BUY_DELAY_S {
+                x.bought = true;
+                entries.push((x.coin.clone(), x.mid));
+            }
             let Some(e) = x.entry else {
                 if minute >= x.minute + 2 {
                     match closes.at(&x.coin, x.minute + 1) {
                         Some(px) if px > 0.0 => {
                             x.entry = Some(px);
                             x.entry_at = t;
-                            entries.push((x.coin.clone(), px));
+                            if !x.bought {
+                                x.bought = true;
+                                entries.push((x.coin.clone(), px));
+                            }
                         }
                         _ => continue,
                     }
@@ -323,6 +340,17 @@ mod tests {
             let (ev, en) = b.step(&p, &c, &HashMap::new(), &vol, m0 + 2, 120.0);
             assert!(ev.is_empty() && en == vec![("xyz:NVDA".to_string(), 97.0)]);
             assert_eq!(b.open[0].entry, Some(97.0));
+            // a live signal: bought on the poll after, once; the paper entry comes on its own
+            let mut q = Book::default();
+            let (t0, m1) = (1e9, m0 + 1000);
+            for m in m1 - 20..m1 {
+                c.update("xyz:NVDA", m, 100.0, 40);
+            }
+            let lows: HashMap<String, (i64, f64)> = [("xyz:NVDA".to_string(), (m1, 95.5))].into();
+            assert!(q.step(&p, &c, &lows, &vol, m1, t0).1.is_empty());
+            assert_eq!(q.step(&p, &c, &HashMap::new(), &vol, m1, t0 + 10.0).1, vec![("xyz:NVDA".to_string(), 95.5)]);
+            assert!(q.step(&p, &c, &HashMap::new(), &vol, m1 + 2, t0 + 120.0).1.is_empty());
+            assert!(q.open[0].entry.is_some());
             c.update("xyz:NVDA", m0 + 30, 102.0, 40);
             let (ev, _) = b.step(&p, &c, &HashMap::new(), &vol, m0 + 30, 1800.0);
             assert_eq!(ev[0]["why"], "take");

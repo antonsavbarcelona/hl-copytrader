@@ -244,6 +244,20 @@ impl Venue {
         Ok(())
     }
 
+    /// The book for an order of `size` from the API (a HIP-3 coin has no live book here): `dip::snapshot`, Null when not read.
+    pub(crate) async fn book_now(&self, coin: &str, buy: bool, size: f64) -> Value {
+        let v = match self.ex.info(json!({"type": "l2Book", "coin": coin})).await {
+            Ok(v) => v,
+            Err(e) => {
+                log!("live: {coin} book not read: {e:#}");
+                return Value::Null;
+            }
+        };
+        let side = |i: usize| v["levels"][i].as_array().map_or(Vec::new(), |l| l.iter().map(|x| (num(&x["px"]), num(&x["sz"]))).collect());
+        let b = crate::ws::Book { bids: side(0), asks: side(1), time_ms: v["time"].as_u64().unwrap_or(0) };
+        crate::dip::snapshot(&b, buy, size, now())
+    }
+
     /// The farthest a stop may sit on the coin (a fraction of the entry): an isolated position's liquidation comes at
     /// ~ 1/L - the maintenance (half the initial margin at the max), and a stop past it never fires (the margin goes
     /// first; 2026-11-05: 5x on a 10x coin liquidates at ~-15%, the asks' / dips' stops at 20%), so the stop goes

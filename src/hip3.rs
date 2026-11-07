@@ -279,7 +279,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
                     let size = crate::trades::size_for(risk, wp.stop(), mid);
                     let book = v.book_now(&coin, true, size).await;
-                    let r = crate::trades::open_market(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s()).await;
+                    let r = crate::trades::open_market_at(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s(), mid).await;
                     match r {
                         Ok(tr) => {
                             event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "mid": mid, "book": book, "size": tr.size, "notional": tr.size * tr.entry_px,

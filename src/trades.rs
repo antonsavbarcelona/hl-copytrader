@@ -248,6 +248,19 @@ pub(crate) fn size_for(risk_usd: f64, stop: f64, px: f64) -> f64 {
 /// The stop (and the take, a resting reduce-only limit) for a position of `size` (signed) filled at
 /// `px`: the trade, held `hold_s`. A stop not placed is an error (the caller closes the position).
 pub(crate) async fn protect(v: &Venue, coin: &str, size: f64, px: f64, stop: f64, take: Option<f64>, hold_s: f64) -> Result<Trade> {
+    protect_at(v, coin, size, px, stop, take, hold_s, 0.0).await
+}
+
+/// The take's base: the fill, or the price expected (`expect` > 0) when the fill came worse (a long above it, a short
+/// under): the take where the backtest and the paper put it, not pushed out by the slippage (2026-11-07, xyz:SOXL: the
+/// paper in at 45.132 and its take hit at 47.475; ours in at 45.226, its take at 47.487 missed by 0.03%).
+pub(crate) fn take_base(px: f64, expect: f64, dir: f64) -> f64 {
+    if expect > 0.0 && (expect - px) * dir < 0.0 { expect } else { px }
+}
+
+/// `protect` with the take from `take_base(px, expect)`; the stop from the fill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn protect_at(v: &Venue, coin: &str, size: f64, px: f64, stop: f64, take: Option<f64>, hold_s: f64, expect: f64) -> Result<Trade> {
     let dir = size.signum();
     // an isolated position: the stop inside its liquidation (a stop past it never fires)
     let stop = v.stop_cap(coin).map_or(stop, |c| stop.min(c));
@@ -255,7 +268,7 @@ pub(crate) async fn protect(v: &Venue, coin: &str, size: f64, px: f64, stop: f64
     let stop_oid = v.stop(coin, dir, size, stop_px).await?;
     let (mut take_px, mut take_oid) = (0.0, None);
     if let Some(tk) = take {
-        take_px = px * (1.0 + dir * tk);
+        take_px = take_base(px, expect, dir) * (1.0 + dir * tk);
         match v.limit(coin, -size, take_px, true, "Gtc").await {
             Ok(Placed::Resting(o)) => take_oid = Some(o),
             Ok(Placed::Filled(..)) => {}
@@ -269,11 +282,16 @@ pub(crate) async fn protect(v: &Venue, coin: &str, size: f64, px: f64, stop: f64
 /// A position opened at market for `size` (signed), then protected (see `protect`). The stop not
 /// placed: the position closed again and the error returned.
 pub(crate) async fn open_market(v: &Venue, coin: &str, size: f64, stop: f64, take: Option<f64>, hold_s: f64) -> Result<Trade> {
+    open_market_at(v, coin, size, stop, take, hold_s, 0.0).await
+}
+
+/// `open_market` with the take from the price expected when the fill came worse (see `take_base`).
+pub(crate) async fn open_market_at(v: &Venue, coin: &str, size: f64, stop: f64, take: Option<f64>, hold_s: f64, expect: f64) -> Result<Trade> {
     let (got, px, _) = v.market(coin, size, false).await?;
     if got == 0.0 {
         bail!("{coin}: nothing filled");
     }
-    match protect(v, coin, got, px, stop, take, hold_s).await {
+    match protect_at(v, coin, got, px, stop, take, hold_s, expect).await {
         Ok(t) => Ok(t),
         Err(e) => {
             let _ = v.market(coin, -got, true).await;
@@ -384,6 +402,15 @@ mod tests {
     #[test]
     fn the_isolated_leverage() {
         assert_eq!([3, 5, 10, 20, 50].map(isolated_leverage), [3, 4, 5, 5, 6]);
+    }
+
+    #[test]
+    fn the_take_from_the_price_expected_when_the_fill_came_worse() {
+        assert_eq!(take_base(45.226, 45.132, 1.0), 45.132);
+        assert_eq!(take_base(45.0, 45.132, 1.0), 45.0);
+        assert_eq!(take_base(45.226, 0.0, 1.0), 45.226);
+        assert_eq!(take_base(10.0, 10.1, -1.0), 10.1);
+        assert_eq!(take_base(10.2, 10.1, -1.0), 10.2);
     }
 
     #[test]

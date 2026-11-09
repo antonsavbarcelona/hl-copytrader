@@ -914,6 +914,14 @@ impl Wick {
                 self.filled(c, f, b.px, rung).await;
                 false
             }
+            // The status lags a fill by seconds (2026-11-09, xyz:HIMS: the bid filled at 21:08:00.56, cancelled 1.4 s on as
+            // "held" (its own position seen first), the status still "open" with nothing filled -> dropped; the position ran
+            // 8 minutes with no stop, told as an orphan): still "open" after the cancel -> kept for the next check, where a
+            // bid gone from the open orders is settled on its own status.
+            Ok((_, true)) => {
+                log!("wick: {c} order {} still open after the cancel (kept for the check)", b.oid);
+                false
+            }
             Ok(_) => {
                 self.book(rung).remove(c);
                 true

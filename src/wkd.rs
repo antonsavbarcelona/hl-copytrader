@@ -374,3 +374,57 @@ mod tests {
         assert!(message(&ev[0]).unwrap().contains("ночь США"));
     }
 }
+
+#[cfg(test)]
+mod hours_tests {
+    use super::*;
+
+    /// The minute (UTC) of a civil date and time.
+    fn at(y: i64, mo: i64, d: i64, h: i64, mi: i64) -> i64 {
+        days_from_civil(y, mo, d) * 1440 + h * 60 + mi
+    }
+
+    #[test]
+    fn the_utc_weekend_runs_saturday_to_sunday_midnight() {
+        assert!(!weekend(at(2026, 11, 6, 23, 59)));   // Fri
+        assert!(weekend(at(2026, 11, 7, 0, 0)));      // Sat
+        assert!(weekend(at(2026, 11, 8, 23, 59)));    // Sun
+        assert!(!weekend(at(2026, 11, 9, 0, 0)));     // Mon
+    }
+
+    #[test]
+    fn the_us_weeknights_follow_new_york_time_in_and_out_of_summer_time() {
+        // winter (EST, UTC-5): Mon 9 Nov 2026 20:00 ET = Tue 01:00 UTC
+        assert!(!us_night(at(2026, 11, 10, 0, 59)));
+        assert!(us_night(at(2026, 11, 10, 1, 0)));
+        assert!(us_night(at(2026, 11, 10, 8, 59)));   // 03:59 ET
+        assert!(!us_night(at(2026, 11, 10, 9, 0)));   // 04:00 ET: the pre-market
+        // summer (EDT, UTC-4): Tue 14 Jul 2026 20:00 ET = Wed 00:00 UTC
+        assert!(!us_night(at(2026, 7, 14, 23, 59)));
+        assert!(us_night(at(2026, 7, 15, 0, 0)));
+        // Friday night is the weekend's, not a weeknight
+        assert!(!us_night(at(2026, 11, 14, 1, 30)));
+    }
+
+    #[test]
+    fn sunday_night_in_new_york_is_shut_after_the_utc_weekend() {
+        assert!(us_sunday_night(at(2026, 11, 9, 0, 0)));   // Sun 19:00 ET
+        assert!(us_sunday_night(at(2026, 11, 9, 8, 59)));  // Mon 03:59 ET
+        assert!(!us_sunday_night(at(2026, 11, 9, 9, 0)));  // Mon 04:00 ET
+        assert!(!us_sunday_night(at(2026, 11, 8, 12, 0))); // the UTC weekend itself
+        assert!(us_shut(at(2026, 11, 8, 12, 0)) && us_shut(at(2026, 11, 9, 3, 0)) && us_shut(at(2026, 11, 10, 2, 0)));
+        assert!(!us_shut(at(2026, 11, 10, 15, 0)));        // Tue 10:00 ET: open
+    }
+
+    #[test]
+    fn only_the_listed_dexes_stocks_trade_and_the_non_us_not_at_night() {
+        assert!(!tradable("BTC"));
+        assert!(!tradable("nodex:AAPL"));
+        for x in EXCLUDED {
+            assert!(!tradable(&format!("xyz:{x}")), "{x}");
+        }
+        for x in NON_US {
+            assert!(!us_stock(&format!("xyz:{x}")) || EXCLUDED.contains(x), "{x}");
+        }
+    }
+}

@@ -131,3 +131,18 @@ mod tests {
         assert_eq!(round_size(0.0, 5), 0.0);
     }
 }
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn a_size_rounds_toward_zero_to_its_decimals() {
+        assert_eq!(round_size(0.00014, 5), 0.00014);   // 13.999.. steps in binary: still 14
+        assert_eq!(round_size(1.239, 2), 1.23);
+        assert_eq!(round_size(-1.239, 2), -1.23);
+        assert_eq!(round_size(5.0, 0), 5.0);
+        assert_eq!(round_size(0.004, 2), 0.0);
+        assert_eq!(round_size(123456.7, 0), 123456.0);
+    }
+}

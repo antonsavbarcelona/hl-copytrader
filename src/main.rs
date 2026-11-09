@@ -32,6 +32,10 @@ mod trend;
 mod wick;
 mod wickwatch;
 mod wkd;
+#[cfg(test)]
+mod testkit;
+#[cfg(test)]
+mod e2e_tests;
 mod ws;
 
 use std::time::Duration;

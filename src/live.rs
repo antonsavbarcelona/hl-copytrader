@@ -189,6 +189,15 @@ pub(crate) struct Venue {
     isolated: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
+#[cfg(test)]
+impl Venue {
+    /// A venue on a test server (`testkit::FakeHl`): no live books, nothing set yet.
+    pub(crate) fn for_test(ex: Exchange, account: &str, coins: HashMap<String, (u32, u32)>, max_lev: HashMap<String, u32>) -> Venue {
+        Venue { ex, coins: Arc::new(coins), books: None, mids: Default::default(), account: account.to_string(), max_lev: Arc::new(max_lev),
+            lev_set: Default::default(), isolated: Default::default() }
+    }
+}
+
 impl Venue {
     pub(crate) async fn mid(&self, coin: &str) -> Result<f64> {
         if self.ex.mainnet() {
@@ -1489,5 +1498,28 @@ mod tests {
         assert_eq!(again.legs.keys().collect::<Vec<_>>(), vec!["BTC|0xa"]);
         assert_eq!(again.in_coin("BTC").count(), 1);
         assert_eq!(again.in_coin("ETH").count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn an_order_reply_is_read_as_resting_filled_or_an_error() {
+        assert!(matches!(placed("X", &json!({"resting": {"oid": 7}}), true).unwrap(), Placed::Resting(7)));
+        match placed("X", &json!({"filled": {"totalSz": "1.5", "avgPx": "10.2", "oid": 8}}), false).unwrap() {
+            Placed::Filled(got, px, oid) => assert!(got == -1.5 && px == 10.2 && oid == 8),
+            _ => panic!(),
+        }
+        let e = placed("X", &json!({"error": "Post only order would have immediately matched"}), true).unwrap_err();
+        assert!(format!("{e:#}").contains("not placed"));
+        assert!(placed("X", &Value::Null, true).is_err());
+    }
+
+    #[test]
+    fn a_margin_refusal_is_told_apart() {
+        assert!(no_margin("exchange: Insufficient margin to place order. asset=5"));
+        assert!(!no_margin("Order could not immediately match against any resting orders."));
     }
 }

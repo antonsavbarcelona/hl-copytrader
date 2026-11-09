@@ -244,3 +244,22 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn the_wire_and_the_price_rounding_at_their_edges() {
+        assert_eq!(wire(-0.0), "0");
+        assert_eq!(wire(-1.5), "-1.5");
+        assert_eq!(wire(0.000000001), "0");          // under 8 decimals
+        assert_eq!(wire(123456789.0), "123456789");
+        assert_eq!(round_px(0.0, 2), 0.0);
+        assert_eq!(round_px(-5.0, 2), 0.0);
+        assert_eq!(round_px(0.0036841, 0), 0.003684); // 5 significant figures, 6 decimals at most
+        assert_eq!(round_px(45.2264, 2), 45.226);
+        assert_eq!(round_px(104321.7, 5), 104320.0);
+        assert_eq!(round_px(0.12345678, 4), 0.12);    // 6 - 4 decimals
+    }
+}

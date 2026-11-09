@@ -908,26 +908,22 @@ impl Wick {
     /// (2026-11-02, xyz:LITE: filled at 12:19:00, repriced at 12:19:05 as if still resting, the position left
     /// with no stop). True when it was not filled (off the book); the status unread: kept for the check.
     async fn settle_cancelled(&mut self, c: &str, b: &Bid, rung: usize) -> bool {
-        match self.venue.filled(b.oid).await {
-            Ok((f, _)) if f > 0.0 => {
+        let r = self.venue.filled(b.oid).await;
+        match after_cancel(&r) {
+            AfterCancel::Filled(f) => {
                 self.trace(json!({"what": "filled before the cancel", "coin": c, "oid": b.oid, "px": b.px, "size": f, "rung": rung, "t_done": now()}));
                 self.filled(c, f, b.px, rung).await;
                 false
             }
-            // The status lags a fill by seconds (2026-11-09, xyz:HIMS: the bid filled at 21:08:00.56, cancelled 1.4 s on as
-            // "held" (its own position seen first), the status still "open" with nothing filled -> dropped; the position ran
-            // 8 minutes with no stop, told as an orphan): still "open" after the cancel -> kept for the next check, where a
-            // bid gone from the open orders is settled on its own status.
-            Ok((_, true)) => {
-                log!("wick: {c} order {} still open after the cancel (kept for the check)", b.oid);
-                false
-            }
-            Ok(_) => {
+            AfterCancel::Gone => {
                 self.book(rung).remove(c);
                 true
             }
-            Err(e) => {
-                log!("wick: {c} order {} status not read after the cancel (kept for the check): {e:#}", b.oid);
+            AfterCancel::Keep => {
+                match r {
+                    Err(e) => log!("wick: {c} order {} status not read after the cancel (kept for the check): {e:#}", b.oid),
+                    Ok(_) => log!("wick: {c} order {} still open after the cancel (kept for the check)", b.oid),
+                }
                 false
             }
         }
@@ -1493,6 +1489,28 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     Ok(())
 }
 
+/// What a cancelled bid was, from its status read right after the cancel.
+#[derive(Debug, PartialEq)]
+pub(crate) enum AfterCancel {
+    /// filled (in part) before the cancel: the trade, with its stop and take
+    Filled(f64),
+    /// cancelled with nothing filled: off the book
+    Gone,
+    /// not known yet: kept for the next check, which settles it on its own status
+    Keep,
+}
+
+/// The status lags a fill by seconds (2026-11-09, xyz:HIMS: the bid filled at 21:08:00.56, cancelled 1.4 s on as "held"
+/// (its own position seen first), the status still "open" with nothing filled -> dropped; the position ran 8 minutes with
+/// no stop, told as an orphan): still "open" after the cancel, or unread -> kept.
+pub(crate) fn after_cancel(r: &anyhow::Result<(f64, bool)>) -> AfterCancel {
+    match r {
+        Ok((f, _)) if *f > 0.0 => AfterCancel::Filled(*f),
+        Ok((_, true)) | Err(_) => AfterCancel::Keep,
+        Ok(_) => AfterCancel::Gone,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1602,5 +1620,19 @@ mod tests {
         assert_eq!(dex_of("SOL"), "");
         let m = message(&json!({"what": "close", "coin": "SOL", "why": "take", "entry_px": 92.0, "px": 96.6, "ret_pct": 5.0, "pnl_usd": 5.0})).unwrap();
         assert!(m.contains("ТЕЙК") && m.contains("+$5.00"));
+    }
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_bid_is_settled_on_its_status() {
+        assert_eq!(after_cancel(&Ok((2.0, false))), AfterCancel::Filled(2.0));
+        assert_eq!(after_cancel(&Ok((0.5, true))), AfterCancel::Filled(0.5));       // in part, the rest still resting
+        assert_eq!(after_cancel(&Ok((0.0, false))), AfterCancel::Gone);
+        assert_eq!(after_cancel(&Ok((0.0, true))), AfterCancel::Keep);            // the HIMS case: the status behind
+        assert_eq!(after_cancel(&Err(anyhow::anyhow!("no status"))), AfterCancel::Keep);
     }
 }

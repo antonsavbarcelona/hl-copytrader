@@ -35,6 +35,10 @@ fn sender() -> &'static Option<mpsc::UnboundedSender<String>> {
 
 /// Sends `text` to the chat (nothing if it is not set).
 pub fn send(text: impl Into<String>) {
+    // the tests never reach the chat, whatever the environment holds
+    if cfg!(test) {
+        return;
+    }
     if let Some(tx) = sender() {
         let _ = tx.send(text.into());
     }

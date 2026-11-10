@@ -449,11 +449,22 @@ impl Venue {
                 Placed::Filled(..) => bail!("{coin} order {oid} moved and filled at once"),
             };
         }
-        let open = self.ex.info(json!({"type": "openOrders", "user": self.account})).await?;
-        open.as_array().into_iter().flatten()
-            .filter(|o| o["coin"] == coin && (o["side"] == "B") == (size > 0.0) && (num(&o["limitPx"]) - p).abs() <= 1e-9 * p.max(1.0))
-            .filter_map(|o| o["oid"].as_u64()).max()
-            .with_context(|| format!("{coin} order {oid} moved ({r}) but not found among the open orders at {p}"))
+        // the coin's own dex: the main dex's list has no HIP-3 order (2026-11-10: the moved xyz bids not found there,
+        // placed again on top of themselves)
+        let dex = coin.split_once(':').map(|d| d.0).unwrap_or("");
+        for i in 0..3 {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let open = self.ex.info(json!({"type": "openOrders", "user": self.account, "dex": dex})).await?;
+            let found = open.as_array().into_iter().flatten()
+                .filter(|o| o["coin"] == coin && (o["side"] == "B") == (size > 0.0) && (num(&o["limitPx"]) - p).abs() <= 1e-9 * p.max(1.0))
+                .filter_map(|o| o["oid"].as_u64()).max();
+            if let Some(o) = found {
+                return Ok(o);
+            }
+        }
+        bail!("{coin} order {oid} moved ({r}) but not found among the open orders at {p}")
     }
 
     /// The account's leverage on `coin` (isolated unless `cross`).

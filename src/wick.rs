@@ -384,6 +384,21 @@ fn level(anchor: f64, pct: f64) -> f64 {
     anchor * (1.0 - pct)
 }
 
+/// The account's resting orders the wick should hold but does not (`frontendOpenOrders` rows): plain limits, not
+/// reduce-only (the strategies' takes), not a trigger (the stops), on a coin the wick bids on, `STRAY_AGE_S` old (an
+/// order placed this minute is not in the book yet), not tracked. A lost reply or a move not seen leaves one
+/// (2026-11-10: the moved xyz bids placed again on top of themselves).
+pub(crate) fn strays(orders: &[Value], tracked: &HashSet<u64>, coins: &HashSet<String>, now_ms: f64) -> Vec<(String, u64)> {
+    orders.iter()
+        .filter(|o| o["reduceOnly"] != true && o["isTrigger"] != true && o["orderType"] == "Limit")
+        .filter(|o| now_ms - o["timestamp"].as_f64().unwrap_or(now_ms) >= STRAY_AGE_S * 1000.0)
+        .filter_map(|o| Some((o["coin"].as_str()?.to_string(), o["oid"].as_u64()?)))
+        .filter(|(c, oid)| coins.contains(c) && !tracked.contains(oid))
+        .collect()
+}
+
+const STRAY_AGE_S: f64 = 120.0;
+
 /// Whether the level `new` is past a resting order at `old`: under a bid, over an ask (the order would
 /// fill nearer the price than the research had).
 fn level_past(ask: bool, old: f64, new: f64) -> bool {
@@ -1113,6 +1128,34 @@ impl Wick {
         }
     }
 
+    /// The wick's orders it does not hold (`strays`) cancelled: each dex's resting orders read, the books' and the moved
+    /// bids' oids the tracked ones, the coins the books' and the picks'.
+    async fn sweep_strays(&mut self) {
+        let mut tracked: HashSet<u64> = HashSet::new();
+        let mut coins: HashSet<String> = self.picked.iter().chain(&self.h3_picked).chain(&self.low_picked).cloned().collect();
+        for r in 0..=LOW2 {
+            for (c, b) in self.book(r).iter() {
+                tracked.insert(b.oid);
+                coins.insert(c.clone());
+            }
+        }
+        tracked.extend(self.moved.iter().map(|m| m.2.oid));
+        let mut dexes = vec![String::new()];
+        dexes.extend(crate::live::usdc_dexes(&self.venue.ex).await);
+        for d in dexes {
+            let Ok(v) = self.venue.ex.info(json!({"type": "frontendOpenOrders", "user": self.venue.account, "dex": d})).await else { continue };
+            let rows = v.as_array().cloned().unwrap_or_default();
+            for (c, oid) in strays(&rows, &tracked, &coins, now() * 1000.0) {
+                if !self.venue.coins.contains_key(&c) {
+                    continue;
+                }
+                log!("wick: {c} order {oid} rests untracked (a stray): cancelled");
+                self.venue.cancel(&c, oid).await;
+                self.trace(json!({"what": "cancel", "coin": c, "oid": oid, "why": "stray", "t_done": now()}));
+            }
+        }
+    }
+
     async fn place_book(&mut self, minute: i64, rung: usize, want: HashMap<String, (f64, f64, bool)>) {
         let t_calc = now();
         if !self.moved.is_empty() {
@@ -1569,6 +1612,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             }
             if t - orphans_at >= ORPHANS_EVERY_S {
                 w.watch_orphans().await;
+                if (t / 60.0) as i64 % 5 == 0 {
+                    w.sweep_strays().await;
+                }
                 orphans_at = t;
             }
             // The levels move with the minutes' closes: once a minute (and at once when BTC jumps).
@@ -1676,6 +1722,24 @@ mod tests {
         assert!((p.deep_pct - 0.05).abs() < 1e-12 && p.deep_max_open == 3);
         let (take, stop, hold) = p.exits("xyz:NVDA", true, p.deep_pct);
         assert!((take - 0.05).abs() < 1e-12 && (stop - 0.125).abs() < 1e-12 && (hold - 86_400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_strays_are_the_untracked_plain_limits_on_the_wicks_coins() {
+        let now_ms = 1_800_000_000_000.0;
+        let row = |coin: &str, oid: u64, age_s: f64, reduce: bool, kind: &str| json!({"coin": coin, "oid": oid, "timestamp": now_ms - age_s * 1000.0,
+            "reduceOnly": reduce, "isTrigger": kind != "Limit", "orderType": kind});
+        let rows = vec![
+            row("xyz:SNDK", 1, 300.0, false, "Limit"),   // the duplicate: out
+            row("xyz:SNDK", 2, 300.0, false, "Limit"),   // the book's: kept
+            row("xyz:MU", 3, 30.0, false, "Limit"),      // placed this minute: kept
+            row("xyz:SNDK", 4, 300.0, true, "Limit"),    // a take: kept
+            row("xyz:SNDK", 5, 300.0, true, "Stop Market"),
+            row("BTC", 6, 300.0, false, "Limit"),        // not a wick coin (a hand order): kept
+        ];
+        let tracked: HashSet<u64> = [2].into();
+        let coins: HashSet<String> = ["xyz:SNDK".to_string(), "xyz:MU".to_string()].into();
+        assert_eq!(strays(&rows, &tracked, &coins, now_ms), vec![("xyz:SNDK".to_string(), 1)]);
     }
 
     #[test]

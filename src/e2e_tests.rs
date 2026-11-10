@@ -442,3 +442,17 @@ async fn a_bid_filled_or_crossing_is_not_moved_and_nothing_new_rests() {
     let o = f.open_orders("E3A");
     assert!(o.len() == 1 && o[0].oid == b && close(o[0].px, 90.0), "{o:?}");
 }
+
+#[tokio::test]
+async fn a_hip3_bid_moved_with_a_bare_reply_is_found_on_its_own_dex_not_placed_twice() {
+    // 2026-11-10: the moved xyz bids looked up on the main dex, not found, placed again on top of themselves
+    let f = FakeHl::start(&[("xyz:E3B", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    f.with(|s| s.modify_bare_reply = true);
+    let crate::live::Placed::Resting(old) = v.limit("xyz:E3B", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let new = v.modify("xyz:E3B", old, 1.0, 91.0, "Alo").await.unwrap();
+    let o = f.open_orders("xyz:E3B");
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(o[0].oid, new);
+    assert!(close(o[0].px, 91.0));
+}

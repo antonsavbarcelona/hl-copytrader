@@ -162,11 +162,18 @@ pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64, f64)>)
 /// takes it (the same side, not twice, the family's risk cap as any), and it takes no other strategy's place there.
 pub(crate) const RUNG3: &str = "wick3";
 
+/// Whether a trade of `held` on the coin takes a `kind` trade's place there (`per_coin`): the third rung never; for the
+/// HIP-3 dip no wick rung (2026-11-10, the user's call: xyz:NET 2026-11-06 skipped behind two wick rungs, +2.26% on
+/// paper) - still on the same side only, the dip once, the family's risk cap as any.
+fn counts_against(kind: &str, held: &str) -> bool {
+    held != RUNG3 && !(kind == "hip3" && held.starts_with("wick"))
+}
+
 /// Whether the coin may take one more trade of `kind` on side `dir`: free, or held by fewer than `per_coin`
 /// trades (the third rung not counted), none of them `kind`'s, all on the same side; the third rung: any number held.
 fn coin_fits(held: &[(String, f64, f64)], kind: &str, dir: f64, per_coin: usize) -> bool {
     let same = held.iter().all(|k| k.0 != kind && k.2 * dir > 0.0);
-    let n = held.iter().filter(|k| k.0 != RUNG3).count();
+    let n = held.iter().filter(|k| counts_against(kind, &k.0)).count();
     if kind == RUNG3 { same } else { held.is_empty() || (n < per_coin && same) }
 }
 
@@ -476,6 +483,15 @@ mod tests {
         assert!(coin_fits(&[k("wick", 1.0), k("wick2", 1.0)], RUNG3, 1.0, 2));
         assert!(!coin_fits(&[k("wick", 1.0), k(RUNG3, 1.0)], RUNG3, 1.0, 2));
         assert!(!coin_fits(&[k("pump", -1.0)], RUNG3, 1.0, 2));
+        // the HIP-3 dip: the wick's rungs on the coin take no place of it (NET 2026-11-06), the side and once still hold
+        assert!(!coin_fits(&[k("wick", 1.0), k("wick2", 1.0)], "dip", 1.0, 2));
+        assert!(coin_fits(&[k("wick", 1.0), k("wick2", 1.0)], "hip3", 1.0, 2));
+        assert!(coin_fits(&[k("wick", 1.0), k("wick2", 1.0), k(RUNG3, 1.0)], "hip3", 1.0, 1));
+        assert!(!coin_fits(&[k("wicka", -1.0)], "hip3", 1.0, 2));               // a wick ask (short): never against it
+        assert!(!coin_fits(&[k("wick", 1.0), k("hip3", 1.0)], "hip3", 1.0, 2));  // the dip once
+        assert!(!coin_fits(&[k("wick", 1.0), k("rsidip", 1.0)], "hip3", 1.0, 1)); // another strategy still counts
+        // and the wick still bids a coin the dip holds (one of two places)
+        assert!(coin_fits(&[k("hip3", 1.0)], "wick", 1.0, 2));
         assert!(coin_fits(&[k("wick", 1.0), k(RUNG3, 1.0)], "wick2", 1.0, 2));
         assert!(!coin_fits(&[k("wick", 1.0), k("wick2", 1.0), k(RUNG3, 1.0)], "dip", 1.0, 2));
     }

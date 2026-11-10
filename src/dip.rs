@@ -926,8 +926,23 @@ impl Dip {
                 && match p.stop_oid { Some(o) => crate::trades::order_done(&self.venue, o).await, None => false };
             if gone(held, p.size) || stopped {
                 self.state.open.remove(&coin);
-                let mut ev = json!({"what": "stopped", "coin": coin, "size_was": p.size, "entry_px": p.entry_px, "stop_px": p.stop_px,
-                    "pnl_approx": p.size * (p.stop_px - p.entry_px)});
+                // Its own stop, or closed otherwise (by hand, a liquidation: INIT 2026-11-10, +$40.80 told as a -$22 stop):
+                // the price is the closing fills', the stop's only when none are read.
+                let by_stop = stopped || match p.stop_oid { Some(o) => crate::trades::order_done(&self.venue, o).await, None => false };
+                let fills = if stopped { None } else { self.venue.close_fills(&coin, (p.opened * 1000.0) as i64).await };
+                let px = match fills {
+                    Some((px, _)) => px,
+                    None if by_stop => p.stop_px,
+                    None => self.venue.mid(&coin).await.unwrap_or(p.stop_px),
+                };
+                if !by_stop {
+                    if let Some(o) = p.stop_oid {
+                        self.venue.cancel(&coin, o).await;
+                    }
+                }
+                let mut ev = json!({"what": if by_stop { "stopped" } else { "closed_outside" }, "coin": coin, "size_was": p.size,
+                    "entry_px": p.entry_px, "stop_px": p.stop_px, "px": px, "ret_pct": (px / p.entry_px - 1.0) * 100.0 * p.size.signum(),
+                    "pnl_approx": p.size * (px - p.entry_px)});
                 if p.pump {
                     ev["family"] = json!("pump");
                 }
@@ -1001,7 +1016,10 @@ fn message(ev: &Value) -> Option<String> {
         "close" => format!("{} {} {coin} через {:.0} мин: {} -> {} ({:+.2}%), {}",
             if f("pnl_approx") >= 0.0 { "✅" } else { "🔻" }, if ev["family"] == "pump" { "ЗАКРЫЛ ШОРТ" } else { "ПРОДАЛ" },
             f("held_min"), f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_approx"))),
-        "stopped" => format!("🛑 СТОП{} {coin}: {} -> {}, примерно {}", if ev["family"] == "pump" { " ШОРТА" } else { "" }, f("entry_px"), f("stop_px"), usd(f("pnl_approx"))),
+        "stopped" => format!("🛑 СТОП{} {coin}: {} -> {}, примерно {}", if ev["family"] == "pump" { " ШОРТА" } else { "" }, f("entry_px"),
+            if f("px") > 0.0 { f("px") } else { f("stop_px") }, usd(f("pnl_approx"))),
+        "closed_outside" => format!("{} {coin} ЗАКРЫТО ВНЕ БОТА (руками или ликвидация): {} -> {} ({:+.2}%), {}",
+            if f("pnl_approx") >= 0.0 { "✅" } else { "🔻" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_approx"))),
         "pump_open" => format!("🔴 ШОРТ {coin}: выросла на {:.1}% за 15 мин
 цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
             f("rise") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
@@ -1136,5 +1154,9 @@ mod tests {
         let m = message(&json!({"what": "close", "coin": "ZEC", "entry_px": 100.0, "px": 103.0, "ret_pct": 3.0, "pnl_approx": 7.5, "held_min": 60.0})).unwrap();
         assert!(m.contains("ZEC") && m.contains("+3.00%") && m.contains("+$7.50") && m.contains("ПРОДАЛ"));
         assert!(message(&json!({"what": "stop", "coin": "ZEC"})).is_none());
+        let m = message(&json!({"what": "closed_outside", "coin": "INIT", "entry_px": 0.20057, "px": 0.27343, "ret_pct": 36.33, "pnl_approx": 40.80})).unwrap();
+        assert!(m.contains("ВНЕ БОТА") && m.contains("+36.33%") && m.contains("+$40.80") && !m.contains("СТОП"));
+        let m = message(&json!({"what": "stopped", "coin": "ZEC", "entry_px": 100.0, "stop_px": 80.0, "px": 79.5, "pnl_approx": -20.5})).unwrap();
+        assert!(m.contains("СТОП ZEC") && m.contains("79.5") && m.contains("-$20.50"));
     }
 }

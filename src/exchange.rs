@@ -12,6 +12,26 @@ use sha3::{Digest, Keccak256};
 pub const TESTNET: &str = "https://api.hyperliquid-testnet.xyz";
 pub const MAINNET: &str = "https://api.hyperliquid.xyz";
 
+/// The account's address-based request headroom (`userRateLimit`: the cap, 1 request per USDC traded
+/// + 10 000, less the requests used): each action counts its orders / cancels down, a "Too many
+/// cumulative requests" reply sets it to 0, and `live::watch_rate_limit` re-reads it each minute.
+/// Unknown (no watcher: the tests, the paper) = unlimited. On 2026-11-10 the wick's moves spent it all
+/// (~8 000 requests a day against ~$1 700 traded): every order refused for hours, a ZRO exit among them.
+static HEADROOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
+
+pub fn headroom() -> i64 {
+    HEADROOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_headroom(v: i64) {
+    HEADROOM.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the reply is the address's request limit.
+pub fn rate_limited(text: &str) -> bool {
+    text.contains("Too many cumulative requests")
+}
+
 #[derive(Serialize)]
 pub struct OrderWire {
     pub a: u32,
@@ -177,6 +197,12 @@ impl Exchange {
         // Nonces must differ: two actions in one millisecond get consecutive ones.
         let now = (crate::api::now() * 1000.0) as u64;
         let nonce = self.last_nonce.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(now.max(l + 1))).map(|l| now.max(l + 1)).unwrap_or(now);
+        let n = match action {
+            Action::Order { orders, .. } => orders.len(),
+            Action::Cancel { cancels } => cancels.len(),
+            Action::UpdateLeverage { .. } => 1,
+        } as i64;
+        let _ = HEADROOM.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| Some(if h == i64::MAX { h } else { h - n }));
         let signature = sign(&self.key, action, nonce, self.mainnet)?;
         let body = json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": null, "expiresAfter": null});
         let r = self.http.post(format!("{}/exchange", self.base)).json(&body).send().await?;
@@ -184,6 +210,9 @@ impl Exchange {
         let text = r.text().await?;
         let v: Value = serde_json::from_str(&text).with_context(|| format!("exchange {status}: {text}"))?;
         if v["status"] != "ok" {
+            if rate_limited(&text) {
+                set_headroom(0);
+            }
             bail!("exchange: {v}");
         }
         Ok(v["response"].clone())
@@ -248,6 +277,13 @@ mod tests {
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+
+    #[test]
+    fn the_address_limit_reply_is_told() {
+        // the reply of 2026-11-10
+        assert!(rate_limited(r#"{"response":"Too many cumulative requests sent (73958 > 73191) for cumulative volume traded $63192.48. Place taker orders to free up 1 request per USDC traded.","status":"err"}"#));
+        assert!(!rate_limited(r#"{"response":"Insufficient margin to place order.","status":"err"}"#));
+    }
 
     #[test]
     fn the_wire_and_the_price_rounding_at_their_edges() {

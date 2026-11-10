@@ -384,6 +384,12 @@ fn level(anchor: f64, pct: f64) -> f64 {
     anchor * (1.0 - pct)
 }
 
+/// Whether the level `new` is past a resting order at `old`: under a bid, over an ask (the order would
+/// fill nearer the price than the research had).
+fn level_past(ask: bool, old: f64, new: f64) -> bool {
+    if ask { new > old } else { new < old }
+}
+
 /// Whether a resting bid at `old` should move to `new`.
 fn drifted(old: f64, new: f64, up: f64, down: f64) -> bool {
     old <= 0.0 || new >= old * (1.0 + up) || new <= old * (1.0 - down)
@@ -1068,6 +1074,9 @@ impl Wick {
             }
         }
         for (c, (lvl, pct, shut)) in want {
+            // no requests to spare (`live::RATE_RESERVE`): nothing placed or moved; a bid its level left
+            // behind (the level past it: the MRNA case) only cancelled; one the level moved away from stays
+            let spend = crate::live::wick_may_spend();
             let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.rung_exits(&c, rung, shut, pct).1, lvl);
             let mut old = None;
             if let Some(b) = self.book(rung).get(&c).cloned() {
@@ -1075,6 +1084,9 @@ impl Wick {
                 // an ask the mirror: moved up as soon as its level rises, down when it falls far
                 let (up, down) = if rung == ASK { (self.p.reprice_down, self.p.reprice) } else { (self.p.reprice, self.p.reprice_down) };
                 if b.shut == shut && !drifted(b.px, lvl, up, down) {
+                    continue;
+                }
+                if !spend && b.shut == shut && !level_past(rung == ASK, b.px, lvl) {
                     continue;
                 }
                 let t_sent = now();
@@ -1090,6 +1102,9 @@ impl Wick {
                 if !self.settle_cancelled(&c, &b, rung).await {
                     continue;
                 }
+            }
+            if !spend {
+                continue;
             }
             let t_sent = now();
             let placed = self.venue.limit(&c, if rung == ASK { -size } else { size }, lvl, false, "Alo").await;
@@ -1588,6 +1603,11 @@ mod tests {
 
     #[test]
     fn levels_drift_and_the_pick() {
+        // with no requests to spare only a bid the level fell past is cancelled (a bid under it, an ask over it)
+        assert!(level_past(false, 92.0, 91.7));
+        assert!(!level_past(false, 92.0, 94.0));
+        assert!(level_past(true, 108.0, 108.5));
+        assert!(!level_past(true, 108.0, 107.0));
         assert!((level(100.0, 0.08) - 92.0).abs() < 1e-12);
         assert!(!drifted(92.0, 93.0, 0.02, 0.002));      // up 1.1%: stays
         assert!(drifted(92.0, 94.0, 0.02, 0.002));       // up 2.2%: moves

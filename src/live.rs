@@ -754,6 +754,45 @@ impl Limits {
     }
 }
 
+/// Requests the wick keeps free for the exits, the stops and the takes (`exchange::headroom`): under it
+/// the wick places and moves nothing (its cancels go on: they have their own, bigger limit).
+pub(crate) const RATE_RESERVE: i64 = 2000;
+
+/// Re-reads the account's request headroom each minute (`userRateLimit`: an info request, outside the
+/// address's limit); once per process. Told to the chat when it runs out and when it is back.
+fn watch_rate_limit(ex: Exchange, account: String) {
+    static ON: std::sync::Once = std::sync::Once::new();
+    ON.call_once(|| {
+        tokio::spawn(async move {
+            let mut low = false;
+            loop {
+                if let Ok(v) = ex.info(json!({"type": "userRateLimit", "user": account})).await {
+                    let (used, cap) = (v["nRequestsUsed"].as_i64(), v["nRequestsCap"].as_i64());
+                    if let (Some(used), Some(cap)) = (used, cap) {
+                        let h = cap + v["nRequestsSurplus"].as_i64().unwrap_or(0) - used;
+                        crate::exchange::set_headroom(h);
+                        if (h < RATE_RESERVE) != low {
+                            low = h < RATE_RESERVE;
+                            log!("rate limit: headroom {h} (used {used}, cap {cap})");
+                            crate::notify::send(if low {
+                                format!("⚠️ лимит запросов биржи: запас {h} (< {RATE_RESERVE}). Сетка wick на паузе, выходы/стопы/тейки работают")
+                            } else {
+                                format!("✅ лимит запросов биржи: запас {h}, сетка wick снова ставит лимитки")
+                            });
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    });
+}
+
+/// Whether the wick may spend requests (placing, moving).
+pub(crate) fn wick_may_spend() -> bool {
+    crate::exchange::headroom() > RATE_RESERVE
+}
+
 /// The live account's venue from the env (`LIVE_KEY`, `LIVE_ACCOUNT`, `LIVE_NET`), for another
 /// strategy on the account (`dip`): the venue and whether the account is unified; None without them.
 pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Option<(Venue, bool)>> {
@@ -764,6 +803,7 @@ pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Op
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let ex = Exchange::new(base, &key)?;
     let account = account.trim().to_lowercase();
+    watch_rate_limit(ex.clone(), account.clone());
     let meta = ex.info(json!({"type": "meta"})).await.context("meta")?;
     let coins = meta["universe"].as_array().into_iter().flatten().enumerate()
         .filter(|(_, u)| u["isDelisted"] != true)

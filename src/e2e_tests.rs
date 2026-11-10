@@ -280,3 +280,42 @@ async fn an_unknown_order_status_is_kept_not_dropped() {
     assert!(r.is_err());
     assert_eq!(after_cancel(&r), AfterCancel::Keep);
 }
+
+// ---------------------------------------------------------------- the request limit's top-up
+
+#[test]
+fn a_top_up_only_when_low_bounded_by_the_side_and_the_day() {
+    use crate::live::{RATE_RESERVE, TOPUP_DAY_MAX_USD, TOPUP_SIDE_MAX_USD, TOPUP_TARGET, topup_side_usd};
+    assert_eq!(topup_side_usd(RATE_RESERVE, 0.0), None);
+    assert_eq!(topup_side_usd(RATE_RESERVE + 500, 0.0), None);
+    // 2026-11-10: 1 070 over: to the target, at most one side's max
+    assert_eq!(topup_side_usd(-1070, 0.0), Some((TOPUP_TARGET + 1070) as f64 / 2.0));
+    assert_eq!(topup_side_usd(-3000, 0.0), Some(TOPUP_SIDE_MAX_USD));
+    assert_eq!(topup_side_usd(1900, 0.0), Some((TOPUP_TARGET - 1900) as f64 / 2.0));
+    // the day's volume spent: what is left of it, nothing under the exchange's minimum
+    assert_eq!(topup_side_usd(0, TOPUP_DAY_MAX_USD - 1000.0), Some(500.0));
+    assert_eq!(topup_side_usd(0, TOPUP_DAY_MAX_USD - 10.0), None);
+    assert_eq!(topup_side_usd(0, TOPUP_DAY_MAX_USD), None);
+}
+
+#[tokio::test]
+async fn a_top_up_buys_and_sells_back_leaving_nothing_open() {
+    let f = FakeHl::start(&[("BTC", 5, 40, 100000.0), ("ETH", 4, 25, 3000.0)]).await;
+    let vol = crate::live::topup(&f.venue(), 1000.0).await.unwrap();
+    assert!(close(vol, 2000.0), "{vol}");
+    assert!(close(f.position("BTC"), 0.0) && close(f.position("ETH"), 0.0));
+    let sells: Vec<_> = f.with(|s| s.actions.iter().filter(|a| a["type"] == "order").map(|a| a["orders"][0]["r"].clone()).collect());
+    assert_eq!(sells, vec![serde_json::json!(false), serde_json::json!(true)], "the sell back reduce-only");
+}
+
+#[tokio::test]
+async fn a_top_up_leaves_a_held_coin_alone() {
+    let f = FakeHl::start(&[("BTC", 5, 40, 100000.0), ("ETH", 4, 25, 3000.0)]).await;
+    f.hand_trade("BTC", -0.01); // a strategy's BTC short
+    let vol = crate::live::topup(&f.venue(), 300.0).await.unwrap();
+    assert!(close(vol, 600.0));
+    assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.0));
+    f.hand_trade("ETH", 0.1);
+    assert_eq!(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 0.0, "both held: nothing traded");
+    assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.1));
+}

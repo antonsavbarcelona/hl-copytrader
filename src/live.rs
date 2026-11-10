@@ -758,31 +758,87 @@ impl Limits {
 /// the wick places and moves nothing (its cancels go on: they have their own, bigger limit).
 pub(crate) const RATE_RESERVE: i64 = 2000;
 
+/// The headroom a top-up aims at, and its bounds: one side's $ at most, the volume a UTC day may spend
+/// on it ($6 000: ~$2.7 of taker fees at 0.045%; the requests then cost ~$0.00045 each, as the
+/// `reserveRequestWeight` purchase would, which a unified account cannot pay: 2026-11-10).
+pub(crate) const TOPUP_TARGET: i64 = RATE_RESERVE + 1500;
+pub(crate) const TOPUP_SIDE_MAX_USD: f64 = 2500.0;
+pub(crate) const TOPUP_DAY_MAX_USD: f64 = 6000.0;
+/// The coins a top-up trades (the first the account holds no position in): the deepest books.
+const TOPUP_COINS: [&str; 2] = ["BTC", "ETH"];
+
+/// A top-up's one side in $ (bought, then sold: twice that traded, 1 request per $), None when the
+/// headroom is enough or the day's volume is spent; at least $12 (the exchange's $10 minimum).
+pub(crate) fn topup_side_usd(headroom: i64, spent_today: f64) -> Option<f64> {
+    if headroom >= RATE_RESERVE {
+        return None;
+    }
+    let side = ((TOPUP_TARGET - headroom) as f64 / 2.0).min(TOPUP_SIDE_MAX_USD).min((TOPUP_DAY_MAX_USD - spent_today) / 2.0);
+    (side >= 12.0).then(|| side.max(12.0))
+}
+
+/// Buys `usd` of a top-up coin at market and sells it back (reduce-only, retried until it goes: an
+/// exit, never left open); the volume traded. Skipped (0) while the account holds both coins.
+pub(crate) async fn topup(v: &Venue, usd: f64) -> Result<f64> {
+    let held = v.dex_positions("").await?;
+    let Some(coin) = TOPUP_COINS.iter().copied().find(|c| !held.contains_key(*c) && v.coins.contains_key(*c)) else { return Ok(0.0) };
+    let mid = v.mid(coin).await?;
+    // market_once: no resting bids taken off for its margin
+    let (got, px, _) = v.market_once(coin, usd / mid, false).await?;
+    let mut last = String::new();
+    for _ in 0..60 {
+        match v.market_once(coin, -got, true).await {
+            Ok((sold, px2, _)) => return Ok(got.abs() * px + sold.abs() * px2),
+            Err(e) => last = format!("{e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    crate::notify::send(format!("🆘 добор лимита: {coin} {got} куплен и не продан ({last}) — закрой руками"));
+    bail!("top-up {coin}: bought {got}, not sold back: {last}")
+}
+
 /// Re-reads the account's request headroom each minute (`userRateLimit`: an info request, outside the
-/// address's limit); once per process. Told to the chat when it runs out and when it is back.
-fn watch_rate_limit(ex: Exchange, account: String) {
+/// address's limit) and tops it up with volume when it runs low (`topup`); once per process. Told to the
+/// chat when it runs out and when it is back.
+fn watch_rate_limit(v: Venue) {
     static ON: std::sync::Once = std::sync::Once::new();
     ON.call_once(|| {
         tokio::spawn(async move {
-            let mut low = false;
+            let (mut low, mut day, mut spent) = (false, 0i64, 0.0);
             loop {
-                if let Ok(v) = ex.info(json!({"type": "userRateLimit", "user": account})).await {
-                    let (used, cap) = (v["nRequestsUsed"].as_i64(), v["nRequestsCap"].as_i64());
-                    if let (Some(used), Some(cap)) = (used, cap) {
-                        let h = cap + v["nRequestsSurplus"].as_i64().unwrap_or(0) - used;
+                let mut wait = 60;
+                if let Ok(r) = v.ex.info(json!({"type": "userRateLimit", "user": v.account})).await {
+                    if let (Some(used), Some(cap)) = (r["nRequestsUsed"].as_i64(), r["nRequestsCap"].as_i64()) {
+                        let h = cap + r["nRequestsSurplus"].as_i64().unwrap_or(0) - used;
                         crate::exchange::set_headroom(h);
                         if (h < RATE_RESERVE) != low {
                             low = h < RATE_RESERVE;
                             log!("rate limit: headroom {h} (used {used}, cap {cap})");
                             crate::notify::send(if low {
-                                format!("⚠️ лимит запросов биржи: запас {h} (< {RATE_RESERVE}). Сетка wick на паузе, выходы/стопы/тейки работают")
+                                format!("⚠️ лимит запросов биржи: запас {h} (< {RATE_RESERVE}). Wick на паузе, добираю оборотом")
                             } else {
-                                format!("✅ лимит запросов биржи: запас {h}, сетка wick снова ставит лимитки")
+                                format!("✅ лимит запросов биржи: запас {h}, wick снова ставит лимитки")
                             });
+                        }
+                        let today = (now() / 86400.0) as i64;
+                        if today != day {
+                            (day, spent) = (today, 0.0);
+                        }
+                        if let Some(usd) = topup_side_usd(h, spent) {
+                            match topup(&v, usd).await {
+                                Ok(vol) if vol > 0.0 => {
+                                    spent += vol;
+                                    log!("rate limit: topped up, ${vol:.0} traded (${spent:.0} today), headroom was {h}");
+                                    // the cap catches up with the volume: not read again at once
+                                    wait = 180;
+                                }
+                                Ok(_) => log!("rate limit: no top-up coin free (positions in all)"),
+                                Err(e) => log!("rate limit: top-up failed: {e:#}"),
+                            }
                         }
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             }
         });
     });
@@ -803,7 +859,6 @@ pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Op
     let base = if std::env::var("LIVE_NET").unwrap_or_default() == "mainnet" { MAINNET } else { TESTNET };
     let ex = Exchange::new(base, &key)?;
     let account = account.trim().to_lowercase();
-    watch_rate_limit(ex.clone(), account.clone());
     let meta = ex.info(json!({"type": "meta"})).await.context("meta")?;
     let coins = meta["universe"].as_array().into_iter().flatten().enumerate()
         .filter(|(_, u)| u["isDelisted"] != true)
@@ -811,7 +866,12 @@ pub(crate) async fn venue_from_env(books: Option<crate::ws::Books>) -> Result<Op
         .collect::<HashMap<_, _>>();
     let unified = ex.info(json!({"type": "userAbstraction", "user": account})).await.map(|v| v == "unifiedAccount").unwrap_or(false);
     let max_lev = Arc::new(max_leverage(&meta));
-    Ok(Some((Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account, max_lev, lev_set: Default::default(), isolated: Default::default() }, unified)))
+    let venue = Venue { ex, coins: Arc::new(coins), books, mids: Default::default(), account, max_lev, lev_set: Default::default(), isolated: Default::default() };
+    // mainnet only: the testnet's limits are not ours to pay
+    if base == MAINNET {
+        watch_rate_limit(venue.clone());
+    }
+    Ok(Some((venue, unified)))
 }
 
 /// A meta's coins' max leverage.

@@ -35,7 +35,8 @@ Covered end-to-end: opening long / short with the stop and the take resting; the
 refused -> closed again; isolated HIP-3 stop cap; the take from the price expected (worse and better fills); the margin
 refusal releasing resting bids; post-only crossing; reduce-only with nothing held; a trade ending at the take, the stop,
 by hand, a partial take, a lagging take status; closing on time; a held trade not ended; a bid filled just before its
-cancel with a lagging status (HIMS), cancelled clean, filled in part, an unknown status.
+cancel with a lagging status (HIMS), cancelled clean, filled in part, an unknown status; the request limit's top-up
+(bought and sold back reduce-only, nothing left open; a held BTC left alone, ETH used; both held: nothing traded).
 
 Unit: signing (the SDK's vectors), wire / price / size rounding at the edges, order replies, the margin error, the
 after-cancel decision, the family registry (`coin_fits`), sizes and returns, isolated leverage and the liquidation stop,

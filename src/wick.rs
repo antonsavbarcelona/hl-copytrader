@@ -484,6 +484,9 @@ struct Wick {
     /// When the mids and the contexts (the oracles) were read last (the trace's quote ages).
     mids_at: f64,
     ctx_at: f64,
+    /// Bids moved in one request whose oid changed (`Venue::modify`): (coin, rung, the old bid, when), the old
+    /// order's status read on for a fill in part just before the move (the cancel's settlement, deferred).
+    moved: Vec<(String, usize, Bid, f64)>,
 }
 
 impl Wick {
@@ -1057,8 +1060,64 @@ impl Wick {
         }
     }
 
+    /// A bid moved to `lvl` in one request (`Venue::modify`): only an order still open with nothing filled (a fill in
+    /// part goes the cancel's way, settled as a trade); None: not moved (the caller cancels and places).
+    async fn try_move(&mut self, c: &str, b: &Bid, rung: usize, lvl: f64, size: f64) -> Option<u64> {
+        if !crate::live::modify_on() {
+            return None;
+        }
+        match self.venue.filled(b.oid).await {
+            Ok((f, true)) if f == 0.0 => {}
+            _ => return None,
+        }
+        match self.venue.modify(c, b.oid, if rung == ASK { -size } else { size }, lvl, "Alo").await {
+            Ok(oid) => Some(oid),
+            Err(e) => {
+                log!("wick: {c} order {} not moved ({e:#}): cancelled and placed", b.oid);
+                None
+            }
+        }
+    }
+
+    /// The moved bids' old orders (`moved`): one filled in part just before its move (its status behind) - that part
+    /// the trade, the moved order taken off first; one gone with nothing filled, or 10 minutes on, let go.
+    async fn settle_moved(&mut self, rung: usize) {
+        let due: Vec<(String, usize, Bid, f64)> = self.moved.iter().filter(|m| m.1 == rung).cloned().collect();
+        for (c, r, old, at) in due {
+            let st = self.venue.filled(old.oid).await;
+            let done = match st {
+                Ok((f, _)) if f > 0.0 => {
+                    self.trace(json!({"what": "filled before the move", "coin": c, "oid": old.oid, "px": old.px, "size": f, "rung": r, "t_done": now()}));
+                    if let Some(cur) = self.book(r).get(&c).cloned() {
+                        self.venue.cancel(&c, cur.oid).await;
+                        if !self.settle_cancelled(&c, &cur, r).await {
+                            // the moved order filled too, or its status behind: the old part told, the orphan check holds the rest
+                            log!("wick: {c} order {} filled {f} before its move, the moved order {} not settled clean", old.oid, cur.oid);
+                            crate::notify::send(format!("⚠️ wick {c}: лимитка исполнилась на {f} прямо перед перестановкой — проверь позицию"));
+                            true
+                        } else {
+                            self.filled(&c, f, old.px, r).await;
+                            true
+                        }
+                    } else {
+                        self.filled(&c, f, old.px, r).await;
+                        true
+                    }
+                }
+                Ok((_, false)) => now() - at > 120.0,
+                _ => now() - at > 600.0,
+            };
+            if done {
+                self.moved.retain(|m| m.2.oid != old.oid);
+            }
+        }
+    }
+
     async fn place_book(&mut self, minute: i64, rung: usize, want: HashMap<String, (f64, f64, bool)>) {
         let t_calc = now();
+        if !self.moved.is_empty() {
+            self.settle_moved(rung).await;
+        }
         let deep = rung > 0;
         let mut changed = false;
         for (c, b) in self.book(rung).clone() {
@@ -1088,6 +1147,24 @@ impl Wick {
                 }
                 if !spend && b.shut == shut && !level_past(rung == ASK, b.px, lvl) {
                     continue;
+                }
+                // moved in one request: an order open with nothing filled, its kind unchanged (else cancelled, settled, placed)
+                if spend && b.shut == shut {
+                    let t_sent = now();
+                    if let Some(oid) = self.try_move(&c, &b, rung, lvl, size).await {
+                        self.book(rung).insert(c.clone(), Bid { oid, px: lvl, size, pct, shut });
+                        if !deep {
+                            crate::wickwatch::set_bid(&c, Some(crate::wickwatch::BidView { px: lvl, oid, since: now() }));
+                        }
+                        if oid != b.oid {
+                            self.moved.push((c.clone(), rung, b.clone(), now()));
+                        }
+                        self.trace(json!({"what": "move", "coin": c, "oid": oid, "old_oid": b.oid, "px": lvl, "old_px": b.px, "size": size,
+                            "why": if lvl > b.px { "drift up" } else { "drift down" }, "deep": deep, "rung": rung, "minute": minute,
+                            "t_calc": t_calc, "t_sent": t_sent, "t_done": now()}));
+                        changed = true;
+                        continue;
+                    }
                 }
                 let t_sent = now();
                 if !deep {
@@ -1455,7 +1532,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let mut w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0 };
+        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new() };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     tokio::spawn(async move {
         let (mut vol_at, mut oracle_at, mut orders_at, mut backfill_at, mut h3_at, mut orphans_at) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);

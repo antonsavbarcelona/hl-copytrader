@@ -66,6 +66,9 @@ pub struct CancelWire {
 pub enum Action {
     Order { orders: Vec<OrderWire>, grouping: String },
     Cancel { cancels: Vec<CancelWire> },
+    /// A resting order moved (`oid`'s new price / size): one request, not a cancel and a new order. The
+    /// `always_place` flag left out (false): the new order goes only if the old one was still open.
+    Modify { oid: u64, order: OrderWire },
     /// The leverage (and the margin mode) of an asset for the account.
     UpdateLeverage {
         asset: u32,
@@ -200,6 +203,7 @@ impl Exchange {
         let n = match action {
             Action::Order { orders, .. } => orders.len(),
             Action::Cancel { cancels } => cancels.len(),
+            Action::Modify { .. } => 1,
             Action::UpdateLeverage { .. } => 1,
         } as i64;
         let _ = HEADROOM.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| Some(if h == i64::MAX { h } else { h - n }));
@@ -253,6 +257,7 @@ mod tests {
         let gtc = || OrderWire { a: 110005, b: true, p: "12.345".into(), s: "8.1".into(), r: false, t: OrderType::Limit { tif: "Gtc".into() } };
         let gtc_order = Action::Order { orders: vec![gtc()], grouping: "na".into() };
         let lev = Action::UpdateLeverage { asset: 110005, is_cross: false, leverage: 3 };
+        let modify = Action::Modify { oid: 62246465112, order: OrderWire { t: OrderType::Limit { tif: "Alo".into() }, ..gtc() } };
         let cases = [
             (&order, "08458109a06a62044f3c37e98c589bbe4d30bda32b2aa40e056da1e3841d86ec", false,
              "0x160e61a7191b20d63231960bd6442f3e4981d2edbe6f56d585d2914a84d51720", "0x479a6708b73ac578b303098d68ae3b3fca79557a013ea017e97ed665d26fba37", 27),
@@ -264,6 +269,8 @@ mod tests {
              "0xc5646d6a4399365f94d7801bf5c7f8a9dc0e45eaa60347e6151f1111b8724b53", "0x31413d8edf362c1bca1727c9856e1213efeda533c71eef49462f64ca751e1d70", 27),
             (&lev, "27fbd2b5f40c2b8ac430fab527bd1d00e7b3c13deac23e39d752e46a4db3a4e1", true,
              "0x4c8141cc9e7b8a52199501e80b1a91055f1ff7953a757b4b4798f1ea3187fd89", "0x1a7f948cc19cb5ad30f16cb0afd6f5c9fcd19ebaa21fb8c75156628a922acebb", 27),
+            (&modify, "f42e1cdf3f2fb02555cfb1f3f987b2926474476ec0fe38c309b060ad5ceed7b5", true,
+             "0x13da6eb588493a06e4679c7f478b5261d064482aacd1aefa5b81d88565fb6450", "0x1e098a9bd47f2d7cbdbfc25225eab6b4d50f0c4abebb5dcd054d39dc1ccaaa75", 27),
             (&cancel, "f220594006ae723ef922ef6ef87aaf9fbb774fef0ca1c9f20b59ac15be10e66c", false,
              "0x4cf57a35df1d217496c89caf8d112871194c51f673b0401419e14ce402cd9e04", "0xf782832a27050f5c4edcf1977695f88afd883e1fb88c50a3f4ee9a72ff7c23d", 27),
         ];

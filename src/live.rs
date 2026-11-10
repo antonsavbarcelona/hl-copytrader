@@ -415,6 +415,47 @@ impl Venue {
         placed(coin, &r["data"]["statuses"][0], size > 0.0)
     }
 
+    /// A resting limit moved to `px` / `size` (signed) in one request ("modify", not a cancel and a new order: half
+    /// the address's requests): the order's oid now. The new order goes only if the old one was still open
+    /// (`always_place` off). Err: not moved (the old one filled or gone, the new one refused). A reply without the
+    /// status: the order looked up among the open ones at its new price.
+    pub(crate) async fn modify(&self, coin: &str, oid: u64, size: f64, px: f64, tif: &str) -> Result<u64> {
+        let (asset, dec) = self.coins[coin];
+        let sz = round_size(size.abs(), dec);
+        if sz <= 0.0 {
+            bail!("{coin}: size {size} rounds to 0");
+        }
+        let p = round_px(px, dec);
+        let order = OrderWire { a: asset, b: size > 0.0, p: wire(p), s: wire(sz), r: false, t: OrderType::Limit { tif: tif.into() } };
+        let r = match self.ex.act(&Action::Modify { oid, order }).await {
+            Ok(r) => {
+                MODIFY_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
+                r
+            }
+            Err(e) => {
+                // the whole action refused (not one order's status): after MODIFY_MAX_FAILS in a row the moves go back to
+                // a cancel and a new order (the limit's own refusal aside)
+                if !crate::exchange::rate_limited(&format!("{e:#}"))
+                    && MODIFY_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == MODIFY_MAX_FAILS {
+                    log!("live: modify refused {MODIFY_MAX_FAILS} times in a row ({e:#}): moves by a cancel and a new order");
+                    crate::notify::send(format!("⚠️ перестановка лимиток одним запросом не работает ({e:#}); вернулся к отмене + новой заявке"));
+                }
+                return Err(e);
+            }
+        };
+        if let Some(st) = r["data"]["statuses"].get(0) {
+            return match placed(coin, st, size > 0.0)? {
+                Placed::Resting(o) => Ok(o),
+                Placed::Filled(..) => bail!("{coin} order {oid} moved and filled at once"),
+            };
+        }
+        let open = self.ex.info(json!({"type": "openOrders", "user": self.account})).await?;
+        open.as_array().into_iter().flatten()
+            .filter(|o| o["coin"] == coin && (o["side"] == "B") == (size > 0.0) && (num(&o["limitPx"]) - p).abs() <= 1e-9 * p.max(1.0))
+            .filter_map(|o| o["oid"].as_u64()).max()
+            .with_context(|| format!("{coin} order {oid} moved ({r}) but not found among the open orders at {p}"))
+    }
+
     /// The account's leverage on `coin` (isolated unless `cross`).
     pub(crate) async fn leverage(&self, coin: &str, leverage: u32, cross: bool) -> Result<()> {
         let asset = self.coins[coin].0;
@@ -752,6 +793,15 @@ impl Limits {
     fn of(&self, l: &Leg) -> f64 {
         if l.risk > 0.0 { l.risk } else { self.risk }
     }
+}
+
+/// The modify action refused outright this many times in a row: not tried again (`modify_on`).
+const MODIFY_MAX_FAILS: u32 = 3;
+static MODIFY_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the bids move by `Venue::modify` (one request), not by a cancel and a new order.
+pub(crate) fn modify_on() -> bool {
+    MODIFY_FAILS.load(std::sync::atomic::Ordering::Relaxed) < MODIFY_MAX_FAILS
 }
 
 /// Requests the wick keeps free for the exits, the stops and the takes (`exchange::headroom`): under it

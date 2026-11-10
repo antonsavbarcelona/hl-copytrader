@@ -25,6 +25,8 @@ Faults on demand (`f.with(|s| ...)`):
 | `refuse_stops` | a stop not placed: the position must be closed again |
 | `ioc_needs` | a thin book: the IOC matches only further through the mid |
 | `margin_refusals` | the margin held by the resting bids (2026-11-02) |
+| `lose_replies`, `lose_order` | a reply lost after the action took effect (a timeout, a 502) |
+| `modify_keeps_oid`, `modify_bare_reply` | the modify's reply shapes the docs leave open |
 | `partial_fill`, `hand_trade` | a take filled in part (io:PRL 2026-11-03), a position closed by hand (xyz:RELIANCE) |
 
 Each test uses its own coin names: the family registry (`trades::OPEN`) is process-wide.
@@ -36,7 +38,9 @@ refused -> closed again; isolated HIP-3 stop cap; the take from the price expect
 refusal releasing resting bids; post-only crossing; reduce-only with nothing held; a trade ending at the take, the stop,
 by hand, a partial take, a lagging take status; closing on time; a held trade not ended; a bid filled just before its
 cancel with a lagging status (HIMS), cancelled clean, filled in part, an unknown status; the request limit's top-up
-(bought and sold back reduce-only, nothing left open; a held BTC left alone, ETH used; both held: nothing traded).
+(bought and sold back reduce-only, nothing left open; a held BTC left alone, ETH used; both held: nothing traded); a timed close of a position
+already gone (ended at its close price, not retried for ever); a bid moved in one request (`modify`: a new oid or the
+same, a bare reply looked up among the open orders; a filled or crossing bid not moved, nothing new resting).
 
 Unit: signing (the SDK's vectors), wire / price / size rounding at the edges, order replies, the margin error, the
 after-cancel decision, the family registry (`coin_fits`), sizes and returns, isolated leverage and the liquidation stop,

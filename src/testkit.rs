@@ -64,6 +64,10 @@ pub(crate) struct State {
     pub(crate) lose_replies: u32,
     /// the reply of the n-th order action from now lost (1: the next), after it took effect
     pub(crate) lose_order: u32,
+    /// a modify keeps the order's oid (else the old one is cancelled and a new oid placed); its reply without
+    /// the statuses ({"type": "default"})
+    pub(crate) modify_keeps_oid: bool,
+    pub(crate) modify_bare_reply: bool,
     pub(crate) leverage: HashMap<String, (u32, bool)>,
     pub(crate) now_ms: u64,
 }
@@ -235,6 +239,34 @@ impl State {
                     st.push(self.place(w));
                 }
                 json!({"status": "ok", "response": {"type": "order", "data": {"statuses": st}}})
+            }
+            "modify" => {
+                let oid = a["oid"].as_u64().unwrap_or(0);
+                let st = match self.orders.get(&oid).cloned() {
+                    Some(o) if o.status == "open" => {
+                        let w = &a["order"];
+                        let (px, sz) = (n(&w["p"]), n(&w["s"]));
+                        let mid = self.mids.get(&o.coin).copied().unwrap_or(0.0);
+                        let tif = w["t"]["limit"]["tif"].as_str().unwrap_or("Gtc");
+                        if tif == "Alo" && (if o.buy { px >= mid } else { px <= mid }) {
+                            json!({"error": "Post only order would have immediately matched, bbo was 1. asset=0"})
+                        } else if self.modify_keeps_oid {
+                            let x = self.orders.get_mut(&oid).unwrap();
+                            (x.px, x.orig, x.left) = (px, sz, sz);
+                            json!({"resting": {"oid": oid}})
+                        } else {
+                            // the old one off (whatever of it filled stays filled), the new order placed
+                            self.orders.get_mut(&oid).unwrap().status = "canceled".into();
+                            self.place(w)
+                        }
+                    }
+                    _ => json!({"error": "Cannot modify canceled or filled order"}),
+                };
+                if self.modify_bare_reply && st.get("error").is_none() {
+                    json!({"status": "ok", "response": {"type": "default"}})
+                } else {
+                    json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [st]}}})
+                }
             }
             t => json!({"status": "err", "response": format!("the fake has no action {t}")}),
         }

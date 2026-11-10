@@ -385,3 +385,60 @@ async fn a_top_up_never_leaves_a_position_nor_touches_a_coin_in_use() {
     let sells = orders(&f).iter().filter(|o| o.1).count();
     assert_eq!(sells, 1, "sold once: {:?}", orders(&f));
 }
+
+// ---------------------------------------------------------------- a bid moved in one request (modify)
+
+#[tokio::test]
+async fn a_bid_moves_in_one_request_to_its_new_price() {
+    let f = FakeHl::start(&[("E2Y", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    let crate::live::Placed::Resting(old) = v.limit("E2Y", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let n = f.with(|s| s.actions.len());
+    let new = v.modify("E2Y", old, 1.2, 91.5, "Alo").await.unwrap();
+    assert_eq!(f.with(|s| s.actions.len()) - n, 1, "one request");
+    let o = f.open_orders("E2Y");
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(o[0].oid, new);
+    assert!(close(o[0].px, 91.5) && close(o[0].left, 1.2) && o[0].buy);
+    assert_eq!(f.order(old).unwrap().status, "canceled");
+
+    // an ask the mirror
+    let crate::live::Placed::Resting(ask) = v.limit("E2Y", -1.0, 108.0, false, "Alo").await.unwrap() else { panic!() };
+    let new = v.modify("E2Y", ask, -1.0, 108.5, "Alo").await.unwrap();
+    assert!(f.order(new).is_some_and(|o| !o.buy && close(o.px, 108.5)));
+}
+
+#[tokio::test]
+async fn a_move_keeping_its_oid_or_with_a_bare_reply_still_knows_its_order() {
+    let f = FakeHl::start(&[("E2Z", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    f.with(|s| s.modify_keeps_oid = true);
+    let crate::live::Placed::Resting(old) = v.limit("E2Z", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    assert_eq!(v.modify("E2Z", old, 1.0, 91.0, "Alo").await.unwrap(), old);
+    assert!(close(f.order(old).unwrap().px, 91.0));
+
+    f.with(|s| { s.modify_keeps_oid = false; s.modify_bare_reply = true; });
+    let new = v.modify("E2Z", old, 1.0, 90.0, "Alo").await.unwrap();
+    assert_ne!(new, old);
+    assert!(f.order(new).is_some_and(|o| o.status == "open" && close(o.px, 90.0)));
+}
+
+#[tokio::test]
+async fn a_bid_filled_or_crossing_is_not_moved_and_nothing_new_rests() {
+    let f = FakeHl::start(&[("E3A", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    // filled before the move (a wick through it): refused, nothing new placed, the fill stays the bid's
+    let crate::live::Placed::Resting(old) = v.limit("E3A", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    f.set_mid("E3A", 91.0);
+    f.set_mid("E3A", 95.0);
+    assert!(v.modify("E3A", old, 1.0, 93.0, "Alo").await.is_err());
+    assert!(f.open_orders("E3A").is_empty());
+    assert!(close(f.position("E3A"), 1.0));
+    assert!(close(v.filled(old).await.unwrap().0, 1.0), "the settlement still sees the fill");
+
+    // a new price through the book (post-only): refused, the old bid still resting
+    let crate::live::Placed::Resting(b) = v.limit("E3A", 1.0, 90.0, false, "Alo").await.unwrap() else { panic!() };
+    assert!(v.modify("E3A", b, 1.0, 96.0, "Alo").await.is_err());
+    let o = f.open_orders("E3A");
+    assert!(o.len() == 1 && o[0].oid == b && close(o[0].px, 90.0), "{o:?}");
+}

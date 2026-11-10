@@ -777,21 +777,53 @@ pub(crate) fn topup_side_usd(headroom: i64, spent_today: f64) -> Option<f64> {
     (side >= 12.0).then(|| side.max(12.0))
 }
 
-/// Buys `usd` of a top-up coin at market and sells it back (reduce-only, retried until it goes: an
-/// exit, never left open); the volume traded. Skipped (0) while the account holds both coins.
+/// Buys `usd` of a top-up coin at market and sells it back (reduce-only, retried until the position is
+/// gone: never left open); the volume traded. The coin: one the account has no position, no resting order
+/// and no strategy's trade in, held in the family registry while it runs (no strategy opens a short on it
+/// meanwhile); none free: skipped (0). A reply lost after the buy went through: the position read and sold.
 pub(crate) async fn topup(v: &Venue, usd: f64) -> Result<f64> {
     let held = v.dex_positions("").await?;
-    let Some(coin) = TOPUP_COINS.iter().copied().find(|c| !held.contains_key(*c) && v.coins.contains_key(*c)) else { return Ok(0.0) };
+    let resting = v.ex.info(json!({"type": "openOrders", "user": v.account})).await?;
+    let busy = |c: &str| held.contains_key(c) || crate::trades::registered(c)
+        || resting.as_array().into_iter().flatten().any(|o| o["coin"] == c);
+    let Some(coin) = TOPUP_COINS.iter().copied().find(|c| v.coins.contains_key(*c) && !busy(c)) else { return Ok(0.0) };
+    crate::trades::register(coin, TOPUP_KIND, 0.0, 1.0);
+    let r = topup_on(v, coin, usd).await;
+    crate::trades::unregister(coin, TOPUP_KIND);
+    r
+}
+
+const TOPUP_KIND: &str = "topup";
+
+async fn topup_on(v: &Venue, coin: &str, usd: f64) -> Result<f64> {
     let mid = v.mid(coin).await?;
     // market_once: no resting bids taken off for its margin
-    let (got, px, _) = v.market_once(coin, usd / mid, false).await?;
+    let (got, px) = match v.market_once(coin, usd / mid, false).await {
+        Ok((got, px, _)) => (got, px),
+        Err(e) => {
+            // refused, or the reply lost after it filled: what is there is ours (the coin was flat)
+            let pos = v.dex_positions("").await.ok().and_then(|p| p.get(coin).copied()).unwrap_or(0.0);
+            if pos == 0.0 {
+                return Err(e);
+            }
+            log!("rate limit: top-up {coin}: the buy errored ({e:#}) but {pos} is held: sold back");
+            (pos, mid)
+        }
+    };
     let mut last = String::new();
-    for _ in 0..60 {
+    for i in 0..60 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // a sell whose reply was lost: done when the position is
+            match v.dex_positions("").await {
+                Ok(p) if p.get(coin).copied().unwrap_or(0.0) <= 0.0 => return Ok(2.0 * got.abs() * px),
+                _ => {}
+            }
+        }
         match v.market_once(coin, -got, true).await {
             Ok((sold, px2, _)) => return Ok(got.abs() * px + sold.abs() * px2),
             Err(e) => last = format!("{e:#}"),
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
     crate::notify::send(format!("🆘 добор лимита: {coin} {got} куплен и не продан ({last}) — закрой руками"));
     bail!("top-up {coin}: bought {got}, not sold back: {last}")

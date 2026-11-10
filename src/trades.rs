@@ -201,6 +201,11 @@ pub(crate) fn register(coin: &str, kind: &str, risk: f64, dir: f64) {
     v.push((kind.to_string(), risk, dir.signum()));
 }
 
+/// Whether any strategy's trade (or a top-up) holds `coin`.
+pub(crate) fn registered(coin: &str) -> bool {
+    OPEN.lock().unwrap().as_ref().is_some_and(|m| m.get(coin).is_some_and(|v| !v.is_empty()))
+}
+
 pub(crate) fn unregister(coin: &str, kind: &str) {
     if let Some(m) = OPEN.lock().unwrap().as_mut() {
         if let Some(v) = m.get_mut(coin) {

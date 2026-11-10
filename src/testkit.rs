@@ -60,6 +60,10 @@ pub(crate) struct State {
     pub(crate) ioc_needs: f64,
     /// the next opening IOC is refused for margin
     pub(crate) margin_refusals: u32,
+    /// the next exchange replies lost after the action took effect (a timeout, a proxy's 502)
+    pub(crate) lose_replies: u32,
+    /// the reply of the n-th order action from now lost (1: the next), after it took effect
+    pub(crate) lose_order: u32,
     pub(crate) leverage: HashMap<String, (u32, bool)>,
     pub(crate) now_ms: u64,
 }
@@ -335,11 +339,18 @@ impl FakeHl {
                         buf.drain(..head_end + len);
                         let out = {
                             let mut s = st.lock().unwrap();
-                            let v = if path.ends_with("/exchange") { s.exchange(&body) } else { s.info(&body) };
+                            let ex = path.ends_with("/exchange");
+                            let v = if ex { s.exchange(&body) } else { s.info(&body) };
                             s.sweep();
-                            v
+                            let is_order = ex && body["action"]["type"] == "order";
+                            let lose_order = is_order && s.lose_order > 0 && { s.lose_order -= 1; s.lose_order == 0 };
+                            if lose_order || (ex && s.lose_replies > 0 && { s.lose_replies -= 1; true }) {
+                                Value::String("<html>502 Bad Gateway</html>".into())
+                            } else {
+                                v
+                            }
                         };
-                        let text = out.to_string();
+                        let text = match &out { Value::String(t) => t.clone(), o => o.to_string() };
                         let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", text.len(), text);
                         if sock.write_all(resp.as_bytes()).await.is_err() {
                             return;

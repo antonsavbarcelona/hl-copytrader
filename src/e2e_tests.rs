@@ -298,24 +298,58 @@ fn a_top_up_only_when_low_bounded_by_the_side_and_the_day() {
     assert_eq!(topup_side_usd(0, TOPUP_DAY_MAX_USD), None);
 }
 
+// One test, in order: the top-up's coins are BTC / ETH and the family registry is process-wide.
 #[tokio::test]
-async fn a_top_up_buys_and_sells_back_leaving_nothing_open() {
-    let f = FakeHl::start(&[("BTC", 5, 40, 100000.0), ("ETH", 4, 25, 3000.0)]).await;
+async fn a_top_up_never_leaves_a_position_nor_touches_a_coin_in_use() {
+    let start = || FakeHl::start(&[("BTC", 5, 40, 100000.0), ("ETH", 4, 25, 3000.0)]);
+    let orders = |f: &FakeHl| f.with(|s| s.actions.iter().filter(|a| a["type"] == "order").map(|a| (a["orders"][0]["a"].as_u64().unwrap(), a["orders"][0]["r"].as_bool().unwrap())).collect::<Vec<_>>());
+
+    // clean: BTC bought, sold back reduce-only, flat
+    let f = start().await;
     let vol = crate::live::topup(&f.venue(), 1000.0).await.unwrap();
     assert!(close(vol, 2000.0), "{vol}");
     assert!(close(f.position("BTC"), 0.0) && close(f.position("ETH"), 0.0));
-    let sells: Vec<_> = f.with(|s| s.actions.iter().filter(|a| a["type"] == "order").map(|a| a["orders"][0]["r"].clone()).collect());
-    assert_eq!(sells, vec![serde_json::json!(false), serde_json::json!(true)], "the sell back reduce-only");
-}
+    assert_eq!(orders(&f), vec![(0, false), (0, true)]);
+    assert!(!trades::registered("BTC"), "the registry let go");
 
-#[tokio::test]
-async fn a_top_up_leaves_a_held_coin_alone() {
-    let f = FakeHl::start(&[("BTC", 5, 40, 100000.0), ("ETH", 4, 25, 3000.0)]).await;
-    f.hand_trade("BTC", -0.01); // a strategy's BTC short
-    let vol = crate::live::topup(&f.venue(), 300.0).await.unwrap();
-    assert!(close(vol, 600.0));
+    // a strategy's BTC short: ETH used, the short untouched
+    let f = start().await;
+    f.hand_trade("BTC", -0.01);
+    assert!(close(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
     assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.0));
-    f.hand_trade("ETH", 0.1);
-    assert_eq!(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 0.0, "both held: nothing traded");
-    assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.1));
+    // and a wick bid resting on ETH: nothing traded at all
+    let v = f.venue();
+    v.limit("ETH", 0.1, 2500.0, false, "Alo").await.unwrap();
+    let before = orders(&f).len();
+    assert_eq!(crate::live::topup(&v, 300.0).await.unwrap(), 0.0);
+    assert_eq!(orders(&f).len(), before);
+    assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.0));
+
+    // a strategy's trade on BTC in the registry (its order not yet on the exchange): ETH used
+    let f = start().await;
+    trades::register("BTC", "test_strategy", 10.0, -1.0);
+    assert!(close(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
+    trades::unregister("BTC", "test_strategy");
+    assert!(close(f.position("BTC"), 0.0) && close(f.position("ETH"), 0.0));
+
+    // the buy's reply lost after it filled: the position read and sold back
+    let f = start().await;
+    f.with(|s| s.lose_order = 1);
+    assert!(crate::live::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
+    assert!(close(f.position("BTC"), 0.0), "{}", f.position("BTC"));
+
+    // the buy refused outright: nothing open, an error
+    let f = start().await;
+    f.with(|s| s.ioc_needs = 0.5);
+    assert!(crate::live::topup(&f.venue(), 1000.0).await.is_err());
+    assert!(close(f.position("BTC"), 0.0));
+    assert!(!trades::registered("BTC"));
+
+    // the sell's reply lost after it filled: seen flat on the next look, not sold twice
+    let f = start().await;
+    f.with(|s| s.lose_order = 2);
+    assert!(crate::live::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
+    assert!(close(f.position("BTC"), 0.0));
+    let sells = orders(&f).iter().filter(|o| o.1).count();
+    assert_eq!(sells, 1, "sold once: {:?}", orders(&f));
 }

@@ -4,10 +4,10 @@
 //! level and `MIN_USD`, within `MAX_DIST` of the mid, on the `TOP_COINS` main-dex coins by volume.
 //!
 //! Events (kind "walls"):
-//! - `on`: a wall standing `MIN_AGE_S` (the shorter ones only counted: `flicker`, hourly); once one, it stays one
+//! - a wall counts once it stands `MIN_AGE_S` (the shorter ones only counted: `flicker`, hourly); once one, it stays one
 //!   down to `HOLD` of the bar (a 3 min sample on 2026-11-10 without it: 2 of 3 walls 'pulled' at the bar's edge);
 //! - `touch`: the mid within `TOUCH` of it (each approach once), with the exchange-tick level found inside its bucket;
-//! - `off`: gone, and why: `crossed` (the price went through it), `pulled_near` (removed with the price within
+//! - `off`: its one row, at its end (its first look in it too), and why it went: `crossed` (the price went through it), `pulled_near` (removed with the price within
 //!   `NEAR`), `pulled` (removed, the price away), `out_of_view` (the price moved off: past the book's 20 levels);
 //! - `after`: from a wall's first touch, the mid 1 / 5 / 15 / 60 min on and its high / low over 15 and 60 min.
 //!
@@ -137,10 +137,10 @@ impl Tracker {
                 w.usd = usd;
                 w.max_usd = w.max_usd.max(usd);
                 w.min_dist = w.min_dist.min(dist);
+                // A wall is one row, at its end (`off`: its first look too); a 30 min live sample on 2026-11-10: ~730
+                // walls, 40 touches - a row at its start as well doubled the rows for nothing.
                 if !w.told && t - w.first >= MIN_AGE_S {
                     w.told = true;
-                    out.push(json!({"what": "on", "id": w.id, "coin": coin, "side": side.name(), "px": px, "bucket": bucket(px),
-                        "usd": usd, "x_median": w.x, "median_usd": med, "dist_pct": dist * 100.0, "mid": mid, "seen_s": t - w.first}));
                 }
                 let near = dist <= TOUCH;
                 if w.told && near && !w.near {
@@ -175,7 +175,7 @@ impl Tracker {
                 let dist = (w.px / mid - 1.0).abs();
                 let why = if crossed { "crossed" } else if beyond { "out_of_view" } else if dist <= NEAR { "pulled_near" } else { "pulled" };
                 out.push(json!({"what": "off", "id": w.id, "coin": coin, "side": side.name(), "px": w.px, "why": why, "life_s": t - w.first,
-                    "usd_first": w.usd0, "usd_last": w.usd, "usd_max": w.max_usd, "x_median_first": w.x,
+                    "bucket": bucket(w.px), "usd_first": w.usd0, "usd_last": w.usd, "usd_max": w.max_usd, "x_median_first": w.x,
                     "dist0_pct": w.dist0 * 100.0, "min_dist_pct": w.min_dist * 100.0, "dist_pct": dist * 100.0, "touches": w.touches,
                     "mid0": w.mid0, "mid": mid}));
             }
@@ -277,10 +277,7 @@ mod tests {
         let b = book(1000.0, 1.0, Some((990.0, 100.0)));
         assert!(tr.step("X", 0.0, &b, None).is_empty());
         assert!(tr.step("X", 20.0, &b, None).is_empty());       // not yet MIN_AGE_S
-        let ev = tr.step("X", 31.0, &b, None);
-        assert_eq!(ev.len(), 1);
-        assert_eq!(ev[0]["what"], "on");
-        assert!((ev[0]["dist_pct"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert!(tr.step("X", 31.0, &b, None).is_empty());       // one row at its end, none at its start
         // the price comes down to it: touched once, not again while it stays near
         let b2 = book(990.5, 1.0, Some((990.0, 100.0)));
         let ev = tr.step("X", 40.0, &b2, None);
@@ -291,6 +288,7 @@ mod tests {
         let off = ev.iter().find(|e| e["what"] == "off").unwrap();
         assert_eq!(off["why"], "crossed");
         assert_eq!(off["touches"], 1);
+        assert!((off["dist0_pct"].as_f64().unwrap() - 1.0).abs() < 1e-9);
         // its path is followed from the touch (t 40): the hour's record at +3600 s
         let mut last = Vec::new();
         for s in [100.0, 340.0, 940.0, 3640.0] {

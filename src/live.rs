@@ -820,11 +820,12 @@ pub(crate) fn modify_on() -> bool {
 pub(crate) const RATE_RESERVE: i64 = 2000;
 
 /// The headroom a top-up aims at, and its bounds: one side's $ at most, the volume a UTC day may spend
-/// on it ($6 000: ~$2.7 of taker fees at 0.045%; the requests then cost ~$0.00045 each, as the
-/// `reserveRequestWeight` purchase would, which a unified account cannot pay: 2026-11-10).
+/// on it ($20 000: ~$9 of taker fees at 0.045% at most; the requests then cost ~$0.00045 each, as the
+/// `reserveRequestWeight` purchase would, which a unified account cannot pay: 2026-11-10). $6 000 until
+/// 2026-11-10: a falling day's wick moves ~600-850 requests an hour, and the user's call is no bid lost.
 pub(crate) const TOPUP_TARGET: i64 = RATE_RESERVE + 1500;
 pub(crate) const TOPUP_SIDE_MAX_USD: f64 = 2500.0;
-pub(crate) const TOPUP_DAY_MAX_USD: f64 = 6000.0;
+pub(crate) const TOPUP_DAY_MAX_USD: f64 = 20000.0;
 /// The coins a top-up trades (the first the account holds no position in): the deepest books.
 const TOPUP_COINS: [&str; 2] = ["BTC", "ETH"];
 

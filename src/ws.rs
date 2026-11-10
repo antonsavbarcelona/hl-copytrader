@@ -142,8 +142,17 @@ pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>
 
 /// Keeps `books` current for every coin.
 pub async fn run_books(coins: Vec<String>, books: Books) {
-    let subs = coins.iter().map(|c| json!({"type": "l2Book", "coin": c})).collect();
-    run("books", subs, move |v| {
+    run_books_sig(coins, None, books).await
+}
+
+/// Keeps `books` current for every coin, its levels grouped to `sig` significant figures (None: the
+/// exchange's own ticks): 20 levels then reach ~10x further from the mid.
+pub async fn run_books_sig(coins: Vec<String>, sig: Option<u32>, books: Books) {
+    let subs = coins.iter().map(|c| match sig {
+        Some(n) => json!({"type": "l2Book", "coin": c, "nSigFigs": n}),
+        None => json!({"type": "l2Book", "coin": c}),
+    }).collect();
+    run(if sig.is_some() { "books (grouped)" } else { "books" }, subs, move |v| {
         if v["channel"] != "l2Book" {
             return;
         }

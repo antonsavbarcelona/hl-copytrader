@@ -44,7 +44,8 @@ same, a bare reply looked up among the open orders; a filled or crossing bid not
 
 Unit: signing (the SDK's vectors), wire / price / size rounding at the edges, order replies, the margin error, the
 after-cancel decision, the family registry (`coin_fits`), sizes and returns, isolated leverage and the liquidation stop,
-the take base, the wkd / US hours (DST in and out, the weekend, Sunday night), the dex lists, and the strategies' own
+the take base, the walls' record (`walls::Tracker`: told after its age, touched once per approach, crossed /
+pulled / pulled near, kept down to half its bar, its price path an hour from the touch), the wkd / US hours (DST in and out, the weekend, Sunday night), the dex lists, and the strategies' own
 signal tests (dip, rsidip, squeeze, trend, wkd, liq, stable, alloc, engine).
 
 Mutation checks run by hand when this was written (each must turn a test red): the HIMS keep -> drop (2 red), the

@@ -310,8 +310,27 @@ pub(crate) async fn close(v: &Venue, t: &Trade) -> Result<f64> {
     for o in [t.take_oid, t.stop_oid].into_iter().flatten() {
         v.cancel(&t.coin, o).await;
     }
-    let (_, px, _) = v.market(&t.coin, -t.size, true).await?;
-    Ok(px)
+    match v.market(&t.coin, -t.size, true).await {
+        Ok((_, px, _)) => Ok(px),
+        Err(e) => {
+            // Already out (a lost reply after the sell filled, the stop, a hand): ended at its close fills' price,
+            // not tried again for ever (2026-11-10, rsidip ZRO: closed at 09:15, its exit retried each poll for
+            // hours, every try a request off the exhausted limit). The position read is an info request: it goes
+            // while the exchange refuses the orders.
+            let dex = t.coin.split_once(':').map(|d| d.0).unwrap_or("");
+            match v.dex_positions(dex).await {
+                Ok(p) if p.get(&t.coin).copied().unwrap_or(0.0) * t.size <= 0.0 => {
+                    let px = match v.close_fills(&t.coin, (t.at * 1000.0) as i64).await {
+                        Some((px, _)) => px,
+                        None => v.mid(&t.coin).await.unwrap_or(t.entry_px),
+                    };
+                    crate::log!("{}: the close errored ({e:#}) but no position is held: ended at {px}", t.coin);
+                    Ok(px)
+                }
+                _ => Err(e),
+            }
+        }
+    }
 }
 
 /// A trade of `kind` whose position is gone (held now: the account's signed size in its coin): how it

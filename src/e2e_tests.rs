@@ -215,6 +215,38 @@ async fn closing_on_time_cancels_both_orders_then_sells_at_market() {
 }
 
 #[tokio::test]
+async fn closing_on_time_a_position_already_gone_ends_it_at_its_close_price_not_for_ever() {
+    // the rsidip ZRO of 2026-11-10: out at 09:15 (the exit's reply lost), the exit retried each poll for hours
+    let f = FakeHl::start(&[("E2V", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    let tr = trades::open_market(&v, "E2V", 1.0, 0.10, Some(0.05), 3600.0).await.unwrap();
+    f.set_mid("E2V", 101.0);
+    f.hand_trade("E2V", -1.0);
+    f.set_mid("E2V", 103.0);
+    let px = trades::close(&v, &tr).await.unwrap();
+    assert!(close(px, 101.0), "its close fill's price: {px}");
+    assert!(close(f.position("E2V"), 0.0), "no short opened");
+    assert!(f.open_orders("E2V").is_empty());
+
+    // the close's own reply lost after it filled: ended, not an error
+    let f = FakeHl::start(&[("E2W", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    let tr = trades::open_market(&v, "E2W", 1.0, 0.10, Some(0.05), 3600.0).await.unwrap();
+    f.set_mid("E2W", 102.0);
+    f.with(|s| s.lose_order = 1);
+    assert!(close(trades::close(&v, &tr).await.unwrap(), 102.0));
+    assert!(close(f.position("E2W"), 0.0));
+
+    // still held and the sell refused: an error (tried again on the next poll)
+    let f = FakeHl::start(&[("E2X", 2, 10, 100.0)]).await;
+    let v = f.venue();
+    let tr = trades::open_market(&v, "E2X", 1.0, 0.10, Some(0.05), 3600.0).await.unwrap();
+    f.with(|s| s.ioc_needs = 0.5);
+    assert!(trades::close(&v, &tr).await.is_err());
+    assert!(close(f.position("E2X"), 1.0));
+}
+
+#[tokio::test]
 async fn a_trade_still_held_is_not_ended() {
     let f = FakeHl::start(&[("E2Q", 2, 10, 100.0)]).await;
     let v = f.venue();

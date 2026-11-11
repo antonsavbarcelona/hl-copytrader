@@ -523,18 +523,13 @@ impl Venue {
         Ok((num(&o["order"]["origSz"]) - num(&o["order"]["sz"]), o["status"] == "open"))
     }
 
-    /// The account's fills closing `coin` since `since_ms`: their size-weighted price and their size (None: none read).
+    /// The account's last close of `coin` since `since_ms` (its fills within `LAST_CLOSE_MS` of the latest closing fill):
+    /// their size-weighted price and their size (None: none read). Only the last burst: on a coin two strategies share, an
+    /// earlier close of the other's is not this one's (2026-11-11, INIT: the RSI dip's stop at 0.132 told at 0.1518 with
+    /// the dip's close at 0.1749 seven hours before in it, -$9.47 told for -$22.8).
     pub(crate) async fn close_fills(&self, coin: &str, since_ms: i64) -> Option<(f64, f64)> {
         let r = self.ex.info(json!({"type": "userFillsByTime", "user": self.account, "startTime": since_ms})).await.ok()?;
-        let (mut q, mut c) = (0.0, 0.0);
-        for x in r.as_array()? {
-            if x["coin"] == coin && x["dir"].as_str().is_some_and(|d| d.starts_with("Close") || d.contains("Liquidat")) {
-                let sz = num(&x["sz"]);
-                q += sz;
-                c += sz * num(&x["px"]);
-            }
-        }
-        (q > 0.0).then(|| (c / q, q))
+        last_close(&r, coin)
     }
 
     /// An order's status ("open", "filled", "triggered", "canceled", ...) and the size filled.
@@ -546,6 +541,23 @@ impl Venue {
         }
         Ok((o["status"].as_str().unwrap_or("").to_string(), num(&o["order"]["origSz"]) - num(&o["order"]["sz"])))
     }
+}
+
+/// The fills of one close are this close (ms) of the latest closing fill.
+const LAST_CLOSE_MS: u64 = 30_000;
+
+/// The size-weighted price and the size of `coin`'s last close in `userFillsByTime` rows (see `Venue::close_fills`).
+pub(crate) fn last_close(fills: &Value, coin: &str) -> Option<(f64, f64)> {
+    let rows: Vec<&Value> = fills.as_array()?.iter()
+        .filter(|x| x["coin"] == coin && x["dir"].as_str().is_some_and(|d| d.starts_with("Close") || d.contains("Liquidat"))).collect();
+    let last = rows.iter().filter_map(|x| x["time"].as_u64()).max()?;
+    let (mut q, mut c) = (0.0, 0.0);
+    for x in rows.into_iter().filter(|x| x["time"].as_u64().is_some_and(|t| t + LAST_CLOSE_MS >= last)) {
+        let sz = num(&x["sz"]);
+        q += sz;
+        c += sz * num(&x["px"]);
+    }
+    (q > 0.0).then(|| (c / q, q))
 }
 
 /// What a limit order did: rests (its id), or filled at once (the size, signed, its average price).
@@ -1646,6 +1658,21 @@ pub async fn check(cfg: &Config, coin: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_last_close_only() {
+        // 2026-11-11 INIT: the dip's close 7 h before the RSI dip's stop, both since the RSI dip's open
+        let f = json!([
+            {"coin": "INIT", "dir": "Open Long", "px": "0.17631", "sz": "214", "time": 1_000_000u64},
+            {"coin": "INIT", "dir": "Close Long", "px": "0.17492", "sz": "585", "time": 2_000_000u64},
+            {"coin": "INIT", "dir": "Close Long", "px": "0.1320", "sz": "600", "time": 27_000_000u64},
+            {"coin": "INIT", "dir": "Close Long", "px": "0.1310", "sz": "86", "time": 27_000_400u64},
+            {"coin": "ZEC", "dir": "Close Long", "px": "500", "sz": "1", "time": 27_000_500u64}]);
+        let (px, sz) = last_close(&f, "INIT").unwrap();
+        assert_eq!(sz, 686.0);
+        assert!((px - (0.132 * 600.0 + 0.131 * 86.0) / 686.0).abs() < 1e-12);
+        assert_eq!(last_close(&f, "BTC"), None);
+    }
 
     /// The equity of a real unified account on mainnet (reads only): `EQUITY_ACCOUNT` = its address.
     /// `cargo test -- --ignored the_unified_equity --nocapture`

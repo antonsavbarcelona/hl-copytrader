@@ -27,7 +27,7 @@ use crate::ws::{Book, Books};
 
 const TOP_COINS: usize = 40;
 const MIN_VOL_USD: f64 = 10e6;
-const SIG: u32 = 4;
+pub(crate) const SIG: u32 = 4;
 const WALL_X: f64 = 5.0;
 const MIN_USD: f64 = 25_000.0;
 const MAX_DIST: f64 = 0.03;
@@ -214,8 +214,9 @@ impl Tracker {
     }
 }
 
-/// Starts the record: the grouped books of the top coins over the websocket, a look each second.
-pub async fn start(store: Store, api: Api, fine: Books) -> Result<()> {
+/// Starts the record: the grouped books of the top coins over the websocket, a look each second. The coins and
+/// their grouped books back (the minute record `micro` reads them too).
+pub async fn start(store: Store, api: Api, fine: Books) -> Result<(Vec<String>, Books)> {
     let (_, ctx) = api.meta().await?;
     let mut coins: Vec<(String, f64)> = ctx.into_iter().filter(|(n, c)| c.day_volume >= MIN_VOL_USD && !n.contains(':')).map(|(n, c)| (n, c.day_volume)).collect();
     coins.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -223,6 +224,7 @@ pub async fn start(store: Store, api: Api, fine: Books) -> Result<()> {
     log!("walls: recording {} coins' walls (x{WALL_X} the median level, ${MIN_USD:.0}+, within {:.0}%): {}", coins.len(), MAX_DIST * 100.0, coins.join(","));
     let agg: Books = Arc::default();
     tokio::spawn(crate::ws::run_books_sig(coins.clone(), Some(SIG), agg.clone()));
+    let back = (coins.clone(), agg.clone());
     tokio::spawn(async move {
         let mut tr = Tracker::default();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -249,7 +251,7 @@ pub async fn start(store: Store, api: Api, fine: Books) -> Result<()> {
             }
         }
     });
-    Ok(())
+    Ok(back)
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@ mod store;
 mod trades;
 mod trend;
 mod walls;
+mod micro;
 mod wick;
 mod wickwatch;
 mod wkd;
@@ -89,8 +90,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         listing::start(&cfg, store.clone()).await?;
         trend::start(&cfg, store.clone()).await?;
         expiry::start(&cfg, store.clone()).await?;
-        if let Err(e) = walls::start(store.clone(), api.clone(), books.clone()).await {
-            log!("walls: not recording: {e:#}");
+        match walls::start(store.clone(), api.clone(), books.clone()).await {
+            Ok((coins, agg)) => if let Err(e) = micro::start(store.clone(), api.clone(), coins, agg).await {
+                log!("micro: not recording: {e:#}");
+            },
+            Err(e) => log!("walls: not recording: {e:#}"),
         }
         squeeze::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));

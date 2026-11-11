@@ -167,3 +167,70 @@ pub async fn run_books_sig(coins: Vec<String>, sig: Option<u32>, books: Books) {
     })
     .await;
 }
+
+/// One trade of the public tape.
+#[derive(Clone, Debug)]
+pub struct Tape {
+    pub coin: String,
+    pub px: f64,
+    pub sz: f64,
+    /// The taker bought (the exchange's side "B").
+    pub taker_buy: bool,
+    pub time_ms: u64,
+    pub buyer: String,
+    pub seller: String,
+}
+
+/// Every trade of `coins` (both its accounts), each once (a resubscription's replay dropped).
+pub async fn run_tape(name: &'static str, coins: Vec<String>, tx: mpsc::UnboundedSender<Tape>) {
+    let subs = coins.iter().map(|c| json!({"type": "trades", "coin": c})).collect();
+    let started_ms = (exchange_now() * 1000.0) as u64;
+    let mut seen: HashMap<String, (u64, HashSet<u64>)> = HashMap::new();
+    run(name, subs, move |v| {
+        if v["channel"] != "trades" {
+            return;
+        }
+        let Some(list) = v["data"].as_array() else { return };
+        let mut list: Vec<&Value> = list.iter().collect();
+        list.sort_by_key(|t| (t["time"].as_u64().unwrap_or(0), t["tid"].as_u64().unwrap_or(0)));
+        for t in list {
+            let coin = t["coin"].as_str().unwrap_or("").to_string();
+            let (time_ms, tid) = (t["time"].as_u64().unwrap_or(0), t["tid"].as_u64().unwrap_or(0));
+            let (last, ids) = seen.entry(coin.clone()).or_insert_with(|| (started_ms, HashSet::new()));
+            if time_ms < *last || (time_ms == *last && !ids.insert(tid)) {
+                continue;
+            }
+            if time_ms > *last {
+                *last = time_ms;
+                ids.clear();
+                ids.insert(tid);
+            }
+            let users = t["users"].as_array();
+            let (Some(buyer), Some(seller)) = (users.and_then(|u| u.first()).and_then(Value::as_str),
+                                                users.and_then(|u| u.get(1)).and_then(Value::as_str)) else { continue };
+            let _ = tx.send(Tape { coin, px: num(&t["px"]), sz: num(&t["sz"]), taker_buy: t["side"] == "B", time_ms,
+                buyer: buyer.to_lowercase(), seller: seller.to_lowercase() });
+        }
+    })
+    .await;
+}
+
+/// The best bid and ask of `coins`: (bid, ask, the exchange's ms).
+pub type Bbos = Arc<RwLock<HashMap<String, (f64, f64, u64)>>>;
+
+pub async fn run_bbo(name: &'static str, coins: Vec<String>, bbos: Bbos) {
+    let subs = coins.iter().map(|c| json!({"type": "bbo", "coin": c})).collect();
+    run(name, subs, move |v| {
+        if v["channel"] != "bbo" {
+            return;
+        }
+        let d = &v["data"];
+        let (Some(coin), Some(b)) = (d["coin"].as_str(), d["bbo"].as_array()) else { return };
+        let px = |i: usize| b.get(i).map(|l| num(&l["px"])).unwrap_or(0.0);
+        let (bid, ask) = (px(0), px(1));
+        if bid > 0.0 && ask > 0.0 {
+            bbos.write().unwrap().insert(coin.to_string(), (bid, ask, d["time"].as_u64().unwrap_or(0)));
+        }
+    })
+    .await;
+}

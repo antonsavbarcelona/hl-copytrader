@@ -142,7 +142,7 @@ impl Api {
         }
     }
 
-    async fn info(&self, body: Value, weight: u32) -> Result<Value> {
+    pub(crate) async fn info(&self, body: Value, weight: u32) -> Result<Value> {
         let mut backoff = 1.0;
         for _ in 0..6 {
             self.pace(weight).await;

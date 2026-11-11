@@ -167,7 +167,9 @@ impl Params {
         Params { drop: v("DIP_DROP_PCT", 8.0) / 100.0, window: v("DIP_WINDOW_MIN", 15.0) as i64, btc_max: v("DIP_BTC_MAX_PCT", 2.0) / 100.0,
             min_vol: v("DIP_MIN_VOL_USD", 16e6), hold_s: v("DIP_HOLD_MIN", 120.0) * 60.0, stop: v("DIP_STOP_PCT", 20.0) / 100.0,
             risk: v("DIP_RISK_PCT", 5.0) / 100.0, risk_usd: v("DIP_RISK_USD", 20.0), max_open: v("DIP_MAX_OPEN", 5.0) as usize, cooldown_s: v("DIP_COOLDOWN_MIN", 240.0) * 60.0,
-            dry: on("DIP_DRY"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
+            // paper only by default (2026-11-11, the user's call: the backtest's swings, 5 best days ~46% of
+            // its R, 66 days without a new high): the signals and their result a hold on at the mid logged; "0" trades.
+            dry: std::env::var("DIP_DRY").map_or(true, |x| x.trim() != "0"), rsi_max: v("DIP_RSI_MAX", 0.0), funding_drop: v("DIP_FUNDING_DROP_PCT", 5.6) / 100.0,
             trial: Some(v("DIP_TRIAL", 0.0) as u32).filter(|n| *n > 0),
             // the pump short OFF by default (2026-11-04, the user's call after the robustness run: Binance 5m 2020-26, 894
             // perps point in time, every one of 18 variants negative, the live params -177 R, t by day -1.1, the walk-forward
@@ -217,6 +219,9 @@ struct State {
     last_pump_move: HashMap<String, i64>,
     #[serde(default)]
     dry_pumps: Vec<DryPump>,
+    /// The dip's paper signals (`DIP_DRY`): their result a hold on (`rise` holds the fall).
+    #[serde(default)]
+    dry_dips: Vec<DryPump>,
     /// The pump shorts opened (the trial's count).
     #[serde(default)]
     pumps_opened: u32,
@@ -737,6 +742,23 @@ impl Dip {
         self.save();
     }
 
+    /// The dip's paper signals' results at the mid a hold on (no stop: the 20% stop is rarely hit in 120 min).
+    fn dry_dip_results(&mut self) {
+        let (t, hold) = (now(), self.p.hold_s);
+        let (due, keep): (Vec<DryPump>, Vec<DryPump>) = std::mem::take(&mut self.state.dry_dips).into_iter().partition(|d| t - d.at >= hold);
+        self.state.dry_dips = keep;
+        if due.is_empty() {
+            return;
+        }
+        for d in due {
+            if let Some(m) = self.closes.at(&d.coin, i64::MAX) {
+                self.event(json!({"what": "dip_dry_result", "coin": d.coin, "fall": d.rise, "mid_signal": d.mid, "mid": m,
+                    "after_min": (t - d.at) / 60.0, "ret_pct": (m / d.mid - 1.0) * 100.0}));
+            }
+        }
+        self.save();
+    }
+
     /// The `PUMP_DRY=1` signals' results at the mid, one hold and two holds on.
     fn dry_results(&mut self) {
         let (t, hold) = (now(), self.p.pump.hold_s);
@@ -790,6 +812,7 @@ impl Dip {
         if self.p.dry || !crate::trades::trial_open(self.p.trial, self.state.v2_opened) {
             // The cooldown as if bought: one signal a coin a fall.
             self.state.last_entry.insert(coin.to_string(), now());
+            self.state.dry_dips.push(DryPump { coin: coin.to_string(), at: now(), mid, rise: fall, done: 0 });
             self.event(json!({"what": "signal", "coin": coin, "fall": fall, "btc": btc, "mid": mid, "size": size, "notional": size * mid, "equity": self.equity,
                 "signal_delay_ms": delay_ms, "book": book, "regime": regime}));
             return;
@@ -865,6 +888,9 @@ impl Dip {
         let t = now();
         if !self.state.dry_pumps.is_empty() {
             self.dry_results();
+        }
+        if !self.state.dry_dips.is_empty() {
+            self.dry_dip_results();
         }
         let due: Vec<(String, Pos)> = self.state.open.iter().filter(|(_, p)| t - p.opened >= if p.pump { self.p.pump.hold_s } else { self.p.hold_s })
             .map(|(c, p)| (c.clone(), p.clone())).collect();
@@ -1024,6 +1050,8 @@ fn message(ev: &Value) -> Option<String> {
 цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
             f("rise") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
         "pump_signal" => format!("👀 сигнал шорта (без сделки) {coin}: выросла на {:.1}%, цена {}, шортил бы на ${:.0}", f("rise") * 100.0, f("mid"), f("notional")),
+        "dip_dry_result" => format!("{} итог сигнала дипа {coin} (бумага) через {:.0} мин: {} -> {} ({:+.2}%)",
+            if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),
         "pump_dry_result" => format!("{} итог сигнала шорта {coin} через {:.0} мин: {} -> {} ({:+.2}% для шорта)",
             if f("ret_pct") >= 0.0 { "✅" } else { "🔻" }, f("after_min"), f("mid_signal"), f("mid"), f("ret_pct")),
         "pump_skipped" if ev["why"] == "cooldown" => return None,

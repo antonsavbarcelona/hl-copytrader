@@ -138,6 +138,27 @@ const LOW: usize = 5;
 const LOW2: usize = 6;
 /// The majors bid on their own (BTC is the calm filter's reference).
 const MAJORS: [&str; 5] = ["ETH", "SOL", "XRP", "BNB", "DOGE"];
+
+/// The main HIP-3 bids' risk a trade, % of the equity (the user's call 2026-11-11): the shallow `WICK_H3_PCT` bid while
+/// the US market trades (rung 0, a HIP-3 coin, not a shut-hours bid); every other rung keeps the family's
+/// (`trades::family_risk_pct`, 2%). V404 (the V75 portfolio, 2025-05 .. 2026-10, HIP-3 cross 10x, the 40% cap): all at 2%
+/// x6.3, the drawdown 14.3%; this one at 5% x13.4 at the same 14.3% (h2 x2.40 -> x4.80, its drawdown 6.3 -> 10.1%); all at
+/// 3% x15.2 with 21%. Its 2 slots at 5% + the 6 shut / ladder slots at 2%: 22% at most, not 40%. With the family's sizing
+/// off (the $ test): its $ x2.5.
+const H3_MAIN_RISK_PCT: f64 = 5.0;
+
+/// A rung's risk $ a trade: `H3_MAIN_RISK_PCT` for the main HIP-3 bid, else the family's.
+fn rung_risk(coin: &str, rung: usize, shut: bool, base_usd: f64) -> f64 {
+    rung_risk_at(coin, rung, shut, trades::risk_usd(base_usd), trades::family_risk_pct(), trades::equity())
+}
+
+/// `rung_risk` with the family's risk $ `base`, its % `pct` and the equity `eq` given.
+fn rung_risk_at(coin: &str, rung: usize, shut: bool, base: f64, pct: f64, eq: f64) -> f64 {
+    if rung != 0 || shut || !coin.contains(':') {
+        return base;
+    }
+    if pct > 0.0 && eq > 0.0 { H3_MAIN_RISK_PCT / 100.0 * eq } else { base * H3_MAIN_RISK_PCT / 2.0 }
+}
 const POLL_S: f64 = 5.0;
 const ORDERS_EVERY_S: f64 = 15.0;
 /// The account's positions against the strategies' trades: every minute; one no strategy holds for `ORPHAN_AFTER_S`
@@ -596,11 +617,12 @@ impl Wick {
         let (n_crypto, n_h3, n_shut) = self.counts();
         let risk = trades::risk_usd(self.p.risk_usd);
         let t = now();
-        let free = |c: &str| {
+        let free_at = |c: &str, risk: f64| {
             (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
                 && self.state.last_fill.get(c).is_none_or(|x| t - x >= AGAIN_AFTER_S)
                 && trades::can_open(c, "wick", 1.0, risk)
         };
+        let free = |c: &str| free_at(c, risk);
         if self.btc_calm(minute) && n_crypto < self.p.max_open && trades::trial_open(self.p.trial, self.state.opened) {
             for c in self.picked.clone() {
                 let (Some(close), o) = (self.closes.at(&c, minute - 1), self.oracle.get(&c).copied().unwrap_or(0.0)) else { continue };
@@ -619,7 +641,7 @@ impl Wick {
                 let shut = if noneq { Some(self.p.noneq_shut_pct) } else { self.p.shut_pct(&c, minute) };
                 // the shut-hours trades their own slots (held up to a day, they would keep the 4% bids off)
                 let room = if shut.is_some() { n_shut < self.p.shut_max_open } else { n_h3 < self.p.h3_max_open };
-                if room && free(&c) {
+                if room && free_at(&c, rung_risk(&c, 0, shut.is_some(), self.p.risk_usd)) {
                     let pct = shut.unwrap_or(self.p.h3_pct);
                     out.insert(c, (level(close, pct), pct, shut.is_some()));
                 }
@@ -1039,14 +1061,13 @@ impl Wick {
         if let Some((m, _)) = self.cap.filter(|(_, until)| now() < *until) {
             budget = budget.min(m);
         }
-        let risk = trades::risk_usd(self.p.risk_usd);
         // within a priority the most restless first (the pick's order)
         let rank = |c: &str| [&self.picked, &self.h3_picked, &self.low_picked].iter().find_map(|v| v.iter().position(|x| x == c)).unwrap_or(usize::MAX);
         let mut all: Vec<(f64, usize, String, f64)> = wants.iter().enumerate()
             .flat_map(|(rung, w)| w.iter().map(move |(c, (_, pct, shut))| (rung, c, *pct, *shut)))
             .map(|(rung, c, pct, shut)| {
                 let stop = self.p.rung_exits(c, rung, shut, pct).1;
-                (self.worth(c, rung), rung, c.clone(), risk / stop.max(1e-9) / self.venue.leverage_of(c))
+                (self.worth(c, rung), rung, c.clone(), rung_risk(c, rung, shut, self.p.risk_usd) / stop.max(1e-9) / self.venue.leverage_of(c))
             })
             .collect();
         all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(rank(&a.2).cmp(&rank(&b.2))).then(a.2.cmp(&b.2)));
@@ -1136,7 +1157,7 @@ impl Wick {
             // no requests to spare (`live::RATE_RESERVE`): nothing placed or moved; a bid its level left
             // behind (the level past it: the MRNA case) only cancelled; one the level moved away from stays
             let spend = crate::live::wick_may_spend();
-            let size = trades::size_for(trades::risk_usd(self.p.risk_usd), self.p.rung_exits(&c, rung, shut, pct).1, lvl);
+            let size = trades::size_for(rung_risk(&c, rung, shut, self.p.risk_usd), self.p.rung_exits(&c, rung, shut, pct).1, lvl);
             let mut old = None;
             if let Some(b) = self.book(rung).get(&c).cloned() {
                 // the level's kind changed (the US market shut or open again): moved whichever way
@@ -1607,6 +1628,18 @@ pub(crate) fn after_cancel(r: &anyhow::Result<(f64, bool)>) -> AfterCancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_main_hip3_bid_takes_5_pct() {
+        // the family at 2% of $1000: $20; the main HIP-3 bid (rung 0, US session) 5%: $50
+        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 2.0, 1000.0), 50.0);
+        assert_eq!(rung_risk_at("xyz:SOXL", 0, true, 20.0, 2.0, 1000.0), 20.0);   // a shut-hours bid
+        assert_eq!(rung_risk_at("xyz:SOXL", 1, false, 20.0, 2.0, 1000.0), 20.0);  // the ladder
+        assert_eq!(rung_risk_at("xyz:SOXL", ASK, false, 20.0, 2.0, 1000.0), 20.0);
+        assert_eq!(rung_risk_at("ZEC", 0, false, 20.0, 2.0, 1000.0), 20.0);       // a crypto bid
+        // the family's sizing off (the $ test): the $ x2.5
+        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 0.0, 1000.0), 50.0);
+    }
 
     #[test]
     fn the_crash_insurance() {

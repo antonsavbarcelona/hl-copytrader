@@ -40,6 +40,10 @@ const DEXES_EVERY_S: f64 = 3600.0;
 /// The windows (min) a fall is read over.
 const WINDOWS: [i64; 2] = [5, 15];
 const COOLDOWN_MIN: i64 = 240;
+/// The HIP-3 dip's own buys (off, the user's call 2026-11-11: 7 live trades −$13, the bot's paper of
+/// its 14 signals +0.8% a trade): the signals and their `result` at the mid stay logged as its paper,
+/// a trade already held is still seen out; the weekend dips (`wkd`) on the same venue trade as before.
+const DIP_LIVE: bool = false;
 
 #[derive(Clone, Debug)]
 struct Params {
@@ -160,7 +164,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     for tr in &state.open {
         crate::trades::register(&tr.coin, "hip3", tr.risk(), tr.size);
     }
-    if let Some((v, _)) = &venue {
+    if venue.is_some() && !DIP_LIVE {
+        log!("hip3: the dip's buys off (paper only), {} held seen out", state.open.len());
+        crate::notify::send("📈 HIP-3 покупка падений: только на бумаге (сигналы и итог через 30 мин), без сделок".to_string());
+    } else if let Some((v, _)) = &venue {
         log!("hip3: LIVE on account {}: risk {}, stop {:.0}%, at most {}, {} held, trial {:?} ({} opened)", v.account, crate::trades::sizing_label(p.risk_usd, p.stop),
             p.stop * 100.0, p.max_open, state.open.len(), p.trial, state.opened);
         crate::notify::send(format!("📈 HIP-3 покупка падений НА ДЕНЬГИ: риск {}, стоп {:.0}%, держим {:.0} мин, до {} позиций, плечо 3x изолированно; падение {:.0}% за 5 или 15 мин, оборот от ${:.0}M{}",
@@ -373,6 +380,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     changed = true;
                     // Traded (HIP3_LIVE on): a coin of a USDC dex, within the limits.
                     let Some((v, _)) = &venue else { continue };
+                    if !DIP_LIVE {
+                        continue;
+                    }
                     if !crate::trades::trial_open(p.trial, state.opened) {
                         log!("hip3: {coin} not traded (the trial's {} trades done)", state.opened);
                         continue;

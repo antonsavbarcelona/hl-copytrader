@@ -281,6 +281,7 @@ pub(crate) fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
     Some(match ev["what"].as_str()? {
+        "wkd_signal" | "wkd_close" if !crate::notify::PAPER_TO_CHAT => return None,
         "wkd_signal" => format!("🧪 HIP-3 {} (без сделки) {coin}: {:.1}% под максимум 15 мин, цена {}, оборот ${:.0}k",
             if ev["night"].as_bool().unwrap_or(false) { "ночь США" } else { "выходные" }, f("fall") * 100.0, f("mid"), f("volume") / 1e3),
         "wkd_close" => format!("🧪 {} бумажный итог сигнала {coin} ({}; по цене сигнала, это НЕ реальная сделка): {} -> {} ({:+.2}% после комиссий, {:.1} ч); всего {:.0} сигналов, сумма {:+.1}%",
@@ -356,7 +357,8 @@ mod tests {
             assert_eq!(ev[0]["why"], "take");
             assert!((ev[0]["ret_pct"].as_f64().unwrap() - (5.0 - 0.17)).abs() < 1e-9);
             assert!(b.open.is_empty());
-            assert!(message(&ev[0]).unwrap().contains("тейк"));
+            // the paper result off the chat (`notify::PAPER_TO_CHAT`)
+            assert!(if crate::notify::PAPER_TO_CHAT { message(&ev[0]).unwrap().contains("тейк") } else { message(&ev[0]).is_none() });
         }
         // a US night: the US stock signals, the Asian one does not
         let night = 29_887_320;
@@ -371,7 +373,7 @@ mod tests {
         let (ev, _) = b.step(&p, &c, &lows, &vol, night, 0.0);
         assert_eq!(ev.len(), 1, "{ev:?}");
         assert_eq!(ev[0]["coin"], "xyz:NVDA");
-        assert!(message(&ev[0]).unwrap().contains("ночь США"));
+        assert!(if crate::notify::PAPER_TO_CHAT { message(&ev[0]).unwrap().contains("ночь США") } else { message(&ev[0]).is_none() });
     }
 }
 

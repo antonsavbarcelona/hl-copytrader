@@ -9,6 +9,12 @@ use tokio::sync::mpsc;
 
 use crate::log;
 
+/// Whether the paper side reaches the chat: signals with no trade and their paper results (the HIP-3 dip, the dip,
+/// the pump short, the weekend / US-night dips' paper, the RSI dip's paper, the trials-over signals). Off since
+/// 2026-11-12 (the user's call: a paper "-4.85%" read next to a real +$23 on the same stock); all of it stays in the
+/// events table for the paper-vs-live comparison.
+pub const PAPER_TO_CHAT: bool = false;
+
 static TX: OnceLock<Option<mpsc::UnboundedSender<String>>> = OnceLock::new();
 
 fn sender() -> &'static Option<mpsc::UnboundedSender<String>> {

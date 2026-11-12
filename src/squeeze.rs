@@ -230,6 +230,7 @@ fn message(ev: &Value) -> Option<String> {
             match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "close_stop" => "СТОП по закрытию 4ч", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" },
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
         "error" => format!("⚠️ {nm} {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" if !crate::notify::PAPER_TO_CHAT => return None,
         "signal" => format!("🗜 сигнал: {nm} {coin} по {} (проба окончена, без сделки)", f("px")),
         "own_off" => format!("🗜 {nm} {coin} по {}: пропущен — свои бумажные сделки за {:.0} дн. {:+.1}R ({:.0} шт.), вход только после своего минуса",
             f("px"), f("days"), f("own_r"), f("papers")),

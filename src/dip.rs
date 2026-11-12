@@ -1036,6 +1036,7 @@ fn message(ev: &Value) -> Option<String> {
     let coin = ev["coin"].as_str().unwrap_or("?");
     let usd = |x: f64| if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) };
     Some(match ev["what"].as_str()? {
+        "signal" | "dip_dry_result" | "pump_signal" | "pump_dry_result" | "skipped" | "pump_skipped" if !crate::notify::PAPER_TO_CHAT => return None,
         "open" => format!("🟢 КУПИЛ {coin}: упала на {:.1}% (BTC {:+.1}%)
 цена {}, на ${:.0} ({:.0}% от депозита ${:.0}), стоп {}",
             f("fall") * 100.0, f("btc") * 100.0, f("px"), f("notional"), f("notional") / f("equity").max(1e-9) * 100.0, f("equity"), f("stop_px")),
@@ -1094,8 +1095,9 @@ mod tests {
         let up: Vec<f64> = (0..40).map(|i| i as f64).collect();
         assert!(rsi(&up, 14).unwrap() > 99.9);
         assert_eq!(rsi(&up[..20], 14), None);                // too few closes
-        let m = message(&json!({"what": "skipped", "coin": "X", "fall": -0.09, "why": "rsi", "rsi": 63.2, "rsi_max": 50.0})).unwrap();
-        assert!(m.contains("RSI 1ч 63") && m.contains("до 50"));
+        let m = message(&json!({"what": "skipped", "coin": "X", "fall": -0.09, "why": "rsi", "rsi": 63.2, "rsi_max": 50.0}));
+        // the paper side off the chat (`notify::PAPER_TO_CHAT`): nothing sent
+        assert!(if crate::notify::PAPER_TO_CHAT { m.is_some_and(|m| m.contains("RSI 1ч 63") && m.contains("до 50")) } else { m.is_none() });
     }
 
     #[test]

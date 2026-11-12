@@ -128,6 +128,7 @@ fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
     Some(match ev["what"].as_str()? {
+        "signal" | "result" if !crate::notify::PAPER_TO_CHAT => return None,
         "signal" => format!("👀 HIP-3 сигнал (без сделки) {coin}: упала на {:.1}% за {} мин, цена {}, оборот ${:.0}M", f("fall") * 100.0, f("window"), f("mid"), f("volume") / 1e6),
         "open" => format!("🟢 HIP-3 КУПИЛ {coin}: упала на {:.1}%, цена {}, на ${:.0}, стоп {}, выход через {:.0} мин", f("fall") * 100.0, f("px"), f("notional"), f("stop_px"), f("hold_min")),
         "close" => format!("{} HIP-3 {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
@@ -511,7 +512,10 @@ mod tests {
             c2.update("xyz:A", m, if m >= 114 { 90.0 } else { 100.0 }, 20);
         }
         assert!(falls(&c2, &vol, &mut HashMap::new(), 116, &p).is_empty());
-        let m = message(&json!({"what": "result", "coin": "xyz:A", "after_min": 30.0, "mid_signal": 90.0, "mid": 92.0, "ret_pct": 2.22})).unwrap();
-        assert!(m.contains("xyz:A") && m.contains("+2.22%"));
+        let m = message(&json!({"what": "result", "coin": "xyz:A", "after_min": 30.0, "mid_signal": 90.0, "mid": 92.0, "ret_pct": 2.22}));
+        // the paper side off the chat (`notify::PAPER_TO_CHAT`): nothing sent
+        assert!(if crate::notify::PAPER_TO_CHAT { m.is_some_and(|m| m.contains("xyz:A") && m.contains("+2.22%")) } else { m.is_none() });
+        // a live trade's close is still told
+        assert!(message(&json!({"what": "close", "coin": "xyz:A", "why": "time", "entry_px": 90.0, "px": 92.0, "ret_pct": 2.22, "pnl_usd": 2.5})).is_some());
     }
 }

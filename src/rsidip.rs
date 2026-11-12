@@ -314,6 +314,9 @@ fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
     let live = ev["live"] == true;
+    if !live && !crate::notify::PAPER_TO_CHAT && ev["what"] != "error" {
+        return None;
+    }
     let tag = if live { "💵 RSI-дип НА ДЕНЬГИ" } else { "📝 RSI-дип (бумага, без сделки)" };
     Some(match ev["what"].as_str()? {
         "open" => format!("{tag} ВХОД {coin}{}: RSI был {:.0} и развернулся, цена {:.1}% ниже EMA200{}; по {}, ${:.0}, тейк {} / стоп {}, до {:.0} ч{}",

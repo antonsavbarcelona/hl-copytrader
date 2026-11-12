@@ -135,6 +135,7 @@ fn message(ev: &Value) -> Option<String> {
             match ev["why"].as_str().unwrap_or("") { "stop" => "АВАРИЙНЫЙ СТОП", "trail" => "выход по трейлу", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" },
             f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_days")),
         "error" => format!("⚠️ тренд лонг {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" if !crate::notify::PAPER_TO_CHAT => return None,
         "signal" => format!("📈 сигнал тренд лонга {coin} по {} (проба окончена, без сделки)", f("px")),
         _ => return None,
     })

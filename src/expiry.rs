@@ -90,6 +90,7 @@ fn message(ev: &Value) -> Option<String> {
         "close" => format!("{} шорт экспирации {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
             if ev["why"] == "stop" { "СТОП" } else if ev["why"] == "manual" { "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)" } else { "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ шорт экспирации {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "signal" if !crate::notify::PAPER_TO_CHAT => return None,
         "signal" => format!("🔻 сигнал шорта экспирации {coin} по {} (проба окончена, без сделки)", f("px")),
         _ => return None,
     })

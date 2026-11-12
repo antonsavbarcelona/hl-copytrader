@@ -7,7 +7,8 @@
 //! returns over the last 24 h (the main dex's and the bid HIP-3 dexes' mids every 5 s, every other
 //! HIP-3 dex's every 30 s; after a start 24 h of 1-minute candles read, a coin a minute; a coin with
 //! under 6 h of them after the others, by volume); `WICK_PICK=volume`: the biggest day volume. A bid
-//! moves down as soon as its level falls `WICK_REPRICE_DOWN_PCT` (0.2) under it - never resting
+//! moves down as soon as its level falls `WICK_REPRICE_DOWN_PCT` (0.5; 0.2 until 2026-11-12: V410, HL 1m
+//! 180 d, 0.5 vs 0.2 ~44% fewer requests, R crypto flat, HIP-3 -2.4%; the user's call) under it - never resting
 //! over the level the research had, or a slow slide fills it (xyz:MRNA 2026-10-27: a bid 3.5% stale,
 //! filled 0.5% under the last close) - and up when the level rises `WICK_REPRICE_PCT` (2) over it
 //! (the address's rate limit: not every minute); the crypto bids come off while BTC moves 1%+ in a
@@ -82,7 +83,7 @@
 //! The asks (V248 .. V258), the wick's mirror: a resting SELL `WICK_ASK_PCT` (5) over the anchor (the close, or the oracle when higher) on the
 //! `WICK_ASK_MAX_COINS` (5) most restless picked coins, short, take `WICK_ASK_TAKE_PCT` (3) under, stop `WICK_ASK_STOP_PCT` (10) over,
 //! `WICK_ASK_HOLD_MIN` (240), `WICK_ASK_MAX_OPEN` (2) slots, the registry's `wicka`, the same BTC / hot checks; moved up as soon as its
-//! level rises 0.2% (a stale ask under the level fills on a slow climb). The tape (HL 2025-05 .. 2026-10, a fill only on a print over it):
+//! level rises `WICK_REPRICE_DOWN_PCT` (0.5%; a stale ask under the level fills on a slow climb). The tape (HL 2025-05 .. 2026-10, a fill only on a print over it):
 //! the 30 coins 308 fills +100 bp (t 3.9), 82% up, the halves +94 / +105, w/o the 10 best coins +52; the top 5 hold 264 of them (+103);
 //! the spikes Binance did not share (its high < +2% that minute) +265 bp, 98% up; those it shared (+4%+) +67: an HL book's hole, which
 //! is why Binance 2020-26 shows ~0. The HL portfolio (2%, the top 5) x41.7 -> x69.7, the drawdown 26.1% -> 22.8% (a short side: it
@@ -260,7 +261,7 @@ impl Params {
         let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
             h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 0.7e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
-            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.2) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
+            reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.5) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
             by_spread: std::env::var("WICK_PICK").map(|x| x.trim() != "volume").unwrap_or(true), hot_x: v("WICK_HOT_X", 2.5),

@@ -201,6 +201,14 @@ pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
     fits && !crowded && (cap == 0 || n < cap) && (risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9)
 }
 
+/// Whether one more trade risking `risk` $ fits the family's open-risk cap (`can_open`'s cap alone).
+pub(crate) fn risk_fits(risk: f64) -> bool {
+    let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
+    let eq = equity();
+    let open_risk: f64 = OPEN.lock().unwrap().as_ref().map_or(0.0, |m| m.values().flatten().map(|x| x.1).sum());
+    risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9
+}
+
 pub(crate) fn register(coin: &str, kind: &str, risk: f64, dir: f64) {
     let mut g = OPEN.lock().unwrap();
     let v = g.get_or_insert_with(Default::default).entry(coin.to_string()).or_default();

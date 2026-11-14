@@ -460,6 +460,28 @@ fn sides_margin((bid, ask): (f64, f64)) -> f64 {
     bid.max(ask)
 }
 
+/// Whether `coin`'s rung `rung` (a HIP-3 bid of the shut hours: `shut`) has its slots taken already by the trades
+/// open before this one: a bid filled in the seconds before the others were taken off (2026-11-14, the user's call:
+/// what the slots would not have taken is closed at the market, as the backtest skipped it).
+fn slots_full(p: &Params, st: &State, coin: &str, rung: usize, shut: bool) -> bool {
+    let h3 = coin.contains(':');
+    let n_h3 = |v: &[Trade]| v.iter().filter(|x| x.coin.contains(':')).count();
+    match rung {
+        0 => {
+            let is_shut = |x: &Trade| x.coin.contains(':') && x.exit_at - x.at > 2.0 * p.hold_s;
+            let n_shut = st.open.iter().filter(|x| is_shut(x)).count();
+            let h = n_h3(&st.open) - n_shut;
+            if !h3 { st.open.len() - h - n_shut >= p.max_open } else if shut { n_shut >= p.shut_max_open } else { h >= p.h3_max_open }
+        }
+        1 => if h3 { n_h3(&st.deep_open) >= p.deep_max_open } else { st.deep_open.len() - n_h3(&st.deep_open) >= p.cry_deep_max_open },
+        2 => st.deep3_open.len() >= p.cry_deep3_max_open,
+        ASK => if h3 { n_h3(&st.asks_open) >= p.h3_ask_max_open } else { st.asks_open.len() - n_h3(&st.asks_open) >= p.ask_max_open },
+        MAJ => st.maj_open.len() >= p.maj_max_open,
+        LOW => st.low_open.len() >= p.lowvol_max_open,
+        _ => st.low2_open.len() >= p.lowvol_max_open,
+    }
+}
+
 /// The hour's deviation over `x` times the day's (`x` 0: off; either unknown: not hot).
 fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
     x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
@@ -480,6 +502,8 @@ fn message(ev: &Value) -> Option<String> {
         "close" => format!("{} прокол {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
             match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        "over" => format!("✂️ лишняя лимитка {coin} закрыта по рынку ({}): вход {}, выход {}, {}",
+            if ev["why"] == "slots" { "слоты заняты" } else { "лимит риска семьи" }, f("px"), f("out_px"), usd(f("pnl_usd"))),
         _ => return None,
     })
 }
@@ -1322,6 +1346,23 @@ impl Wick {
             self.p.pct
         };
         let (take, stop, hold_s) = self.p.rung_exits(coin, rung, shut, pct);
+        // over the slots or the family's open-risk cap (several bids hit in the same seconds): closed at the market
+        let over = if slots_full(&self.p, &self.state, coin, rung, shut) {
+            Some("slots")
+        } else if !trades::risk_fits(rung_risk(coin, rung, shut, self.p.risk_usd)) {
+            Some("family cap")
+        } else {
+            None
+        };
+        if let Some(why) = over {
+            match self.venue.market(coin, -got, true).await {
+                Ok((done, out_px, _)) => self.event(json!({"what": "over", "coin": coin, "rung": rung, "why": why, "px": px, "size": got,
+                    "out_px": out_px, "closed": done, "pnl_usd": -done * (out_px - px)})),
+                Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("over the {why}, not closed: {e:#}")})),
+            }
+            self.save();
+            return;
+        }
         match trades::protect(&self.venue, coin, got, px, stop, Some(take), hold_s).await {
             Ok(tr) => {
                 self.event(json!({"what": "open", "coin": coin, "pct": pct, "shut": shut, "deep": deep, "rung": rung, "ask": rung == ASK, "major": rung == MAJ, "px": px, "size": got, "notional": got * px, "take_px": tr.take_px,
@@ -1649,6 +1690,35 @@ pub(crate) fn after_cancel(r: &anyhow::Result<(f64, bool)>) -> AfterCancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fill_over_the_slots_is_seen() {
+        let p = Params::from_env();
+        let tr = |c: &str, hold_h: f64| Trade { coin: c.into(), size: 1.0, at: 0.0, exit_at: hold_h * 3600.0, ..Default::default() };
+        let mut st = State::default();
+        assert!(!slots_full(&p, &st, "ZEC", 0, false));
+        // the crypto 7% bids: 2 slots; the HIP-3 session bids their own 2, the shut-hours ones their own 3
+        st.open = vec![tr("ETH", 1.0), tr("SOL", 1.0)];
+        assert!(slots_full(&p, &st, "ZEC", 0, false));
+        assert!(!slots_full(&p, &st, "xyz:NVDA", 0, false));
+        st.open.push(tr("xyz:SOXL", 1.0));
+        st.open.push(tr("xyz:MU", 1.0));
+        assert!(slots_full(&p, &st, "xyz:NVDA", 0, false));
+        assert!(!slots_full(&p, &st, "xyz:NVDA", 0, true));
+        st.open.extend([tr("xyz:A", 24.0), tr("xyz:B", 24.0), tr("xyz:C", 24.0)]);
+        assert!(slots_full(&p, &st, "xyz:NVDA", 0, true));
+        // the crypto ladder 3 slots, the HIP-3 ladder its own
+        st.deep_open = vec![tr("ETH", 1.0), tr("SOL", 1.0), tr("XRP", 1.0)];
+        assert!(slots_full(&p, &st, "ZEC", 1, false));
+        assert!(!slots_full(&p, &st, "xyz:NVDA", 1, true));
+        // the asks: crypto 2, HIP-3 3
+        st.asks_open = vec![tr("ETH", 4.0), tr("SOL", 4.0)];
+        assert!(slots_full(&p, &st, "ZEC", ASK, false));
+        assert!(!slots_full(&p, &st, "xyz:NVDA", ASK, false));
+        assert!(!slots_full(&p, &st, "ZEC", MAJ, false));
+        st.low_open = vec![tr("A", 1.0), tr("B", 1.0), tr("C", 1.0)];
+        assert!(slots_full(&p, &st, "D", LOW, false) && !slots_full(&p, &st, "D", LOW2, false));
+    }
 
     #[test]
     fn a_coin_holds_its_larger_side_only() {

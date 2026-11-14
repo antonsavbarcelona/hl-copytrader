@@ -453,6 +453,13 @@ fn priority(rung: usize, hip3: bool) -> f64 {
     }
 }
 
+/// A coin's resting orders' margin on HL: (its bids', its asks') -> the larger side only (2026-11-14: HL holds margin
+/// for one side of a coin's book, both can't fill at once; xyz $2181 summed vs $1768 held, io $646 vs $507: the budget
+/// left ~$450 unused; the user's call).
+fn sides_margin((bid, ask): (f64, f64)) -> f64 {
+    bid.max(ask)
+}
+
 /// The hour's deviation over `x` times the day's (`x` 0: off; either unknown: not hot).
 fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
     x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
@@ -1017,10 +1024,17 @@ impl Wick {
         (b.size * b.px).abs() / self.venue.leverage_of(c)
     }
 
-    /// The margin the resting orders hold now.
+    /// The margin the resting orders hold now: a coin's larger side only (`sides_margin`).
     fn held_margin(&mut self) -> f64 {
-        let all: Vec<(String, Bid)> = (0..=LOW2).flat_map(|r| self.book(r).clone().into_iter()).collect();
-        all.iter().map(|(c, b)| self.margin_of(c, b)).sum()
+        let mut by: HashMap<String, (f64, f64)> = HashMap::new();
+        for rung in 0..=LOW2 {
+            for (c, b) in self.book(rung).clone() {
+                let m = self.margin_of(&c, &b);
+                let e = by.entry(c).or_default();
+                if rung == ASK { e.1 += m } else { e.0 += m }
+            }
+        }
+        by.values().map(|s| sides_margin(*s)).sum()
     }
 
     /// The resting orders the market entries may take off, the weakest first.
@@ -1048,7 +1062,8 @@ impl Wick {
         self.volume.get(c).is_some_and(|v| *v < self.p.lowvol_min_vol)
     }
 
-    /// The wanted orders cut to the margin budget (each holds its notional / its coin's leverage): kept by
+    /// The wanted orders cut to the margin budget (each holds its notional / its coin's leverage; a coin's bids and asks
+    /// its larger side only, `sides_margin`): kept by
     /// `priority` (what an order earns a month per $ of the margin it holds), the rest not placed (or taken off).
     fn within_budget(&self, wants: &mut [HashMap<String, (f64, f64, bool)>]) {
         let mut budget = self.p.margin_budget_pct / 100.0 * trades::equity();
@@ -1073,11 +1088,16 @@ impl Wick {
             .collect();
         all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(rank(&a.2).cmp(&rank(&b.2))).then(a.2.cmp(&b.2)));
         let mut used = 0.0;
+        let mut by: HashMap<String, (f64, f64)> = HashMap::new();
         for (_, rung, c, m) in all {
-            if used + m > budget {
+            let cur = by.get(&c).copied().unwrap_or_default();
+            let next = if rung == ASK { (cur.0, cur.1 + m) } else { (cur.0 + m, cur.1) };
+            let add = sides_margin(next) - sides_margin(cur);
+            if used + add > budget {
                 wants[rung].remove(&c);
             } else {
-                used += m;
+                used += add;
+                by.insert(c, next);
             }
         }
     }
@@ -1629,6 +1649,15 @@ pub(crate) fn after_cancel(r: &anyhow::Result<(f64, bool)>) -> AfterCancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coin_holds_its_larger_side_only() {
+        // xyz:CRWV 2026-11-14: a bid holding $230.7 and an ask $72.4 -> HL held $230.7, not $303.1
+        assert_eq!(sides_margin((230.7, 72.4)), 230.7);
+        assert_eq!(sides_margin((0.0, 72.4)), 72.4);
+        assert_eq!(sides_margin((115.1 + 230.4, 71.9)), 345.5);   // two bids add, the ask under them free
+        assert_eq!(sides_margin((0.0, 0.0)), 0.0);
+    }
 
     #[test]
     fn only_the_main_hip3_bid_takes_5_pct() {

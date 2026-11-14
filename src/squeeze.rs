@@ -541,3 +541,20 @@ mod lifecycle {
         assert!(s.state.open.is_empty() && f.position("SQD") == 0.0);
     }
 }
+
+#[cfg(test)]
+mod candles {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg};
+
+    #[tokio::test]
+    async fn the_closed_4h_candles_only() {
+        let f = FakeHl::start(&[("SCA", 2, 10, 100.0)]).await;
+        let (store, _) = Store::for_test();
+        let p = Params::from_env();
+        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default() };
+        let b = (now() / BAR).floor() * BAR;
+        f.set_candles("SCA", "4h", &[(b - BAR, 1.0, 2.0, 0.5, 1.5, 1.0), (b, 1.5, 3.0, 1.0, 2.5, 1.0)]);
+        assert_eq!(s.bars("SCA", 5).await.unwrap(), vec![(b - BAR, 2.0, 0.5, 1.5)]);
+    }
+}

@@ -363,3 +363,21 @@ mod lifecycle {
         assert_eq!(saved(&s.k.cfg, "trend").await.unwrap()["open"].as_array().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+mod candles {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg};
+
+    #[tokio::test]
+    async fn the_closed_days_with_their_notional() {
+        let f = FakeHl::start(&[("TDA", 2, 10, 100.0)]).await;
+        let (store, _) = Store::for_test();
+        let s = TrendLong { k: Keeper::new(f.venue(), false, cfg(), store, "trend", message, HeldIn::Days), p: Params::from_env(), state: State::default() };
+        let day = (now() / DAY).floor() * DAY;
+        f.set_candles("TDA", "1d", &[(day - 2.0 * DAY, 9.0, 11.0, 8.0, 10.0, 5.0), (day - DAY, 10.0, 12.0, 9.0, 11.0, 2.0), (day, 11.0, 13.0, 10.0, 12.0, 1.0)]);
+        let d = s.days("TDA", 5).await.unwrap();
+        assert_eq!(d, vec![(day - 2.0 * DAY, 11.0, 8.0, 10.0, 50.0), (day - DAY, 12.0, 9.0, 11.0, 22.0)], "the forming day left out");
+        assert!(s.days("TDB", 5).await.unwrap().is_empty());
+    }
+}

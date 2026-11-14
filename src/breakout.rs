@@ -618,3 +618,28 @@ mod lifecycle {
         assert_eq!(b.stepped, bar);
     }
 }
+
+#[cfg(test)]
+mod candles {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg};
+
+    #[tokio::test]
+    async fn the_closed_hours_with_their_notional_and_the_cache_brought_up() {
+        let f = FakeHl::start(&[("BCA", 2, 10, 100.0)]).await;
+        let (store, _) = Store::for_test();
+        let p = Params { gap_s: 0.0, ..Params::from_env() };
+        let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(f.venue(), false, cfg(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
+        let mut b = Breakout { venue: f.venue(), keepers, p, states: HashMap::new(), bars: HashMap::new(), stepped: 0.0 };
+        let h = (now() / H).floor() * H;
+        f.set_candles("BCA", "1h", &[(h - 2.0 * H, 1.0, 2.0, 0.5, 1.5, 4.0), (h - H, 1.5, 2.5, 1.0, 2.0, 3.0), (h, 2.0, 3.0, 1.5, 2.5, 1.0)]);
+        assert_eq!(b.fetch("BCA", h - 10.0 * H).await.unwrap(), vec![(h - 2.0 * H, 1.0, 2.0, 0.5, 1.5, 6.0), (h - H, 1.5, 2.5, 1.0, 2.0, 6.0)]);
+        b.refresh(&[("BCA".to_string(), 1e6)]).await;
+        assert_eq!(b.bars["BCA"].len(), 2);
+        // the hour closes: the next refresh adds it, the last ones read again replace theirs
+        f.set_candles("BCA", "1h", &[(h - H, 1.5, 2.6, 1.0, 2.1, 3.0), (h, 2.0, 3.0, 1.5, 2.5, 1.0)]);
+        b.refresh(&[("BCA".to_string(), 1e6)]).await;
+        assert_eq!(b.bars["BCA"].len(), 2);
+        assert_eq!(b.bars["BCA"][1].2, 2.6, "the hour read again replaced");
+    }
+}

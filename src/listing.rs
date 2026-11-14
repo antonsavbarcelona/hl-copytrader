@@ -309,3 +309,22 @@ mod lifecycle {
         assert!(f.position("LSD") == 0.0 && f.open_orders("LSD").is_empty() && s.state.open.is_empty());
     }
 }
+
+#[cfg(test)]
+mod candles {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg};
+
+    #[tokio::test]
+    async fn the_listing_time_is_the_first_day_within_the_window_else_0() {
+        let f = FakeHl::start(&[("LCA", 2, 10, 1.0)]).await;
+        let (store, _) = Store::for_test();
+        let s = Listing { k: Keeper::new(f.venue(), false, cfg(), store, "listing", message, HeldIn::Days), p: Params::from_env(), state: State::default() };
+        let day = (now() / DAY).floor() * DAY;
+        f.set_candles("LCA", "1d", &[(day - 2.0 * DAY, 1.0, 1.0, 1.0, 1.0, 1.0), (day - DAY, 1.0, 1.0, 1.0, 1.0, 1.0)]);
+        assert_eq!(s.listed_at("LCA").await, Some(day - 2.0 * DAY));
+        f.set_candles("LCB", "1d", &(0..(NEW_WITHIN_DAYS as i64 + 3)).map(|i| (day - (NEW_WITHIN_DAYS + 2.0 - i as f64) * DAY, 1.0, 1.0, 1.0, 1.0, 1.0)).collect::<Vec<_>>());
+        assert_eq!(s.listed_at("LCB").await, Some(0.0), "listed before the window");
+        assert_eq!(s.listed_at("LCC").await, None, "no candles");
+    }
+}

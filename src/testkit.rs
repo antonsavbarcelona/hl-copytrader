@@ -490,9 +490,15 @@ pub(crate) async fn saved(cfg: &Config, name: &str) -> Option<Value> {
 impl FakeHl {
     /// A coin's candles of `interval` ("1h", "4h", "1d"): (open time s, open, high, low, close, volume in coins).
     pub(crate) fn set_candles(&self, coin: &str, interval: &str, bars: &[(f64, f64, f64, f64, f64, f64)]) {
-        let v = bars.iter().map(|b| json!({"t": (b.0 * 1000.0) as u64, "o": b.1.to_string(), "h": b.2.to_string(), "l": b.3.to_string(),
+        let step = match interval { "1m" => 60.0, "5m" => 300.0, "15m" => 900.0, "1h" => 3600.0, "4h" => 14_400.0, "1d" => 86_400.0, _ => 0.0 };
+        let v = bars.iter().map(|b| json!({"t": (b.0 * 1000.0) as u64, "T": ((b.0 + step) * 1000.0) as u64 - 1, "o": b.1.to_string(), "h": b.2.to_string(), "l": b.3.to_string(),
             "c": b.4.to_string(), "v": b.5.to_string()})).collect();
         self.with(|s| { s.candles.insert((coin.to_string(), interval.to_string()), v); });
+    }
+
+    /// The info API on the fake (`Api::at`).
+    pub(crate) fn api(&self) -> crate::api::Api {
+        crate::api::Api::at(&self.base)
     }
 
     pub(crate) fn set_volume(&self, coin: &str, usd: f64) {

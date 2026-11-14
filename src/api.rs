@@ -57,6 +57,8 @@ struct Pacer {
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
+    /// The info endpoint (`INFO`; a test's fake).
+    url: String,
     pacer: Arc<Mutex<Pacer>>,
     used: Arc<AtomicU64>,
 }
@@ -65,7 +67,7 @@ impl Api {
     pub fn new(weight_per_min: f64) -> Result<Self> {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(60)).user_agent("hl-copytrader").build()?;
         let per_weight = Duration::from_secs_f64(60.0 / weight_per_min.max(1.0));
-        Ok(Self { http, pacer: Arc::new(Mutex::new(Pacer { per_weight, next: Instant::now() })), used: Default::default() })
+        Ok(Self { http, url: INFO.to_string(), pacer: Arc::new(Mutex::new(Pacer { per_weight, next: Instant::now() })), used: Default::default() })
     }
 
     async fn pace(&self, weight: u32) {
@@ -81,11 +83,17 @@ impl Api {
         }
     }
 
+    /// The API at `base` (a test's fake Hyperliquid), unpaced.
+    #[cfg(test)]
+    pub(crate) fn at(base: &str) -> Self {
+        Api { url: format!("{}/info", base.trim_end_matches('/')), ..Self::new(1e9).unwrap() }
+    }
+
     pub(crate) async fn info(&self, body: Value, weight: u32) -> Result<Value> {
         let mut backoff = 1.0;
         for _ in 0..6 {
             self.pace(weight).await;
-            match self.http.post(INFO).json(&body).send().await {
+            match self.http.post(&self.url).json(&body).send().await {
                 Ok(r) if r.status().is_success() => return Ok(r.json().await?),
                 Ok(r) if r.status().as_u16() == 429 || r.status().is_server_error() => {}
                 Ok(r) => bail!("info {body}: {}", r.status()),
@@ -161,7 +169,7 @@ impl Api {
         for _ in 0..5 {
             self.pace(2).await;
             let t0 = now();
-            let v: Value = self.http.post(INFO).json(&json!({"type": "clearinghouseState", "user": format!("0x{:040}", 0)}))
+            let v: Value = self.http.post(&self.url).json(&json!({"type": "clearinghouseState", "user": format!("0x{:040}", 0)}))
                 .send().await?.json().await?;
             let t1 = now();
             let Some(ms) = v["time"].as_u64() else { bail!("no server time") };
@@ -175,4 +183,27 @@ impl Api {
         Ok((offset, rtt))
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::FakeHl;
+
+    #[tokio::test]
+    async fn the_bar_closes_with_the_forming_one_and_the_reads_on_the_fake() {
+        let f = FakeHl::start(&[("APA", 2, 10, 100.0), ("xyz:APB", 2, 10, 50.0)]).await;
+        let api = f.api();
+        let t = (now() / 300.0).floor() * 300.0;
+        f.set_candles("APA", "5m", &[(t - 300.0, 1.0, 1.0, 1.0, 10.0, 1.0), (t, 1.0, 1.0, 1.0, 11.0, 1.0), (t - 600.0, 1.0, 1.0, 1.0, 0.0, 1.0)]);
+        let v = api.bar_closes("APA", 5, t - 900.0).await.unwrap();
+        assert_eq!(v, vec![((t - 300.0) as i64 / 300, 10.0), (t as i64 / 300, 11.0)], "a zero close left out, the forming bar in");
+        let (coins, ctx) = api.meta().await.unwrap();
+        assert_eq!(coins.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["APA"]);
+        assert!(ctx.contains_key("APA"));
+        assert_eq!(api.mids("").await.unwrap().get("APA"), Some(&100.0));
+        assert_eq!(api.mids("xyz").await.unwrap().get("xyz:APB"), Some(&50.0));
+        f.set_volume("xyz:APB", 7e6);
+        assert_eq!(api.dex_volumes("xyz").await.unwrap().get("xyz:APB"), Some(&7e6));
+    }
 }

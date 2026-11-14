@@ -1190,3 +1190,41 @@ mod tests {
         assert!(m.contains("СТОП ZEC") && m.contains("79.5") && m.contains("-$20.50"));
     }
 }
+
+#[cfg(test)]
+mod candles {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg};
+
+    async fn dip(f: &FakeHl) -> Dip {
+        let (store, _) = Store::for_test();
+        Dip { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default(), closes: Closes::default(),
+            volume: HashMap::new(), funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: Default::default(),
+            regime_hist: VecDeque::new(), old_enough: HashMap::new() }
+    }
+
+    #[tokio::test]
+    async fn the_hour_rsi_on_the_completed_hours_and_the_mid_and_the_age_from_the_first_day() {
+        let f = FakeHl::start(&[("DCA", 2, 10, 100.0)]).await;
+        let mut d = dip(&f).await;
+        let h = (now() / 3600.0).floor() * 3600.0;
+        // 40 completed hours falling 1 a step, and the forming hour (left out) way up
+        let mut bars: Vec<(f64, f64, f64, f64, f64, f64)> = (0..40).map(|i| { let c = 140.0 - i as f64; (h - (40 - i) as f64 * 3600.0, c, c, c, c, 1.0) }).collect();
+        bars.push((h, 500.0, 500.0, 500.0, 500.0, 1.0));
+        f.set_candles("DCA", "1h", &bars);
+        d.closes.update("DCA", 0, 100.0, 5);
+        let r = d.rsi_1h("DCA").await.unwrap();
+        let mut closes: Vec<f64> = bars[..40].iter().map(|b| b.4).collect();
+        closes.push(100.0);
+        assert!((r - rsi(&closes, 14).unwrap()).abs() < 1e-9, "{r}");
+        assert!(d.rsi_1h("NOPE").await.is_none(), "no mid: none");
+        // the age: the first daily candle 30 days back
+        let day = (now() / 86_400.0).floor() * 86_400.0;
+        f.set_candles("DCA", "1d", &(0..31).map(|i| (day - (30 - i) as f64 * 86_400.0, 1.0, 1.0, 1.0, 1.0, 1.0)).collect::<Vec<_>>());
+        assert!(d.old_enough("DCA", 20.0).await);
+        assert!(!d.old_enough("DCB", 20.0).await, "no candles: not old enough");
+        f.set_candles("DCB", "1d", &(0..5).map(|i| (day - (4 - i) as f64 * 86_400.0, 1.0, 1.0, 1.0, 1.0, 1.0)).collect::<Vec<_>>());
+        d.old_enough.clear();
+        assert!(!d.old_enough("DCB", 20.0).await);
+    }
+}

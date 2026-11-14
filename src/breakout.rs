@@ -1,0 +1,561 @@
+//! The 7-day breakout after an accumulation, both sides, on the main-dex perps' 1h candles (`BRK_ENABLED` /
+//! `BRKS_ENABLED`: unset or "1" live, "0" off, set empty the trial; with `LIVE_KEY` / `LIVE_ACCOUNT` as for the dip).
+//!
+//! The rule (from the JewTrade channel's setups, research V418-V424, 2026-11-14): after each 1h candle's close,
+//! - LONG: the close over the highest high of the 168 candles before (the first close over it, the close before at or
+//!   under it), the last 3 days' return under +3%, the last 7 days' under +10%, the 7-day range (high - low, 168 candles
+//!   to it) under 30% of the 30-day range (720 candles): a breakout of a quiet week; and at least `BRK_MIN_CNT` (1) other
+//!   long signal on the scanned coins in the 72 hours before (the breakouts in a batch; a lone one is ~0 R).
+//! - SHORT: the mirror, the close under the lowest low of the 168 before, the 3 days' return over -5%, the range under
+//!   30%, the coin's 24h notional (from the candles) at least `BRKS_SIGNAL_VOL_USD` ($0.5M; the research's Binance floor
+//!   $3.2M ~ that on HL), and at least `BRKS_MIN_CNT` (3) other short signals in the 72 hours before.
+//!
+//! A coin's crossings less than 24 candles apart: the later one skipped (as the research). In at market at once; a resting
+//! stop 3% and a resting take 9% from the fill; out at market 48 h on. The size: the family's risk (`FAMILY_RISK_PCT`)
+//! lost at the stop; at most `BRK_MAX_OPEN` / `BRKS_MAX_OPEN` (3) each, the family's cap and the coin limits.
+//! Traded only on a coin with `BRK_MIN_VOL_USD` ($0.5M) a day or more.
+//!
+//! The research: Binance 2020-26 (179 HL-listed coins, 3/9/48 h): long n 236 +0.53 R t 5.4 (2020-22 ~0, few signals),
+//! short n 519 +0.49 R t 6.8, every year 2022-26 up; HL prices 2025-06 .. 2026-10: long 133 trades win 61% +0.76 R,
+//! short 270 win 44% +0.28 R. The portfolio with the live 5 (Binance 2021-26, same drawdown 52%): x218 -> x2727, the
+//! drawdown and the worst day the same, no live trade displaced (the 40% cap never bound), the daily P&L corr ~0; the
+//! short gains in the crash months (BTC < -15%: +0.87 R) where the trend / squeeze longs lose. Win ~50%: the profit
+//! comes in batches (a few months make most of it).
+//!
+//! The candles: loaded once (900 a coin, paced), then the last few each hour; the requests spaced (`BRK_REQ_GAP_S`) so the
+//! scan stays well inside the IP's weight budget. The states: the store's docs `breakout` and `breakout_short`.
+
+use std::collections::HashMap;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::api::{now, num};
+use crate::config::Config;
+use crate::live::Venue;
+use crate::log;
+use crate::store::Store;
+use crate::trades::{self, Trade};
+
+const H: f64 = 3600.0;
+/// The candles kept a coin (720 for the 30-day range + the 72 h of signals + spare).
+const KEEP: usize = 900;
+/// The first candle a signal may be on (the research: 745).
+const MIN_I: usize = 745;
+const W7: usize = 168;
+const W30: usize = 720;
+const W3: usize = 72;
+/// A coin's crossings closer than this (candles): the later skipped.
+const COOLDOWN: usize = 24;
+/// The window of the other signals counted (hours).
+const CNT_H: f64 = 72.0;
+/// The step this long after a 1h candle's close.
+const AFTER_CLOSE_S: f64 = 20.0;
+const CHECK_EVERY_S: f64 = 120.0;
+
+/// A closed 1h candle: (open time s, open, high, low, close, notional $).
+pub(crate) type Bar = (f64, f64, f64, f64, f64, f64);
+
+#[derive(Clone, Debug)]
+struct Side {
+    kind: &'static str,
+    dir: f64,
+    min_cnt: usize,
+    max_open: usize,
+    stop: f64,
+    take: f64,
+    hold_s: f64,
+    share: f64,
+    risk_usd: f64,
+    trial: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct Params {
+    min_vol: f64,
+    short_signal_vol: f64,
+    gap_s: f64,
+    sides: Vec<Side>,
+}
+
+impl Params {
+    fn from_env() -> Self {
+        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let mut sides = Vec::new();
+        if let Some(trial) = trades::switch("BRK_ENABLED") {
+            sides.push(Side { kind: "breakout", dir: 1.0, min_cnt: v("BRK_MIN_CNT", 1.0) as usize, max_open: v("BRK_MAX_OPEN", 3.0) as usize,
+                stop: 0.03, take: 0.09, hold_s: 48.0 * H, share: v("BRK_RISK_SHARE", 1.0), risk_usd: 20.0, trial });
+        }
+        if let Some(trial) = trades::switch("BRKS_ENABLED") {
+            sides.push(Side { kind: "breakout_short", dir: -1.0, min_cnt: v("BRKS_MIN_CNT", 3.0) as usize, max_open: v("BRKS_MAX_OPEN", 3.0) as usize,
+                stop: 0.03, take: 0.09, hold_s: 48.0 * H, share: v("BRKS_RISK_SHARE", 1.0), risk_usd: 20.0, trial });
+        }
+        Params { min_vol: v("BRK_MIN_VOL_USD", 0.5e6), short_signal_vol: v("BRKS_SIGNAL_VOL_USD", 0.5e6), gap_s: v("BRK_REQ_GAP_S", 2.5), sides }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Pos {
+    tr: Trade,
+    risk: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct State {
+    #[serde(default)]
+    open: Vec<Pos>,
+    #[serde(default)]
+    opened: u32,
+}
+
+fn max_of(x: impl Iterator<Item = f64>) -> f64 {
+    x.fold(f64::NEG_INFINITY, f64::max)
+}
+
+fn min_of(x: impl Iterator<Item = f64>) -> f64 {
+    x.fold(f64::INFINITY, f64::min)
+}
+
+/// The candles with the missing hours filled (o = h = l = c = the close before, no notional), as the research's reindex.
+pub(crate) fn contiguous(b: &[Bar]) -> Vec<Bar> {
+    let mut out: Vec<Bar> = Vec::with_capacity(b.len());
+    for x in b {
+        if let Some(p) = out.last().copied() {
+            if x.0 <= p.0 {
+                continue;
+            }
+            let mut t = p.0 + H;
+            while t < x.0 - 1.0 {
+                out.push((t, p.4, p.4, p.4, p.4, 0.0));
+                t += H;
+            }
+        }
+        out.push(*x);
+    }
+    out
+}
+
+/// The signals of side `dir` on contiguous candles `b` from candle `from` on (the cooldown run from `from - COOLDOWN*4`):
+/// the candles' indexes. `vol_min`: the short's 24h notional floor.
+pub(crate) fn signals(b: &[Bar], dir: f64, from: usize, vol_min: f64) -> Vec<usize> {
+    let n = b.len();
+    let mut out = Vec::new();
+    if n < MIN_I + 2 {
+        return out;
+    }
+    let hi = |i: usize| b[i].2;
+    let lo = |i: usize| b[i].3;
+    let c = |i: usize| b[i].4;
+    // the extreme of the 168 candles before i
+    let prior = |i: usize| if dir > 0.0 { max_of((i - W7..i).map(hi)) } else { min_of((i - W7..i).map(lo)) };
+    let start = from.saturating_sub(COOLDOWN * 4).max(MIN_I);
+    let mut last: Option<usize> = None;
+    for i in start..n {
+        let p = prior(i);
+        let crossed = if dir > 0.0 { c(i) > p && c(i - 1) <= prior(i - 1) } else { c(i) < p && c(i - 1) >= prior(i - 1) };
+        if !crossed {
+            continue;
+        }
+        if last.is_some_and(|l| i - l < COOLDOWN) {
+            continue;
+        }
+        last = Some(i);
+        let h7 = max_of((i + 1 - W7..=i).map(hi));
+        let l7 = min_of((i + 1 - W7..=i).map(lo));
+        let h30 = max_of((i + 1 - W30..=i).map(hi));
+        let l30 = min_of((i + 1 - W30..=i).map(lo));
+        if h30 - l30 <= 0.0 {
+            continue;
+        }
+        let cp = (h7 - l7) / (h30 - l30);
+        let r3 = c(i) / c(i - W3) - 1.0;
+        let r7 = c(i) / c(i - W7) - 1.0;
+        let ok = if dir > 0.0 {
+            r3 < 0.03 && r7 < 0.10 && cp < 0.30
+        } else {
+            let v24: f64 = (i + 1 - 24..=i).map(|k| b[k].5).sum();
+            r3 > -0.05 && cp < 0.30 && v24 >= vol_min
+        };
+        if ok && i >= from {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// The other signals in the `CNT_H` hours before the candle opened at `t` (their candles' open times), any coin.
+fn count_before(sig_times: &[(String, f64)], coin: &str, t: f64) -> usize {
+    sig_times.iter().filter(|(c, s)| (c != coin || *s != t) && *s < t && *s >= t - CNT_H * H).count()
+}
+
+fn usd(x: f64) -> String {
+    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
+}
+
+fn message(ev: &Value) -> Option<String> {
+    let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
+    let coin = ev["coin"].as_str().unwrap_or("?");
+    let short = ev["kind"] == "breakout_short";
+    let nm = if short { "ШОРТ ПРОБОЯ НЕДЕЛЬНОГО ЛОЯ" } else { "ЛОНГ ПРОБОЯ НЕДЕЛЬНОГО ХАЯ" };
+    Some(match ev["what"].as_str()? {
+        "open" => format!("📈 {nm} {coin}: цена {}, на ${:.0}, других пробоев за 72ч: {:.0}; стоп {}, тейк {}, выход через {:.0} ч",
+            f("px"), f("notional"), f("cnt"), f("stop_px"), f("take_px"), f("hold_h")),
+        "close" => format!("{} {} {coin}: {} -> {} ({:+.2}%, {}, {:.1} ч)", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" },
+            f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd")), f("held_h")),
+        "error" => format!("⚠️ пробой {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
+        _ => return None,
+    })
+}
+
+struct Breakout {
+    venue: Venue,
+    unified: bool,
+    cfg: Config,
+    store: Store,
+    p: Params,
+    states: HashMap<&'static str, State>,
+    bars: HashMap<String, Vec<Bar>>,
+    /// The last candle stepped (its open time s).
+    stepped: f64,
+}
+
+impl Breakout {
+    fn event(&self, kind: &str, mut ev: Value) {
+        ev["kind"] = json!(kind);
+        ev["at"] = json!(now());
+        log!("{kind}: {ev}");
+        if let Some(m) = message(&ev) {
+            crate::notify::send(m);
+        }
+        self.store.event(ev);
+    }
+
+    fn save(&self, kind: &'static str) {
+        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(self.states.get(kind).cloned().unwrap_or_default()).unwrap_or_default());
+        tokio::spawn(async move {
+            if let Err(e) = crate::store::save_doc(&cfg, kind, &v).await {
+                log!("breakout: {kind} state not saved: {e:#}");
+            }
+        });
+    }
+
+    /// A coin's closed 1h candles from `start` (s).
+    async fn fetch(&self, coin: &str, start: f64) -> Option<Vec<Bar>> {
+        let t = now();
+        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1h",
+            "startTime": (start * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
+        match r {
+            Ok(v) => Some(v.as_array()?.iter()
+                .map(|c| (num(&c["t"]) / 1000.0, num(&c["o"]), num(&c["h"]), num(&c["l"]), num(&c["c"]), num(&c["v"]) * num(&c["c"])))
+                .filter(|x| x.0 + H <= t && x.4 > 0.0).collect()),
+            Err(e) => {
+                log!("breakout: {coin} candles not read: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// The main-dex coins (not delisted, tradable here) and their day volume.
+    async fn universe(&self) -> Option<Vec<(String, f64)>> {
+        let ctx = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await.ok()?;
+        let u = ctx[0]["universe"].as_array()?.clone();
+        let c = ctx[1].as_array()?.clone();
+        Some(u.iter().zip(c.iter()).filter_map(|(u, c)| {
+            let name = u["name"].as_str()?;
+            (u["isDelisted"] != true && self.venue.coins.contains_key(name)).then(|| (name.to_string(), num(&c["dayNtlVlm"])))
+        }).collect())
+    }
+
+    /// The candles brought up to the last closed one: a coin new to the cache loads `KEEP`, the others the last few.
+    async fn refresh(&mut self, coins: &[(String, f64)]) {
+        for (coin, _) in coins {
+            let have = self.bars.get(coin).and_then(|b| b.last().map(|x| x.0));
+            let start = match have {
+                Some(t) => t - 2.0 * H,
+                None => now() - (KEEP as f64 + 2.0) * H,
+            };
+            if let Some(new) = self.fetch(coin, start).await {
+                let b = self.bars.entry(coin.clone()).or_default();
+                for x in new {
+                    if let Some(k) = b.iter().rposition(|y| (y.0 - x.0).abs() < 1.0) {
+                        b[k] = x;
+                    } else if b.last().is_none_or(|y| y.0 < x.0) {
+                        b.push(x);
+                    }
+                }
+                if b.len() > KEEP + 50 {
+                    b.drain(..b.len() - KEEP);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs_f64(self.p.gap_s)).await;
+        }
+    }
+
+    async fn exit(&mut self, kind: &'static str, pos: &Pos, why: &str) -> bool {
+        match trades::close(&self.venue, &pos.tr).await {
+            Ok(px) => {
+                let ret = pos.tr.ret(px);
+                self.event(kind, json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                    "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_h": (now() - pos.tr.at) / H}));
+                trades::unregister(&pos.tr.coin, kind);
+                true
+            }
+            Err(e) => {
+                self.event(kind, json!({"what": "error", "coin": pos.tr.coin, "error": format!("exit: {e:#}")}));
+                false
+            }
+        }
+    }
+
+    /// After a 1h candle's close (its open `bar`): the candles brought up, the signals of the last 72 h counted, the new
+    /// ones traded.
+    async fn step(&mut self, bar: f64) {
+        let Some(coins) = self.universe().await else {
+            log!("breakout: contexts not read: no step");
+            return;
+        };
+        self.refresh(&coins).await;
+        let vol: HashMap<&str, f64> = coins.iter().map(|(c, v)| (c.as_str(), *v)).collect();
+        let sides = self.p.sides.clone();
+        for side in &sides {
+            let mut times: Vec<(String, f64)> = Vec::new();
+            let mut fresh: Vec<(String, f64)> = Vec::new();
+            let mut ready = 0usize;
+            for (coin, raw) in &self.bars {
+                let b = contiguous(raw);
+                if b.len() < MIN_I + 2 {
+                    continue;
+                }
+                ready += 1;
+                let from = b.len().saturating_sub(CNT_H as usize + 3);
+                for i in signals(&b, side.dir, from, self.p.short_signal_vol) {
+                    times.push((coin.clone(), b[i].0));
+                    if (b[i].0 - bar).abs() < 1.0 && i == b.len() - 1 {
+                        fresh.push((coin.clone(), b[i].4));
+                    }
+                }
+            }
+            log!("{}: candle {}: {} coins ready of {}, signals in 72 h {}, new {}", side.kind, bar, ready, coins.len(), times.len(), fresh.len());
+            for (coin, close) in fresh {
+                let cnt = count_before(&times, &coin, bar);
+                let v = vol.get(coin.as_str()).copied().unwrap_or(0.0);
+                if cnt < side.min_cnt {
+                    self.store.event(json!({"kind": side.kind, "what": "lone", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    continue;
+                }
+                if v < self.p.min_vol {
+                    self.store.event(json!({"kind": side.kind, "what": "thin", "coin": coin, "px": close, "cnt": cnt, "vol": v, "at": now()}));
+                    continue;
+                }
+                let st = self.states.entry(side.kind).or_default();
+                let risk = trades::risk_usd(side.risk_usd) * side.share;
+                if st.open.len() >= side.max_open || st.open.iter().any(|x| x.tr.coin == coin) || !trades::can_open(&coin, side.kind, side.dir, risk) {
+                    self.store.event(json!({"kind": side.kind, "what": "full", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    continue;
+                }
+                if !trades::trial_open(side.trial, st.opened) {
+                    self.store.event(json!({"kind": side.kind, "what": "signal", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    continue;
+                }
+                let size = trades::size_for(risk, side.stop, close) * side.dir;
+                match trades::open_market_at(&self.venue, &coin, size, side.stop, Some(side.take), side.hold_s, close).await {
+                    Ok(tr) => {
+                        self.event(side.kind, json!({"what": "open", "coin": coin, "px": tr.entry_px, "close": close, "size": tr.size, "notional": (tr.size * tr.entry_px).abs(),
+                            "cnt": cnt, "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": side.hold_s / H, "vol": v}));
+                        let r = tr.risk();
+                        trades::register(&coin, side.kind, r, tr.size);
+                        let st = self.states.entry(side.kind).or_default();
+                        st.open.push(Pos { tr, risk: r });
+                        st.opened += 1;
+                        self.save(side.kind);
+                    }
+                    Err(e) => self.event(side.kind, json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
+                }
+            }
+        }
+        self.stepped = bar;
+    }
+
+    /// Between the steps: the time exits, and a trade whose stop or take filled ends.
+    async fn check(&mut self) {
+        if self.states.values().all(|s| s.open.is_empty()) {
+            return;
+        }
+        let held = match crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+            Ok((eq, p)) => {
+                trades::set_equity(eq);
+                p
+            }
+            Err(e) => {
+                log!("breakout: account not read: {e:#}");
+                return;
+            }
+        };
+        let kinds: Vec<&'static str> = self.states.keys().copied().collect();
+        for kind in kinds {
+            let mut keep = Vec::new();
+            let mut changed = false;
+            for pos in std::mem::take(&mut self.states.get_mut(kind).unwrap().open) {
+                match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), kind).await {
+                    Some((why, px)) => {
+                        let ret = pos.tr.ret(px);
+                        self.event(kind, json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                            "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_h": (now() - pos.tr.at) / H}));
+                        trades::unregister(&pos.tr.coin, kind);
+                        changed = true;
+                    }
+                    None if now() >= pos.tr.exit_at => {
+                        if self.exit(kind, &pos, "time").await {
+                            changed = true;
+                        } else {
+                            keep.push(pos);
+                        }
+                    }
+                    None => keep.push(pos),
+                }
+            }
+            self.states.get_mut(kind).unwrap().open = keep;
+            if changed {
+                self.save(kind);
+            }
+        }
+    }
+}
+
+/// Starts the breakout long (`BRK_ENABLED`) and short (`BRKS_ENABLED`): both on unless "0".
+pub async fn start(cfg: &Config, store: Store) -> Result<()> {
+    let p = Params::from_env();
+    if p.sides.is_empty() {
+        log!("breakout: off (BRK_ENABLED=0, BRKS_ENABLED=0)");
+        return Ok(());
+    }
+    let Some((venue, unified)) = crate::live::venue_from_env(None).await? else {
+        log!("breakout: LIVE_KEY / LIVE_ACCOUNT not set, off");
+        return Ok(());
+    };
+    let mut states = HashMap::new();
+    for s in &p.sides {
+        let st: State = crate::store::load_doc(cfg, s.kind).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        for pos in &st.open {
+            trades::register(&pos.tr.coin, s.kind, pos.risk, pos.tr.size);
+        }
+        states.insert(s.kind, st);
+    }
+    let risk = if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct()) } else { "$20".to_string() };
+    for s in &p.sides {
+        let short = s.dir < 0.0;
+        log!("{}: account {}: 1h close {} the 7-day {} after a quiet week, >= {} other signals in 72 h; stop {:.0}% take {:.0}% {:.0} h; risk {risk}, at most {}; {} held",
+            s.kind, venue.account, if short { "under" } else { "over" }, if short { "low" } else { "high" }, s.min_cnt, s.stop * 100.0, s.take * 100.0, s.hold_s / H,
+            s.max_open, states[s.kind].open.len());
+        crate::notify::send(format!("📈 {} НА ДЕНЬГИ: часовое закрытие {} 7-дневного {} после спокойной недели (диапазон недели < 30% месячного), не меньше {} других таких пробоев за 72 ч; стоп {:.0}%, тейк {:.0}%, выход через {:.0} ч; риск {risk} на сделку, до {} позиций, оборот монеты от ${:.1}M{}",
+            if short { "ШОРТ ПРОБОЯ ВНИЗ" } else { "ЛОНГ ПРОБОЯ ВВЕРХ" }, if short { "ниже" } else { "выше" }, if short { "лоя" } else { "хая" }, s.min_cnt,
+            s.stop * 100.0, s.take * 100.0, s.hold_s / H, s.max_open, p.min_vol / 1e6, trades::trial_label(s.trial, states[s.kind].opened)));
+    }
+    let mut l = Breakout { venue, unified, cfg: cfg.clone(), store, p, states, bars: HashMap::new(), stepped: 0.0 };
+    tokio::spawn(async move {
+        let mut check_at = 0.0;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            let t = now();
+            let bar = ((t - AFTER_CLOSE_S) / H).floor() * H - H;
+            if bar > l.stepped {
+                l.step(bar).await;
+            }
+            if now() - check_at >= CHECK_EVERY_S {
+                l.check().await;
+                check_at = now();
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `n` candles an hour apart around `px` swinging by `amp` (a fraction) every candle, from t = 0.
+    fn flat(n: usize, px: f64, amp: f64) -> Vec<Bar> {
+        (0..n).map(|i| {
+            let c = px * (1.0 + if i % 2 == 0 { amp } else { -amp } * 0.5);
+            (i as f64 * H, c, c * (1.0 + amp), c * (1.0 - amp), c, 1e6)
+        }).collect()
+    }
+
+    #[test]
+    fn a_long_after_a_quiet_week_only() {
+        // a wide month (swings of 20%) then a quiet week (1%) then a close over the week's high
+        let mut b = flat(600, 100.0, 0.10);
+        b.extend(flat(300, 100.0, 0.005).into_iter().map(|x| (x.0 + 600.0 * H, x.1, x.2, x.3, x.4, x.5)));
+        assert!(signals(&b, 1.0, 0, 0.0).is_empty(), "no break yet");
+        let t = b.len() as f64 * H;
+        b.push((t, 100.0, 102.0, 100.0, 101.5, 1e6));
+        let s = signals(&b, 1.0, 0, 0.0);
+        assert_eq!(s, vec![b.len() - 1]);
+        assert!(signals(&b, -1.0, 0, 0.0).is_empty());
+        // the next candle still over: not a new crossing
+        b.push((t + H, 101.5, 102.5, 101.0, 102.0, 1e6));
+        assert_eq!(signals(&b, 1.0, 0, 0.0), vec![b.len() - 2]);
+    }
+
+    #[test]
+    fn a_loud_week_or_a_run_up_gives_none() {
+        // the whole span wide: the week's range ~ the month's -> no signal
+        let mut b = flat(900, 100.0, 0.05);
+        let t = b.len() as f64 * H;
+        b.push((t, 100.0, 120.0, 100.0, 119.0, 1e6));
+        assert!(signals(&b, 1.0, 0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_short_needs_its_volume() {
+        let mut b = flat(600, 100.0, 0.10);
+        b.extend(flat(300, 100.0, 0.005).into_iter().map(|x| (x.0 + 600.0 * H, x.1, x.2, x.3, x.4, x.5)));
+        let t = b.len() as f64 * H;
+        b.push((t, 100.0, 100.0, 97.5, 98.0, 1e6));
+        assert_eq!(signals(&b, -1.0, 0, 0.5e6), vec![b.len() - 1]);
+        assert!(signals(&b, -1.0, 0, 1e9).is_empty(), "under the volume floor");
+    }
+
+    #[test]
+    fn the_gaps_filled_and_the_count_of_the_others() {
+        let b = vec![(0.0, 1.0, 1.0, 1.0, 1.0, 1.0), (3.0 * H, 2.0, 2.0, 2.0, 2.0, 1.0)];
+        let c = contiguous(&b);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c[1], (H, 1.0, 1.0, 1.0, 1.0, 0.0));
+        let t = 100.0 * H;
+        let s = vec![("A".to_string(), t), ("B".to_string(), t), ("C".to_string(), t - H), ("D".to_string(), t - 72.0 * H), ("E".to_string(), t - 73.0 * H)];
+        // A's own and B's at the same hour not counted; C and D in the 72 h, E out
+        assert_eq!(count_before(&s, "A", t), 2);
+    }
+}
+
+#[cfg(test)]
+mod parity {
+    use super::*;
+
+    /// The research's parity check (run by hand): `BRK_PARITY_DIR` holds `<coin>.json` files of [[t, o, h, l, c, notional], ...]
+    /// 1h candles; prints each coin's long / short signals (the candle's open time) for comparing with the Python rule.
+    #[test]
+    #[ignore]
+    fn print_signals_of_files() {
+        let Ok(dir) = std::env::var("BRK_PARITY_DIR") else { return };
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        names.sort();
+        let mut out = String::new();
+        for p in names {
+            let v: Vec<Vec<f64>> = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            let b: Vec<Bar> = contiguous(&v.iter().map(|x| (x[0], x[1], x[2], x[3], x[4], x[5])).collect::<Vec<_>>());
+            let coin = p.file_stem().unwrap().to_string_lossy().to_string();
+            for (d, nm) in [(1.0, "L"), (-1.0, "S")] {
+                for i in signals(&b, d, 0, 10f64.powf(6.5) - 1.0) {
+                    out += &format!("{coin},{nm},{}\n", b[i].0 as i64);
+                }
+            }
+        }
+        std::fs::write(format!("{dir}/rust_signals.csv"), out).unwrap();
+    }
+}

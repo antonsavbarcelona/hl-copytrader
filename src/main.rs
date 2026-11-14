@@ -9,6 +9,7 @@
 mod account;
 mod alloc;
 mod api;
+mod breakout;
 mod clusters;
 mod config;
 mod dip;
@@ -96,7 +97,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             },
             Err(e) => log!("walls: not recording: {e:#}"),
         }
-        squeeze::start(&cfg, store).await?;
+        squeeze::start(&cfg, store.clone()).await?;
+        breakout::start(&cfg, store).await?;
         tokio::spawn(ws::run_books(names, books));
         shutdown_signal().await;
         log!("stopped");
@@ -118,6 +120,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     trend::start(&cfg, store.clone()).await?;
     expiry::start(&cfg, store.clone()).await?;
     squeeze::start(&cfg, store.clone()).await?;
+    breakout::start(&cfg, store.clone()).await?;
     let store_liq = store.clone();
     let mut engine = engine::Engine::new(cfg.clone(), api.clone(), books.clone(), coins, tx.clone(), traders, store)?;
     engine.set_picks(picks);

@@ -35,6 +35,8 @@ use crate::dip::{Closes, cooled};
 use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
+use crate::trades::Trade;
+use crate::venue::Venue;
 
 const DOC: &str = "hip3";
 const POLL_S: f64 = 10.0;
@@ -124,6 +126,66 @@ fn message(ev: &Value) -> Option<String> {
     })
 }
 
+/// An event of the HIP-3 family (the dip's paper, the weekend dips): logged, told, stored.
+fn event(store: &Store, mut ev: Value) {
+    ev["kind"] = json!("hip3");
+    ev["at"] = json!(now());
+    log!("hip3: {ev}");
+    if let Some(m) = message(&ev) {
+        crate::notify::send(m);
+    }
+    store.event(ev);
+}
+
+/// The weekend dips' trades: one due (`exit_at`) out at market; with `check` the positions read (each dex once) and a
+/// trade whose position is gone (its stop or take filled, a hand close) ends. -> whether any ended.
+async fn sweep_wkd(v: &Venue, store: &Store, live: &mut Vec<Trade>, t: f64, check: bool) -> bool {
+    let mut changed = false;
+    let mut held: HashMap<String, f64> = HashMap::new();
+    let mut read: std::collections::HashSet<String> = Default::default();
+    if check {
+        let ds: std::collections::HashSet<String> = live.iter().filter_map(|x| x.coin.split_once(':').map(|d| d.0.to_string())).collect();
+        for d in ds {
+            match v.dex_positions(&d).await {
+                Ok(x) => {
+                    held.extend(x);
+                    read.insert(d);
+                }
+                Err(e) => log!("hip3: weekend {d} positions not read: {e:#}"),
+            }
+        }
+    }
+    let mut keep = Vec::new();
+    for tr in std::mem::take(live) {
+        let dex_ok = tr.coin.split_once(':').is_some_and(|d| read.contains(d.0));
+        let out = if t >= tr.exit_at {
+            match crate::trades::close(v, &tr).await {
+                Ok(px) => Some(("time", px)),
+                Err(e) => {
+                    event(store, json!({"what": "wkd_error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
+                    None
+                }
+            }
+        } else if check && dex_ok {
+            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0), "wkd").await
+        } else {
+            None
+        };
+        match out {
+            Some((why, px)) => {
+                let ret = tr.ret(px);
+                event(store, json!({"what": "wkd_exit", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                    "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_h": (t - tr.at) / 3600.0}));
+                crate::trades::unregister(&tr.coin, "wkd");
+                changed = true;
+            }
+            None => keep.push(tr),
+        }
+    }
+    *live = keep;
+    changed
+}
+
 /// Starts the HIP-3 dip's signals unless `HIP3_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::trades::switch("HIP3_ENABLED").is_none() {
@@ -169,15 +231,6 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let mut checked = false;
         let started = now();
         let mut wkd_pos_at = 0.0;
-        let event = |store: &Store, mut ev: Value| {
-            ev["kind"] = json!("hip3");
-            ev["at"] = json!(now());
-            log!("hip3: {ev}");
-            if let Some(m) = message(&ev) {
-                crate::notify::send(m);
-            }
-            store.event(ev);
-        };
         let save = |cfg: &Config, state: &State| {
             let (cfg, v) = (cfg.clone(), serde_json::to_value(state).unwrap_or_default());
             tokio::spawn(async move {
@@ -274,49 +327,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                 // Out on time; a position gone (its stop or take filled) ends its trade.
                 if !state.wkd.live.is_empty() {
                     let check = t - wkd_pos_at >= 30.0;
-                    let mut held: HashMap<String, f64> = HashMap::new();
-                    let mut read: std::collections::HashSet<String> = Default::default();
                     if check {
                         wkd_pos_at = t;
-                        let ds: std::collections::HashSet<String> = state.wkd.live.iter().filter_map(|x| x.coin.split_once(':').map(|d| d.0.to_string())).collect();
-                        for d in ds {
-                            match v.dex_positions(&d).await {
-                                Ok(x) => {
-                                    held.extend(x);
-                                    read.insert(d);
-                                }
-                                Err(e) => log!("hip3: weekend {d} positions not read: {e:#}"),
-                            }
-                        }
                     }
-                    let mut keep = Vec::new();
-                    for tr in std::mem::take(&mut state.wkd.live) {
-                        let dex_ok = tr.coin.split_once(':').is_some_and(|d| read.contains(d.0));
-                        let out = if t >= tr.exit_at {
-                            match crate::trades::close(v, &tr).await {
-                                Ok(px) => Some(("time", px)),
-                                Err(e) => {
-                                    event(&store, json!({"what": "wkd_error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
-                                    None
-                                }
-                            }
-                        } else if check && dex_ok {
-                            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0), "wkd").await
-                        } else {
-                            None
-                        };
-                        match out {
-                            Some((why, px)) => {
-                                let ret = tr.ret(px);
-                                event(&store, json!({"what": "wkd_exit", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                                    "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_h": (t - tr.at) / 3600.0}));
-                                crate::trades::unregister(&tr.coin, "wkd");
-                                wchanged = true;
-                            }
-                            None => keep.push(tr),
-                        }
-                    }
-                    state.wkd.live = keep;
+                    wchanged |= sweep_wkd(v, &store, &mut state.wkd.live, t, check).await;
                 }
             }
             if wchanged {
@@ -405,5 +419,63 @@ mod tests {
         assert!(if crate::notify::PAPER_TO_CHAT { m.is_some_and(|m| m.contains("xyz:A") && m.contains("+2.22%")) } else { m.is_none() });
         // a live trade's close is still told
         assert!(message(&json!({"what": "close", "coin": "xyz:A", "why": "time", "entry_px": 90.0, "px": 92.0, "ret_pct": 2.22, "pnl_usd": 2.5})).is_some());
+    }
+}
+
+#[cfg(test)]
+mod wkd_lifecycle {
+    use super::*;
+    use crate::testkit::FakeHl;
+
+    async fn held(f: &FakeHl, coin: &str) -> Trade {
+        let tr = crate::trades::open_market(&f.venue(), coin, 2.0, 0.05, Some(0.03), 6.0 * 3600.0).await.unwrap();
+        crate::trades::register(coin, "wkd", tr.risk(), tr.size);
+        tr
+    }
+
+    #[tokio::test]
+    async fn a_stop_or_a_take_filled_ends_the_weekend_trade_when_the_positions_are_read() {
+        let f = FakeHl::start(&[("xyz:WKA", 2, 10, 100.0), ("xyz:WKB", 2, 10, 50.0)]).await;
+        let (store, mut rx) = Store::for_test();
+        let mut live = vec![held(&f, "xyz:WKA").await, held(&f, "xyz:WKB").await];
+        f.set_mid("xyz:WKA", 94.0);                       // under the stop
+        f.set_mid("xyz:WKB", 52.0);                       // over the take
+        // not a check: nothing read, nothing ended (the time not due)
+        assert!(!sweep_wkd(&f.venue(), &store, &mut live, now(), false).await);
+        assert_eq!(live.len(), 2);
+        assert!(crate::store::drain(&mut rx).is_empty());
+        assert!(sweep_wkd(&f.venue(), &store, &mut live, now(), true).await);
+        assert!(live.is_empty());
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(ev.len(), 2, "{ev:?}");
+        let by = |c: &str| ev.iter().find(|e| e["coin"] == c).unwrap().clone();
+        let (a, b) = (by("xyz:WKA"), by("xyz:WKB"));
+        assert_eq!((a["kind"].as_str(), a["what"].as_str(), a["why"].as_str()), (Some("hip3"), Some("wkd_exit"), Some("stop")));
+        assert_eq!((b["what"].as_str(), b["why"].as_str()), (Some("wkd_exit"), Some("take")));
+        assert!(a["ret_pct"].as_f64().unwrap() < -4.9 && a["held_h"].as_f64().is_some() && b["pnl_usd"].as_f64().unwrap() > 0.0);
+        assert!(!crate::trades::registered("xyz:WKA") && !crate::trades::registered("xyz:WKB"));
+    }
+
+    #[tokio::test]
+    async fn its_time_up_it_goes_out_at_market_without_a_check_and_a_failed_close_is_kept() {
+        let f = FakeHl::start(&[("xyz:WKC", 2, 10, 100.0), ("xyz:WKD", 2, 10, 100.0)]).await;
+        let (store, mut rx) = Store::for_test();
+        let mut c = held(&f, "xyz:WKC").await;
+        c.exit_at = now() - 1.0;
+        let mut live = vec![c, held(&f, "xyz:WKD").await];
+        f.set_mid("xyz:WKC", 101.0);
+        assert!(sweep_wkd(&f.venue(), &store, &mut live, now(), false).await);
+        assert_eq!(live.len(), 1);
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!((ev.len(), ev[0]["why"].as_str(), ev[0]["coin"].as_str()), (1, Some("time"), Some("xyz:WKC")), "{ev:?}");
+        assert!(f.position("xyz:WKC") == 0.0 && f.open_orders("xyz:WKC").is_empty());
+        // the close refused: told as an error, the trade kept for the next poll
+        live[0].exit_at = now() - 1.0;
+        f.with(|s| s.ioc_needs = 0.5);
+        assert!(!sweep_wkd(&f.venue(), &store, &mut live, now(), false).await);
+        assert_eq!(live.len(), 1);
+        let ev = crate::store::drain(&mut rx);
+        assert!(ev.iter().any(|e| e["what"] == "wkd_error" && e["error"].as_str().unwrap().starts_with("exit:")), "{ev:?}");
+        assert!(crate::trades::registered("xyz:WKD"));
     }
 }

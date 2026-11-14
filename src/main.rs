@@ -69,6 +69,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let books: ws::Books = Default::default();
     spawn_clock_sync(api.clone());
     let store = store::open(&cfg).await?;
+    // the start in the events too: a deploy is checked by its version there
+    store.event(serde_json::json!({"kind": "bot", "what": "start", "version": commit_full(), "at": api::now()}));
     clusters::start(&cfg, api.clone()).await?;
     dip::start(&cfg, store.clone(), api.clone(), books.clone()).await?;
     hip3::start(&cfg, store.clone(), api.clone()).await?;
@@ -89,6 +91,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     shutdown_signal().await;
     log!("stopped");
     Ok(())
+}
+
+/// The deploy's commit (Railway sets it), "" elsewhere.
+fn commit_full() -> String {
+    std::env::var("RAILWAY_GIT_COMMIT_SHA").unwrap_or_default()
 }
 
 /// Our clock against the exchange's, now and every 10 min (lags are measured on its clock).

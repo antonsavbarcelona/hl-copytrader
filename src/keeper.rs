@@ -2,7 +2,7 @@
 //! its state saved, the account read, and its open trades swept: a resting stop or take filled (or the position
 //! closed by hand) ends a trade, one due out (`exit_at`) is closed at market; each end told and taken off the family.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -30,8 +30,13 @@ pub(crate) struct Keeper {
     pub(crate) unified: bool,
     pub(crate) cfg: Config,
     pub(crate) store: Store,
-    /// The strategy's kind: the events', the family registry's.
+    /// The strategy's kind: the events'.
     pub(crate) kind: &'static str,
+    /// Its trades' kind in the family registry (the kind unless set, `registered_as`).
+    reg: &'static str,
+    /// The events' names for a trade ended and an exit failed (`words`).
+    close_what: &'static str,
+    error_what: &'static str,
     /// The chat's line for an event (None: not told).
     message: fn(&Value) -> Option<String>,
     held_in: HeldIn,
@@ -39,7 +44,17 @@ pub(crate) struct Keeper {
 
 impl Keeper {
     pub(crate) fn new(venue: Venue, unified: bool, cfg: Config, store: Store, kind: &'static str, message: fn(&Value) -> Option<String>, held_in: HeldIn) -> Self {
-        Keeper { venue, unified, cfg, store, kind, message, held_in }
+        Keeper { venue, unified, cfg, store, kind, reg: kind, close_what: "close", error_what: "error", message, held_in }
+    }
+
+    /// Its trades registered in the family under `reg` (the HIP-3 weekend dips: events "hip3", trades "wkd").
+    pub(crate) fn registered_as(self, reg: &'static str) -> Self {
+        Keeper { reg, ..self }
+    }
+
+    /// Its events' names for a trade ended and a failed exit ("close" / "error" unless set).
+    pub(crate) fn words(self, close_what: &'static str, error_what: &'static str) -> Self {
+        Keeper { close_what, error_what, ..self }
     }
 
     /// The event with its kind and time: logged, told when it has a message, stored.
@@ -63,24 +78,35 @@ impl Keeper {
         });
     }
 
-    /// The account's positions (coin -> signed size), the family's equity set from it; None: not read.
-    pub(crate) async fn held(&self) -> Option<HashMap<String, f64>> {
-        match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
-            Ok((eq, p)) => {
-                trades::set_equity(eq);
-                Some(p)
-            }
-            Err(e) => {
-                log!("{}: account not read: {e:#}", self.kind);
-                None
+    /// The account's positions (coin -> signed size) on the dexes of `coins` (the main dex: "", the family's equity set
+    /// from it; a HIP-3 dex: "xyz", ...), and the dexes read.
+    pub(crate) async fn held(&self, coins: impl Iterator<Item = &str>) -> (HashMap<String, f64>, HashSet<String>) {
+        let dexes: HashSet<String> = coins.map(dex_of).map(str::to_string).collect();
+        let (mut held, mut read) = (HashMap::new(), HashSet::new());
+        for d in dexes {
+            let got = if d.is_empty() {
+                crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await.map(|(eq, p)| {
+                    trades::set_equity(eq);
+                    p
+                })
+            } else {
+                self.venue.dex_positions(&d).await
+            };
+            match got {
+                Ok(p) => {
+                    held.extend(p);
+                    read.insert(d);
+                }
+                Err(e) => log!("{}: account{} not read: {e:#}", self.kind, if d.is_empty() { String::new() } else { format!(" ({d})") }),
             }
         }
+        (held, read)
     }
 
     /// A trade ended (`why`, at `px`): told, taken off the family.
     pub(crate) fn ended(&self, tr: &Trade, why: &str, px: f64) {
         let ret = tr.ret(px);
-        let mut ev = json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+        let mut ev = json!({"what": self.close_what, "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
             "pnl_usd": ret * tr.size.abs() * tr.entry_px});
         match self.held_in {
             HeldIn::Hours => ev["held_h"] = json!((now() - tr.at) / H),
@@ -88,7 +114,7 @@ impl Keeper {
             HeldIn::No => {}
         }
         self.event(ev);
-        trades::unregister(&tr.coin, self.kind);
+        trades::unregister(&tr.coin, self.reg);
     }
 
     /// The trade out at market (its stop and take cancelled): told and taken off; false: the close failed (told).
@@ -99,26 +125,28 @@ impl Keeper {
                 true
             }
             Err(e) => {
-                self.event(json!({"what": "error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
+                self.event(json!({"what": self.error_what, "coin": tr.coin, "error": format!("exit: {e:#}")}));
                 false
             }
         }
     }
 
-    /// The open trades (`tr` reads a trade of one): those whose stop or take filled end; those due (`exit_at` passed)
-    /// go out at market when `time_exit`. -> whether any ended (the caller saves its state).
-    pub(crate) async fn sweep<P>(&self, open: &mut Vec<P>, tr: impl Fn(&P) -> &Trade, time_exit: bool) -> bool {
+    /// The open trades (`tr` reads a trade of one): with `fills` the positions read and those whose stop or take filled
+    /// (or closed by hand) end; those due (`exit_at` passed) go out at market when `time_exit`. -> whether any ended (the
+    /// caller saves its state).
+    pub(crate) async fn sweep<P>(&self, open: &mut Vec<P>, tr: impl Fn(&P) -> &Trade, time_exit: bool, fills: bool) -> bool {
         if open.is_empty() {
             return false;
         }
-        let held = self.held().await;
+        let (held, read) = if fills { self.held(open.iter().map(|p| tr(p).coin.as_str())).await } else { Default::default() };
         let mut keep = Vec::new();
         let mut changed = false;
         for p in std::mem::take(open) {
             let t = tr(&p);
-            let gone = match &held {
-                Some(h) => trades::gone(&self.venue, t, h.get(&t.coin).copied().unwrap_or(0.0), self.kind).await,
-                None => None,
+            let gone = if read.contains(dex_of(&t.coin)) {
+                trades::gone(&self.venue, t, held.get(&t.coin).copied().unwrap_or(0.0), self.reg).await
+            } else {
+                None
             };
             let out = match gone {
                 Some((why, px)) => {
@@ -137,6 +165,11 @@ impl Keeper {
         *open = keep;
         changed
     }
+}
+
+/// A coin's dex: "" for the main dex, "xyz" for "xyz:TSLA".
+fn dex_of(coin: &str) -> &str {
+    coin.split_once(':').map_or("", |d| d.0)
 }
 
 #[cfg(test)]
@@ -167,11 +200,11 @@ mod tests {
         let k = Keeper::new(f.venue(), false, cfg(), store, "kp", msg, HeldIn::No);
         let tr = trades::open_market(&k.venue, "KPA", 1.0, 0.1, None, 3600.0).await.unwrap();
         let mut open = vec![Trade { exit_at: now() - 1.0, ..tr }];
-        assert!(k.sweep(&mut open, |t| t, true).await);
+        assert!(k.sweep(&mut open, |t| t, true, true).await);
         assert!(open.is_empty() && f.position("KPA") == 0.0);
         assert!(crate::store::drain(&mut rx).iter().any(|e| e["why"] == "time"));
         // nothing open: nothing read
-        assert!(!k.sweep(&mut Vec::<Trade>::new(), |t| t, true).await);
+        assert!(!k.sweep(&mut Vec::<Trade>::new(), |t| t, true, true).await);
     }
 
     #[tokio::test]
@@ -182,7 +215,7 @@ mod tests {
         let tr = trades::open_market(&k.venue, "KPB", 1.0, 0.1, None, 3600.0).await.unwrap();
         f.with(|s| s.ioc_needs = 0.5);                       // nothing within reach: the market close fails
         let mut open = vec![Trade { exit_at: now() - 1.0, ..tr }];
-        assert!(!k.sweep(&mut open, |t| t, true).await);
+        assert!(!k.sweep(&mut open, |t| t, true, true).await);
         assert_eq!(open.len(), 1);
         let ev = crate::store::drain(&mut rx);
         assert!(ev.iter().any(|e| e["what"] == "error" && e["error"].as_str().unwrap().starts_with("exit:")), "{ev:?}");

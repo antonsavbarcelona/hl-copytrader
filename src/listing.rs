@@ -179,7 +179,7 @@ impl Listing {
 
     /// The trades swept (see `Keeper::sweep`).
     async fn check(&mut self) {
-        if self.k.sweep(&mut self.state.open, |t| t, true).await {
+        if self.k.sweep(&mut self.state.open, |t| t, true, true).await {
             self.k.save(DOC, &self.state);
         }
     }

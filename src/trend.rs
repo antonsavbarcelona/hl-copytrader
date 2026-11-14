@@ -255,7 +255,7 @@ impl TrendLong {
 
     /// The trades swept (see `Keeper::sweep`).
     async fn check(&mut self) {
-        if self.k.sweep(&mut self.state.open, |p| &p.tr, false).await {
+        if self.k.sweep(&mut self.state.open, |p| &p.tr, false, true).await {
             self.k.save(DOC, &self.state);
         }
     }

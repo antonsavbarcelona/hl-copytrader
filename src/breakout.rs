@@ -354,7 +354,7 @@ impl Breakout {
         let kinds: Vec<&'static str> = self.states.keys().copied().collect();
         for kind in kinds {
             let open = &mut self.states.get_mut(kind).unwrap().open;
-            if self.keepers[kind].sweep(open, |p| &p.tr, true).await {
+            if self.keepers[kind].sweep(open, |p| &p.tr, true, true).await {
                 self.save(kind);
             }
         }

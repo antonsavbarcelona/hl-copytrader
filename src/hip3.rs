@@ -34,8 +34,8 @@ use crate::config::Config;
 use crate::dip::{Closes, cooled};
 use crate::notify::usd;
 use crate::log;
+use crate::keeper::{HeldIn, Keeper};
 use crate::store::Store;
-use crate::trades::Trade;
 use crate::venue::Venue;
 
 const DOC: &str = "hip3";
@@ -137,53 +137,9 @@ fn event(store: &Store, mut ev: Value) {
     store.event(ev);
 }
 
-/// The weekend dips' trades: one due (`exit_at`) out at market; with `check` the positions read (each dex once) and a
-/// trade whose position is gone (its stop or take filled, a hand close) ends. -> whether any ended.
-async fn sweep_wkd(v: &Venue, store: &Store, live: &mut Vec<Trade>, t: f64, check: bool) -> bool {
-    let mut changed = false;
-    let mut held: HashMap<String, f64> = HashMap::new();
-    let mut read: std::collections::HashSet<String> = Default::default();
-    if check {
-        let ds: std::collections::HashSet<String> = live.iter().filter_map(|x| x.coin.split_once(':').map(|d| d.0.to_string())).collect();
-        for d in ds {
-            match v.dex_positions(&d).await {
-                Ok(x) => {
-                    held.extend(x);
-                    read.insert(d);
-                }
-                Err(e) => log!("hip3: weekend {d} positions not read: {e:#}"),
-            }
-        }
-    }
-    let mut keep = Vec::new();
-    for tr in std::mem::take(live) {
-        let dex_ok = tr.coin.split_once(':').is_some_and(|d| read.contains(d.0));
-        let out = if t >= tr.exit_at {
-            match crate::trades::close(v, &tr).await {
-                Ok(px) => Some(("time", px)),
-                Err(e) => {
-                    event(store, json!({"what": "wkd_error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
-                    None
-                }
-            }
-        } else if check && dex_ok {
-            crate::trades::gone(v, &tr, held.get(&tr.coin).copied().unwrap_or(0.0), "wkd").await
-        } else {
-            None
-        };
-        match out {
-            Some((why, px)) => {
-                let ret = tr.ret(px);
-                event(store, json!({"what": "wkd_exit", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                    "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_h": (t - tr.at) / 3600.0}));
-                crate::trades::unregister(&tr.coin, "wkd");
-                changed = true;
-            }
-            None => keep.push(tr),
-        }
-    }
-    *live = keep;
-    changed
+/// The weekend dips' keeping: events of kind "hip3" ("wkd_exit" / "wkd_error"), trades "wkd" in the family registry.
+fn wkd_keeper(v: Venue, unified: bool, cfg: Config, store: Store) -> Keeper {
+    Keeper::new(v, unified, cfg, store, "hip3", message, HeldIn::Hours).registered_as("wkd").words("wkd_exit", "wkd_error")
 }
 
 /// Starts the HIP-3 dip's signals unless `HIP3_ENABLED` is "0" (see the module).
@@ -198,10 +154,14 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
     // The live venue with the HIP-3 perps (HIP3_LIVE on unless "0"): without it the signals only.
     let mut venue: Option<(crate::venue::Venue, HashMap<String, u32>)> = None;
+    let mut unified = false;
     if p.live {
         match crate::venue::venue_from_env(None).await {
-            Ok(Some((v, _))) => match v.with_hip3().await {
-                Ok(x) => venue = Some(x),
+            Ok(Some((v, u))) => match v.with_hip3().await {
+                Ok(x) => {
+                    unified = u;
+                    venue = Some(x);
+                }
                 Err(e) => log!("hip3: the HIP-3 perps not read, signals only: {e:#}"),
             },
             Ok(None) => log!("hip3: LIVE_KEY / LIVE_ACCOUNT not set, signals only"),
@@ -222,6 +182,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     log!("hip3: the weekend dips: {}; {wkd_mode}; {} signals so far, {} live held", wp.label(), state.wkd.signals, state.wkd.live.len());
     crate::notify::send(format!("🧪 HIP-3 {}, {wkd_mode}", wp.label()));
     let cfg = cfg.clone();
+    let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), unified, cfg.clone(), store.clone()));
     tokio::spawn(async move {
         let mut closes = Closes::default();
         let mut lows: HashMap<String, (i64, f64)> = HashMap::new();
@@ -330,7 +291,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
                     if check {
                         wkd_pos_at = t;
                     }
-                    wchanged |= sweep_wkd(v, &store, &mut state.wkd.live, t, check).await;
+                    if let Some(k) = &wkd_k {
+                        wchanged |= k.sweep(&mut state.wkd.live, |t| t, true, check).await;
+                    }
                 }
             }
             if wchanged {
@@ -425,7 +388,12 @@ mod tests {
 #[cfg(test)]
 mod wkd_lifecycle {
     use super::*;
-    use crate::testkit::FakeHl;
+    use crate::testkit::{FakeHl, cfg};
+    use crate::trades::Trade;
+
+    async fn sweep_wkd(v: &Venue, store: &Store, live: &mut Vec<Trade>, _t: f64, check: bool) -> bool {
+        wkd_keeper(v.clone(), false, cfg(), store.clone()).sweep(live, |t| t, true, check).await
+    }
 
     async fn held(f: &FakeHl, coin: &str) -> Trade {
         let tr = crate::trades::open_market(&f.venue(), coin, 2.0, 0.05, Some(0.03), 6.0 * 3600.0).await.unwrap();

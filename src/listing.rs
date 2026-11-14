@@ -20,7 +20,8 @@ use serde_json::{Value, json};
 
 use crate::api::{now, num};
 use crate::config::Config;
-use crate::venue::Venue;
+use crate::keeper::{HeldIn, Keeper};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -47,7 +48,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { delay_days: v("LIST_DELAY_DAYS", 7.0), min_vol: v("LIST_MIN_VOL_USD", 5e6), stop: v("LIST_STOP_PCT", 25.0) / 100.0,
             take: v("LIST_TAKE_PCT", 30.0) / 100.0, hold_s: v("LIST_HOLD_DAYS", 14.0) * DAY, risk_usd: v("LIST_RISK_USD", 20.0),
             max_open: v("LIST_MAX_OPEN", 3.0) as usize, trial: trades::switch("LIST_ENABLED").flatten() }
@@ -74,10 +75,6 @@ fn due(listed: f64, t: f64, delay_days: f64) -> bool {
     listed > 0.0 && t >= listed + delay_days * DAY && t < listed + (delay_days + 1.0) * DAY
 }
 
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
-}
-
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
@@ -94,38 +91,16 @@ fn message(ev: &Value) -> Option<String> {
 }
 
 struct Listing {
-    venue: Venue,
-    unified: bool,
-    cfg: Config,
-    store: Store,
+    k: Keeper,
     p: Params,
     state: State,
 }
 
 impl Listing {
-    fn event(&self, mut ev: Value) {
-        ev["kind"] = json!("listing");
-        ev["at"] = json!(now());
-        log!("listing: {ev}");
-        if let Some(m) = message(&ev) {
-            crate::notify::send(m);
-        }
-        self.store.event(ev);
-    }
-
-    fn save(&self) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                log!("listing: state not saved: {e:#}");
-            }
-        });
-    }
-
     /// A coin's listing time: its first daily candle within `NEW_WITHIN_DAYS` (0: older).
     async fn listed_at(&self, coin: &str) -> Option<f64> {
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
+        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
             "startTime": ((t - (NEW_WITHIN_DAYS + 5.0) * DAY) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
         let first = r.ok()?.as_array()?.first()?["t"].as_f64()? / 1000.0;
         Some(if first <= t - NEW_WITHIN_DAYS * DAY { 0.0 } else { first })
@@ -133,7 +108,7 @@ impl Listing {
 
     /// The new coins' listing times; the listings due shorted.
     async fn look(&mut self) {
-        let ctx = match self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
+        let ctx = match self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
             Ok(v) => v,
             Err(e) => {
                 log!("listing: contexts not read: {e:#}");
@@ -170,7 +145,7 @@ impl Listing {
             .map(|(c, at)| (c.clone(), *at)).collect();
         for (coin, at) in due_now {
             let (v, mid) = vol.get(&coin).copied().unwrap_or((0.0, 0.0));
-            if v < self.p.min_vol || mid <= 0.0 || !self.venue.coins.contains_key(&coin) {
+            if v < self.p.min_vol || mid <= 0.0 || !self.k.venue.coins.contains_key(&coin) {
                 log!("listing: {coin} due but thin (${:.1}M a day) or not tradable", v / 1e6);
                 continue;
             }
@@ -182,74 +157,33 @@ impl Listing {
             self.state.done.push(coin.clone());
             changed = true;
             if !trades::trial_open(self.p.trial, self.state.opened) {
-                self.event(json!({"what": "signal", "coin": coin, "days_listed": (t - at) / DAY, "px": mid, "volume": v}));
+                self.k.event(json!({"what": "signal", "coin": coin, "days_listed": (t - at) / DAY, "px": mid, "volume": v}));
                 continue;
             }
             let size = trades::size_for(risk, self.p.stop, mid);
-            match trades::open_market(&self.venue, &coin, -size, self.p.stop, Some(self.p.take), self.p.hold_s).await {
+            match trades::open_market(&self.k.venue, &coin, -size, self.p.stop, Some(self.p.take), self.p.hold_s).await {
                 Ok(tr) => {
-                    self.event(json!({"what": "open", "coin": coin, "days_listed": (t - at) / DAY, "px": tr.entry_px, "size": tr.size,
+                    self.k.event(json!({"what": "open", "coin": coin, "days_listed": (t - at) / DAY, "px": tr.entry_px, "size": tr.size,
                         "notional": tr.size.abs() * tr.entry_px, "take_px": tr.take_px, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "volume": v}));
                     trades::register(&coin, "listing", tr.risk(), tr.size);
                     self.state.open.push(tr);
                     self.state.opened += 1;
                 }
-                Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
+                Err(e) => self.k.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
             }
         }
         if changed {
-            self.save();
+            self.k.save(DOC, &self.state);
         }
     }
 
-    /// The trades: out on time; gone (the stop or the take filled).
+    /// The trades swept (see `Keeper::sweep`).
     async fn check(&mut self) {
-        if self.state.open.is_empty() {
-            return;
-        }
-        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
-            Ok((eq, p)) => {
-                trades::set_equity(eq);
-                Some(p)
-            }
-            Err(e) => {
-                log!("listing: account not read: {e:#}");
-                None
-            }
-        };
-        let t = now();
-        let mut keep = Vec::new();
-        let mut changed = false;
-        for tr in std::mem::take(&mut self.state.open) {
-            let out = if t >= tr.exit_at {
-                match trades::close(&self.venue, &tr).await {
-                    Ok(px) => Some(("time", px)),
-                    Err(e) => {
-                        self.event(json!({"what": "error", "coin": tr.coin, "error": format!("exit: {e:#}")}));
-                        None
-                    }
-                }
-            } else if let Some(h) = &held {
-                trades::gone(&self.venue, &tr, h.get(&tr.coin).copied().unwrap_or(0.0), "listing").await
-            } else {
-                None
-            };
-            match out {
-                Some((why, px)) => {
-                    let ret = tr.ret(px);
-                    self.event(json!({"what": "close", "coin": tr.coin, "why": why, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                        "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_days": (t - tr.at) / DAY}));
-                    trades::unregister(&tr.coin, "listing");
-                    changed = true;
-                }
-                None => keep.push(tr),
-            }
-        }
-        self.state.open = keep;
-        if changed {
-            self.save();
+        if self.k.sweep(&mut self.state.open, |t| t, true).await {
+            self.k.save(DOC, &self.state);
         }
     }
+
 }
 
 /// Starts the listing short unless `LIST_ENABLED` is "0" (see the module).
@@ -273,7 +207,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("🔻 шорт листингов НА ДЕНЬГИ: через {:.0} дн. после листинга (оборот от ${:.0}M), стоп +{:.0}%, тейк −{:.0}%, держим {:.0} дн., риск {}, до {} позиций{}",
         p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,
         trades::trial_label(p.trial, state.opened)));
-    let mut l = Listing { venue, unified, cfg: cfg.clone(), store, p, state };
+    let mut l = Listing { k: Keeper::new(venue, unified, cfg.clone(), store, "listing", message, HeldIn::Days), p, state };
     tokio::spawn(async move {
         let (mut look_at, mut check_at) = (0.0, 0.0);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -317,12 +251,12 @@ mod lifecycle {
     async fn setup(coin: &str) -> (FakeHl, Listing, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
         let (store, rx) = Store::for_test();
-        let s = Listing { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default() };
+        let s = Listing { k: Keeper::new(f.venue(), false, cfg(), store, "listing", message, HeldIn::Days), p: Params::from_env(), state: State::default() };
         (f, s, rx)
     }
 
     async fn hold(s: &mut Listing, coin: &str) {
-        let tr = trades::open_market(&s.venue, coin, -1.0, 0.04, Some(0.05), 3600.0).await.unwrap();
+        let tr = trades::open_market(&s.k.venue, coin, -1.0, 0.04, Some(0.05), 3600.0).await.unwrap();
         trades::register(coin, "listing", tr.risk(), tr.size);
         s.state.open.push(tr);
     }
@@ -339,7 +273,7 @@ mod lifecycle {
         assert_eq!((e["kind"].as_str(), e["what"].as_str(), e["why"].as_str()), (Some("listing"), Some("close"), Some("stop")));
         assert!(e["ret_pct"].as_f64().unwrap() < -3.9 && e["pnl_usd"].as_f64().unwrap() < 0.0 && e["entry_px"].as_f64() == Some(100.0));
         assert!(s.state.open.is_empty() && !trades::registered("LSA"));
-        assert_eq!(saved(&s.cfg, "listing").await.unwrap()["open"], json!([]));
+        assert_eq!(saved(&s.k.cfg, "listing").await.unwrap()["open"], json!([]));
     }
 
     #[tokio::test]

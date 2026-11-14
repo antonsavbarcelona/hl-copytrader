@@ -12,6 +12,7 @@ mod dip;
 mod exchange;
 mod expiry;
 mod hip3;
+mod keeper;
 mod listing;
 mod venue;
 mod notify;

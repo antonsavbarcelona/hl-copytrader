@@ -22,7 +22,8 @@ use serde_json::{Value, json};
 
 use crate::api::{now, num};
 use crate::config::Config;
-use crate::venue::Venue;
+use crate::keeper::{HeldIn, Keeper};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -53,7 +54,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { days: v("TREND_DAYS", 20.0) as usize, atr_k: v("TREND_ATR_K", 3.0), max_days: v("TREND_MAX_DAYS", 90.0),
             btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
             max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch("TREND_ENABLED").flatten() }
@@ -121,10 +122,6 @@ fn chandelier_out(d: &[Day], day: f64, k: f64) -> Option<f64> {
     None
 }
 
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
-}
-
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
@@ -142,38 +139,16 @@ fn message(ev: &Value) -> Option<String> {
 }
 
 struct TrendLong {
-    venue: Venue,
-    unified: bool,
-    cfg: Config,
-    store: Store,
+    k: Keeper,
     p: Params,
     state: State,
 }
 
 impl TrendLong {
-    fn event(&self, mut ev: Value) {
-        ev["kind"] = json!("trend");
-        ev["at"] = json!(now());
-        log!("trend: {ev}");
-        if let Some(m) = message(&ev) {
-            crate::notify::send(m);
-        }
-        self.store.event(ev);
-    }
-
-    fn save(&self) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                log!("trend: state not saved: {e:#}");
-            }
-        });
-    }
-
     /// A coin's closed daily candles over the last `n` days (the forming one left out).
     async fn days(&self, coin: &str, n: usize) -> Option<Vec<Day>> {
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
+        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
             "startTime": ((t - (n as f64 + 2.0) * DAY) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
         let r = match r {
             Ok(v) => v,
@@ -199,19 +174,13 @@ impl TrendLong {
                 None => None,
             }.or_else(|| (now() >= pos.tr.exit_at).then_some("time"));
             match why {
-                Some(why) => match trades::close(&self.venue, &pos.tr).await {
-                    Ok(px) => {
-                        let ret = pos.tr.ret(px);
-                        self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                            "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                        trades::unregister(&pos.tr.coin, "trend");
+                Some(why) => {
+                    if self.k.exit(&pos.tr, why).await {
                         changed = true;
-                    }
-                    Err(e) => {
-                        self.event(json!({"what": "error", "coin": pos.tr.coin, "error": format!("exit: {e:#}")}));
+                    } else {
                         self.state.open.push(pos);
                     }
-                },
+                }
                 None => self.state.open.push(pos),
             }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -222,14 +191,14 @@ impl TrendLong {
         if !btc_up(&btc, self.p.btc_ma) {
             log!("trend: BTC under its {}-day mean (or not read): no entries today", self.p.btc_ma);
         } else {
-            let ctx = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await;
+            let ctx = self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await;
             let mut liquid = Vec::new();
             if let Ok(ctx) = ctx {
                 let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
                 let c = ctx[1].as_array().cloned().unwrap_or_default();
                 for (u, c) in u.iter().zip(c.iter()) {
                     let Some(name) = u["name"].as_str() else { continue };
-                    if u["isDelisted"] != true && name != "BTC" && self.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol * 0.5 {
+                    if u["isDelisted"] != true && name != "BTC" && self.k.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol * 0.5 {
                         liquid.push(name.to_string());
                     }
                 }
@@ -257,13 +226,13 @@ impl TrendLong {
                     continue;
                 }
                 if !trades::trial_open(self.p.trial, self.state.opened) {
-                    self.event(json!({"what": "signal", "coin": coin, "px": px}));
+                    self.k.event(json!({"what": "signal", "coin": coin, "px": px}));
                     continue;
                 }
                 let size = trades::size_for(risk, dist, px);
-                match trades::open_market(&self.venue, &coin, size, (2.0 * dist).min(0.9), None, self.p.max_days * DAY).await {
+                match trades::open_market(&self.k.venue, &coin, size, (2.0 * dist).min(0.9), None, self.p.max_days * DAY).await {
                     Ok(tr) => {
-                        self.event(json!({"what": "open", "coin": coin, "days": self.p.days, "px": tr.entry_px, "size": tr.size, "notional": tr.size * tr.entry_px,
+                        self.k.event(json!({"what": "open", "coin": coin, "days": self.p.days, "px": tr.entry_px, "size": tr.size, "notional": tr.size * tr.entry_px,
                             "atr": a, "atr_k": self.p.atr_k, "chandelier_px": px - self.p.atr_k * a, "stop_px": tr.stop_px, "close": px}));
                         let r = (tr.size * self.p.atr_k * a).abs();
                         trades::register(&coin, "trend", r, tr.size);
@@ -271,53 +240,26 @@ impl TrendLong {
                         self.state.opened += 1;
                         changed = true;
                     }
-                    Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
+                    Err(e) => self.k.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
                 }
             }
         }
         self.state.stepped = day;
         if changed {
-            self.save();
+            self.k.save(DOC, &self.state);
         } else {
-            let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
+            let (cfg, v) = (self.k.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
             tokio::spawn(async move { let _ = crate::store::save_doc(&cfg, DOC, &v).await; });
         }
     }
 
-    /// Between the daily steps: a trade whose resting stop filled (a crash) ends.
+    /// The trades swept (see `Keeper::sweep`).
     async fn check(&mut self) {
-        if self.state.open.is_empty() {
-            return;
-        }
-        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
-            Ok((eq, p)) => {
-                trades::set_equity(eq);
-                p
-            }
-            Err(e) => {
-                log!("trend: account not read: {e:#}");
-                return;
-            }
-        };
-        let mut keep = Vec::new();
-        let mut changed = false;
-        for pos in std::mem::take(&mut self.state.open) {
-            match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), "trend").await {
-                Some((why, px)) => {
-                    let ret = pos.tr.ret(px);
-                    self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                        "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                    trades::unregister(&pos.tr.coin, "trend");
-                    changed = true;
-                }
-                None => keep.push(pos),
-            }
-        }
-        self.state.open = keep;
-        if changed {
-            self.save();
+        if self.k.sweep(&mut self.state.open, |p| &p.tr, false).await {
+            self.k.save(DOC, &self.state);
         }
     }
+
 }
 
 /// Starts the trend long unless `TREND_ENABLED` is "0" (unset or "1": live; set empty: the trial).
@@ -340,7 +282,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("📈 тренд лонг НА ДЕНЬГИ: пробой {}-дн. максимума (оборот от ${:.0}M), BTC выше {}-дн. средней; выход: закрытие дня на {:.0} ATR ниже лучшего или {:.0} дн.; риск {} на сделку, до {} позиций{}",
         p.days, p.min_vol / 1e6, p.btc_ma, p.atr_k, p.max_days, if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct()) } else { format!("${:.0}", p.risk_usd) },
         p.max_open, trades::trial_label(p.trial, state.opened)));
-    let mut l = TrendLong { venue, unified, cfg: cfg.clone(), store, p, state };
+    let mut l = TrendLong { k: Keeper::new(venue, unified, cfg.clone(), store, "trend", message, HeldIn::Days), p, state };
     tokio::spawn(async move {
         let mut check_at = 0.0;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -402,9 +344,9 @@ mod lifecycle {
     async fn the_resting_stop_filled_ends_it_and_a_held_one_stays() {
         let f = FakeHl::start(&[("TRA", 2, 10, 100.0), ("TRB", 2, 10, 50.0)]).await;
         let (store, mut rx) = Store::for_test();
-        let mut s = TrendLong { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default() };
+        let mut s = TrendLong { k: Keeper::new(f.venue(), false, cfg(), store, "trend", message, HeldIn::Days), p: Params::from_env(), state: State::default() };
         for c in ["TRA", "TRB"] {
-            let tr = trades::open_market(&s.venue, c, 1.0, 0.10, None, 30.0 * DAY).await.unwrap();
+            let tr = trades::open_market(&s.k.venue, c, 1.0, 0.10, None, 30.0 * DAY).await.unwrap();
             trades::register(c, "trend", tr.risk(), tr.size);
             s.state.open.push(Pos { tr, day: 0.0, risk: 5.0 });
         }
@@ -418,6 +360,6 @@ mod lifecycle {
         assert_eq!(s.state.open.len(), 1);
         assert_eq!(s.state.open[0].tr.coin, "TRB");
         assert!(!trades::registered("TRA") && trades::registered("TRB"));
-        assert_eq!(saved(&s.cfg, "trend").await.unwrap()["open"].as_array().unwrap().len(), 1);
+        assert_eq!(saved(&s.k.cfg, "trend").await.unwrap()["open"].as_array().unwrap().len(), 1);
     }
 }

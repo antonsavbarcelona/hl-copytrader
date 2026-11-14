@@ -70,7 +70,7 @@ pub(crate) struct Params {
 
 impl Params {
     pub(crate) fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = crate::trades::env_f;
         Params { drop: v("WKD_DROP_PCT", 4.0) / 100.0, min_vol: v("WKD_MIN_VOL_USD", 1e5), take: v("WKD_TAKE_PCT", 5.0) / 100.0,
             stop: v("WKD_STOP_PCT", 10.0) / 100.0, hold_s: v("WKD_HOLD_H", 24.0) * 3600.0, risk_usd: v("WKD_RISK_USD", 20.0),
             max_open: v("WKD_MAX_OPEN", 3.0) as usize, live: crate::trades::switch("WKD_LIVE") }

@@ -123,6 +123,7 @@ use crate::api::{Api, now, num};
 use crate::config::Config;
 use crate::dip::Closes;
 use crate::venue::{Placed, Venue};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -258,7 +259,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
             h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 0.7e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.5) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
@@ -485,10 +486,6 @@ fn slots_full(p: &Params, st: &State, coin: &str, rung: usize, shut: bool) -> bo
 /// The hour's deviation over `x` times the day's (`x` 0: off; either unknown: not hot).
 fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
     x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
-}
-
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
 }
 
 fn message(ev: &Value) -> Option<String> {

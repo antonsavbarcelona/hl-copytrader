@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use crate::api::{Api, now};
 use crate::config::Config;
 use crate::dip::{Closes, cooled};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 
@@ -61,7 +62,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = crate::trades::env_f;
         Params { drop: v("HIP3_DROP_PCT", 8.0) / 100.0, btc_max: v("HIP3_BTC_MAX_PCT", 2.0) / 100.0, min_vol: v("HIP3_MIN_VOL_USD", 10e6),
             hold_s: v("HIP3_HOLD_MIN", 30.0) * 60.0, live: crate::trades::switch("HIP3_LIVE").is_some(), trial: crate::trades::switch("HIP3_LIVE").flatten(),
             risk_usd: v("HIP3_RISK_USD", 20.0), stop: v("HIP3_STOP_PCT", 20.0) / 100.0, max_open: v("HIP3_MAX_OPEN", 3.0) as usize }
@@ -118,10 +119,6 @@ fn falls(closes: &Closes, volume: &HashMap<String, f64>, last_move: &mut HashMap
     }
     out.sort_by(|a, b| a.1.total_cmp(&b.1));
     out
-}
-
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
 }
 
 fn message(ev: &Value) -> Option<String> {

@@ -52,6 +52,7 @@ use crate::api::{Api, now};
 use crate::config::Config;
 use crate::dip::Closes;
 use crate::venue::{Placed, Venue};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -97,7 +98,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { rsi_max: v("RSIDIP_RSI_MAX", 35.0), under: v("RSIDIP_UNDER_PCT", 8.0) / 100.0, btc_max: v("RSIDIP_BTC_MAX_PCT", 0.5) / 100.0,
             min_vol: v("RSIDIP_MIN_VOL_USD", 10e6), take: v("RSIDIP_TAKE_PCT", 10.0) / 100.0, stop: v("RSIDIP_STOP_PCT", 20.0) / 100.0,
             hold_s: v("RSIDIP_HOLD_H", 24.0) * 3600.0, adds: v("RSIDIP_ADDS", 2.0) as u32, add_step: v("RSIDIP_ADD_PCT", 6.0) / 100.0,
@@ -304,10 +305,6 @@ fn signal(c: &[f64], p: &Params, h1: Option<f64>) -> Option<(f64, f64, bool)> {
 /// The EMA200 of the hourly closes (oldest first; seeded at the first), None with fewer than `H1_MIN`.
 fn h1_ema(closes: &[f64]) -> Option<f64> {
     (closes.len() >= H1_MIN).then(|| *ema(closes, 200).last().unwrap())
-}
-
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
 }
 
 fn message(ev: &Value) -> Option<String> {

@@ -33,7 +33,9 @@ use serde_json::{Value, json};
 
 use crate::api::{now, num};
 use crate::config::Config;
+use crate::keeper::{HeldIn, Keeper};
 use crate::venue::Venue;
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -81,7 +83,7 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         let mut sides = Vec::new();
         if let Some(trial) = trades::switch("BRK_ENABLED") {
             sides.push(Side { kind: "breakout", dir: 1.0, min_cnt: v("BRK_MIN_CNT", 1.0) as usize, max_open: v("BRK_MAX_OPEN", 3.0) as usize,
@@ -189,10 +191,6 @@ fn count_before(sig_times: &[(String, f64)], coin: &str, t: f64) -> usize {
     sig_times.iter().filter(|(c, s)| (c != coin || *s != t) && *s < t && *s >= t - CNT_H * H).count()
 }
 
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
-}
-
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
@@ -210,10 +208,10 @@ fn message(ev: &Value) -> Option<String> {
 }
 
 struct Breakout {
+    /// The candles' and the contexts' reads (each side's keeper has its own handle on the same account).
     venue: Venue,
-    unified: bool,
-    cfg: Config,
-    store: Store,
+    /// Each side's keeping (its kind's events, state, trades).
+    keepers: HashMap<&'static str, Keeper>,
     p: Params,
     states: HashMap<&'static str, State>,
     bars: HashMap<String, Vec<Bar>>,
@@ -222,23 +220,12 @@ struct Breakout {
 }
 
 impl Breakout {
-    fn event(&self, kind: &str, mut ev: Value) {
-        ev["kind"] = json!(kind);
-        ev["at"] = json!(now());
-        log!("{kind}: {ev}");
-        if let Some(m) = message(&ev) {
-            crate::notify::send(m);
-        }
-        self.store.event(ev);
+    fn event(&self, kind: &str, ev: Value) {
+        self.keepers[kind].event(ev);
     }
 
     fn save(&self, kind: &'static str) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(self.states.get(kind).cloned().unwrap_or_default()).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, kind, &v).await {
-                log!("breakout: {kind} state not saved: {e:#}");
-            }
-        });
+        self.keepers[kind].save(kind, &self.states.get(kind).cloned().unwrap_or_default());
     }
 
     /// A coin's closed 1h candles from `start` (s).
@@ -293,22 +280,6 @@ impl Breakout {
         }
     }
 
-    async fn exit(&mut self, kind: &'static str, pos: &Pos, why: &str) -> bool {
-        match trades::close(&self.venue, &pos.tr).await {
-            Ok(px) => {
-                let ret = pos.tr.ret(px);
-                self.event(kind, json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                    "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_h": (now() - pos.tr.at) / H}));
-                trades::unregister(&pos.tr.coin, kind);
-                true
-            }
-            Err(e) => {
-                self.event(kind, json!({"what": "error", "coin": pos.tr.coin, "error": format!("exit: {e:#}")}));
-                false
-            }
-        }
-    }
-
     /// After a 1h candle's close (its open `bar`): the candles brought up, the signals of the last 72 h counted, the new
     /// ones traded.
     async fn step(&mut self, bar: f64) {
@@ -342,21 +313,21 @@ impl Breakout {
                 let cnt = count_before(&times, &coin, bar);
                 let v = vol.get(coin.as_str()).copied().unwrap_or(0.0);
                 if cnt < side.min_cnt {
-                    self.store.event(json!({"kind": side.kind, "what": "lone", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    self.keepers[side.kind].store.event(json!({"kind": side.kind, "what": "lone", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
                     continue;
                 }
                 if v < self.p.min_vol {
-                    self.store.event(json!({"kind": side.kind, "what": "thin", "coin": coin, "px": close, "cnt": cnt, "vol": v, "at": now()}));
+                    self.keepers[side.kind].store.event(json!({"kind": side.kind, "what": "thin", "coin": coin, "px": close, "cnt": cnt, "vol": v, "at": now()}));
                     continue;
                 }
                 let st = self.states.entry(side.kind).or_default();
                 let risk = trades::risk_usd(side.risk_usd) * side.share;
                 if st.open.len() >= side.max_open || st.open.iter().any(|x| x.tr.coin == coin) || !trades::can_open(&coin, side.kind, side.dir, risk) {
-                    self.store.event(json!({"kind": side.kind, "what": "full", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    self.keepers[side.kind].store.event(json!({"kind": side.kind, "what": "full", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
                     continue;
                 }
                 if !trades::trial_open(side.trial, st.opened) {
-                    self.store.event(json!({"kind": side.kind, "what": "signal", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
+                    self.keepers[side.kind].store.event(json!({"kind": side.kind, "what": "signal", "coin": coin, "px": close, "cnt": cnt, "at": now()}));
                     continue;
                 }
                 let size = trades::size_for(risk, side.stop, close) * side.dir;
@@ -378,46 +349,12 @@ impl Breakout {
         self.stepped = bar;
     }
 
-    /// Between the steps: the time exits, and a trade whose stop or take filled ends.
+    /// Between the steps: each side's trades swept (`Keeper::sweep`: the stop or take filled, the time exit).
     async fn check(&mut self) {
-        if self.states.values().all(|s| s.open.is_empty()) {
-            return;
-        }
-        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
-            Ok((eq, p)) => {
-                trades::set_equity(eq);
-                p
-            }
-            Err(e) => {
-                log!("breakout: account not read: {e:#}");
-                return;
-            }
-        };
         let kinds: Vec<&'static str> = self.states.keys().copied().collect();
         for kind in kinds {
-            let mut keep = Vec::new();
-            let mut changed = false;
-            for pos in std::mem::take(&mut self.states.get_mut(kind).unwrap().open) {
-                match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), kind).await {
-                    Some((why, px)) => {
-                        let ret = pos.tr.ret(px);
-                        self.event(kind, json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                            "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_h": (now() - pos.tr.at) / H}));
-                        trades::unregister(&pos.tr.coin, kind);
-                        changed = true;
-                    }
-                    None if now() >= pos.tr.exit_at => {
-                        if self.exit(kind, &pos, "time").await {
-                            changed = true;
-                        } else {
-                            keep.push(pos);
-                        }
-                    }
-                    None => keep.push(pos),
-                }
-            }
-            self.states.get_mut(kind).unwrap().open = keep;
-            if changed {
+            let open = &mut self.states.get_mut(kind).unwrap().open;
+            if self.keepers[kind].sweep(open, |p| &p.tr, true).await {
                 self.save(kind);
             }
         }
@@ -453,7 +390,8 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
             if short { "ШОРТ ПРОБОЯ ВНИЗ" } else { "ЛОНГ ПРОБОЯ ВВЕРХ" }, if short { "ниже" } else { "выше" }, if short { "лоя" } else { "хая" }, s.min_cnt,
             s.stop * 100.0, s.take * 100.0, s.hold_s / H, s.max_open, p.min_vol / 1e6, trades::trial_label(s.trial, states[s.kind].opened)));
     }
-    let mut l = Breakout { venue, unified, cfg: cfg.clone(), store, p, states, bars: HashMap::new(), stepped: 0.0 };
+    let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(venue.clone(), unified, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
+    let mut l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
     tokio::spawn(async move {
         let mut check_at = 0.0;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -570,7 +508,9 @@ mod lifecycle {
         let (store, rx) = Store::for_test();
         let p = Params::from_env();
         let states = p.sides.iter().map(|s| (s.kind, State::default())).collect();
-        let b = Breakout { venue: f.venue(), unified: false, cfg: cfg(), store, p, states, bars: HashMap::new(), stepped: 0.0 };
+        let c = cfg();
+        let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(f.venue(), false, c.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
+        let b = Breakout { venue: f.venue(), keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
         (f, b, rx)
     }
 
@@ -594,7 +534,7 @@ mod lifecycle {
         assert!(e["px"].as_f64().unwrap() < 97.5 && e["ret_pct"].as_f64().unwrap() < -2.5 && e["pnl_usd"].as_f64().unwrap() < 0.0);
         assert!(e["entry_px"].as_f64().unwrap() == 100.0 && e["held_h"].as_f64().is_some() && e["at"].as_f64().is_some());
         assert!(b.states["breakout"].open.is_empty() && !trades::registered("BKA"));
-        assert_eq!(saved(&b.cfg, "breakout").await.unwrap()["open"], json!([]));
+        assert_eq!(saved(&b.keepers["breakout"].cfg, "breakout").await.unwrap()["open"], json!([]));
     }
 
     #[tokio::test]
@@ -644,6 +584,9 @@ mod lifecycle {
             s.mids.insert("BKF".into(), 100.0);
         });
         b.venue = f2.venue();
+        for k in b.keepers.values_mut() {
+            k.venue = f2.venue();
+        }
         let now_h = (now() / H).floor() * H;
         let bar = now_h - H;                                       // the candle just closed
         let mk = |break_at: f64| -> Vec<Bar> {

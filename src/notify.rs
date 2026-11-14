@@ -49,3 +49,16 @@ pub fn send(text: impl Into<String>) {
         let _ = tx.send(text.into());
     }
 }
+
+/// A $ amount signed for the chat: +$1.50 / -$2.00.
+pub fn usd(x: f64) -> String {
+    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
+}
+
+#[cfg(test)]
+mod usd_tests {
+    #[test]
+    fn a_signed_amount() {
+        assert_eq!((super::usd(1.5), super::usd(-2.0), super::usd(0.0)), ("+$1.50".to_string(), "-$2.00".to_string(), "+$0.00".to_string()));
+    }
+}

@@ -102,7 +102,8 @@ pub(crate) fn trial_label(trial: Option<u32>, used: u32) -> String {
     trial.map(|n| format!(", ПРОБА: первые {n} сделки (было {used}), потом только сигналы")).unwrap_or_default()
 }
 
-fn env_f(k: &str, d: f64) -> f64 {
+/// A number from the env var `k` (trimmed), `d` when unset or not a number.
+pub(crate) fn env_f(k: &str, d: f64) -> f64 {
     std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d)
 }
 

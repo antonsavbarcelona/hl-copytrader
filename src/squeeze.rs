@@ -31,7 +31,8 @@ use serde_json::{Value, json};
 
 use crate::api::{now, num};
 use crate::config::Config;
-use crate::venue::Venue;
+use crate::keeper::{HeldIn, Keeper};
+use crate::notify::usd;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -81,14 +82,14 @@ struct Params {
 
 impl Params {
     fn from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
             trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true, own_days: v("SQZ_OWN_DAYS", 30.0) }
     }
 
     fn short_from_env() -> Self {
-        let v = |k: &str, d: f64| std::env::var(k).ok().and_then(|x| x.trim().parse().ok()).unwrap_or(d);
+        let v = trades::env_f;
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
             trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false, own_days: 0.0 }
@@ -214,10 +215,6 @@ fn btc_up(b: &[Bar], n: usize) -> bool {
     b.len() >= n && b[b.len() - 1].3 > mean(&b[b.len() - n..].iter().map(|x| x.3).collect::<Vec<_>>())
 }
 
-fn usd(x: f64) -> String {
-    if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }
-}
-
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
@@ -239,38 +236,16 @@ fn message(ev: &Value) -> Option<String> {
 }
 
 struct Squeeze {
-    venue: Venue,
-    unified: bool,
-    cfg: Config,
-    store: Store,
+    k: Keeper,
     p: Params,
     state: State,
 }
 
 impl Squeeze {
-    fn event(&self, mut ev: Value) {
-        ev["kind"] = json!(self.p.kind);
-        ev["at"] = json!(now());
-        log!("{}: {ev}", self.p.kind);
-        if let Some(m) = message(&ev) {
-            crate::notify::send(m);
-        }
-        self.store.event(ev);
-    }
-
-    fn save(&self) {
-        let (cfg, v, doc) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default(), self.p.kind);
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, doc, &v).await {
-                log!("squeeze: state not saved: {e:#}");
-            }
-        });
-    }
-
     /// A coin's closed 4h candles over the last `n` (the forming one left out).
     async fn bars(&self, coin: &str, n: usize) -> Option<Vec<Bar>> {
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "4h",
+        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "4h",
             "startTime": ((t - (n as f64 + 2.0) * BAR) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
         let r = match r {
             Ok(v) => v,
@@ -283,29 +258,13 @@ impl Squeeze {
             .filter(|x| x.0 + BAR <= t && x.3 > 0.0).collect())
     }
 
-    async fn exit(&mut self, pos: &Pos, why: &str) -> bool {
-        match trades::close(&self.venue, &pos.tr).await {
-            Ok(px) => {
-                let ret = pos.tr.ret(px);
-                self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                    "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                trades::unregister(&pos.tr.coin, self.p.kind);
-                true
-            }
-            Err(e) => {
-                self.event(json!({"what": "error", "coin": pos.tr.coin, "error": format!("exit: {e:#}")}));
-                false
-            }
-        }
-    }
-
     /// After a 4h candle's close (its open `bar`): the trades' exits on the close, then the breakouts bought.
     async fn step(&mut self, bar: f64) {
         for pos in std::mem::take(&mut self.state.open) {
             let last = self.bars(&pos.tr.coin, 3).await.and_then(|b| b.last().copied());
             let why = if now() >= pos.tr.exit_at { Some("time") } else if last.is_some_and(|x| (x.3 - pos.close_stop) * self.p.side <= 0.0) { Some("close_stop") } else { None };
             if let Some(why) = why {
-                if self.exit(&pos, why).await {
+                if self.k.exit(&pos.tr, why).await {
                     continue;
                 }
             }
@@ -319,12 +278,12 @@ impl Squeeze {
             .map(|i| (btc[i].0 as i64, btc_up(&btc[..=i], self.p.btc_ma))).collect();
         if self.p.btc_filter && !btc_up(&btc, self.p.btc_ma) {
             log!("squeeze: BTC under its 50-day mean (or not read): no entries");
-        } else if let Ok(ctx) = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
+        } else if let Ok(ctx) = self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
             let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
             let c = ctx[1].as_array().cloned().unwrap_or_default();
             let liquid: Vec<String> = u.iter().zip(c.iter()).filter_map(|(u, c)| {
                 let name = u["name"].as_str()?;
-                (u["isDelisted"] != true && name != "BTC" && self.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol).then(|| name.to_string())
+                (u["isDelisted"] != true && name != "BTC" && self.k.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol).then(|| name.to_string())
             }).collect();
             let (mut cands, mut own, mut papers) = (Vec::new(), 0.0, 0usize);
             let hold = (self.p.hold_s / BAR).round() as usize;
@@ -355,7 +314,7 @@ impl Squeeze {
             }
             for (coin, b) in cands {
                 if !own_ok {
-                    self.event(json!({"what": "own_off", "coin": coin, "px": b[b.len() - 1].3, "own_r": own, "papers": papers, "days": self.p.own_days}));
+                    self.k.event(json!({"what": "own_off", "coin": coin, "px": b[b.len() - 1].3, "own_r": own, "papers": papers, "days": self.p.own_days}));
                     continue;
                 }
                 let Some(a) = atr(&b) else { continue };
@@ -370,64 +329,37 @@ impl Squeeze {
                     continue;
                 }
                 if !trades::trial_open(self.p.trial, self.state.opened) {
-                    self.event(json!({"what": "signal", "coin": coin, "px": px}));
+                    self.k.event(json!({"what": "signal", "coin": coin, "px": px}));
                     continue;
                 }
                 let size = trades::size_for(risk, dist, px) * self.p.side;
-                match trades::open_market(&self.venue, &coin, size, (2.0 * dist).min(0.8), None, self.p.hold_s).await {
+                match trades::open_market(&self.k.venue, &coin, size, (2.0 * dist).min(0.8), None, self.p.hold_s).await {
                     Ok(tr) => {
                         let close_stop = tr.entry_px - self.p.side * self.p.atr_k * a;
-                        self.event(json!({"what": "open", "coin": coin, "px": tr.entry_px, "size": tr.size, "notional": (tr.size * tr.entry_px).abs(), "atr": a,
+                        self.k.event(json!({"what": "open", "coin": coin, "px": tr.entry_px, "size": tr.size, "notional": (tr.size * tr.entry_px).abs(), "atr": a,
                             "close_stop": close_stop, "stop_px": tr.stop_px, "hold_days": self.p.hold_s / DAY, "close": px}));
                         let r = (tr.size * (tr.entry_px - close_stop)).abs();
                         trades::register(&coin, self.p.kind, r, tr.size);
                         self.state.open.push(Pos { tr, close_stop, risk: r });
                         self.state.opened += 1;
                     }
-                    Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
+                    Err(e) => self.k.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
                 }
             }
         } else {
             log!("squeeze: contexts not read: no entries");
         }
         self.state.stepped = bar;
-        self.save();
+        self.k.save(self.p.kind, &self.state);
     }
 
-    /// Between the closes: a trade whose resting stop filled (a crash) ends.
+    /// The trades swept (see `Keeper::sweep`).
     async fn check(&mut self) {
-        if self.state.open.is_empty() {
-            return;
-        }
-        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
-            Ok((eq, p)) => {
-                trades::set_equity(eq);
-                p
-            }
-            Err(e) => {
-                log!("squeeze: account not read: {e:#}");
-                return;
-            }
-        };
-        let mut keep = Vec::new();
-        let mut changed = false;
-        for pos in std::mem::take(&mut self.state.open) {
-            match trades::gone(&self.venue, &pos.tr, held.get(&pos.tr.coin).copied().unwrap_or(0.0), self.p.kind).await {
-                Some((why, px)) => {
-                    let ret = pos.tr.ret(px);
-                    self.event(json!({"what": "close", "coin": pos.tr.coin, "why": why, "entry_px": pos.tr.entry_px, "px": px, "ret_pct": ret * 100.0,
-                        "pnl_usd": ret * pos.tr.size.abs() * pos.tr.entry_px, "held_days": (now() - pos.tr.at) / DAY}));
-                    trades::unregister(&pos.tr.coin, self.p.kind);
-                    changed = true;
-                }
-                None => keep.push(pos),
-            }
-        }
-        self.state.open = keep;
-        if changed {
-            self.save();
+        if self.k.sweep(&mut self.state.open, |p| &p.tr, false).await {
+            self.k.save(self.p.kind, &self.state);
         }
     }
+
 }
 
 /// Starts the squeeze breakout long unless `SQZ_ENABLED` is "0" (unset or "1": live; set empty: the trial), and the
@@ -464,7 +396,7 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
         if short { "шорт пробоя вниз из сжатия" } else { "пробой из сжатия" }, if short { "под" } else { "над" }, p.q * 100.0,
         if p.btc_filter { ", BTC выше 50-дн. средней" } else { "" }, p.min_vol / 1e6, p.atr_k, if short { "выше" } else { "ниже" }, p.hold_s / DAY, p.max_open,
         trades::trial_label(p.trial, state.opened)));
-    let mut l = Squeeze { venue, unified, cfg: cfg.clone(), store, p, state };
+    let mut l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state };
     tokio::spawn(async move {
         let mut check_at = 0.0;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
@@ -541,12 +473,12 @@ mod lifecycle {
     async fn setup(coin: &str, p: Params) -> (FakeHl, Squeeze, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
         let (store, rx) = Store::for_test();
-        let s = Squeeze { venue: f.venue(), unified: false, cfg: cfg(), store, p, state: State::default() };
+        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default() };
         (f, s, rx)
     }
 
     async fn hold(s: &mut Squeeze, coin: &str, size: f64, close_stop: f64) {
-        let tr = trades::open_market(&s.venue, coin, size, 0.10, None, 5.0 * DAY).await.unwrap();
+        let tr = trades::open_market(&s.k.venue, coin, size, 0.10, None, 5.0 * DAY).await.unwrap();
         trades::register(coin, s.p.kind, tr.risk(), tr.size);
         s.state.open.push(Pos { tr, close_stop, risk: 5.0 });
     }
@@ -563,7 +495,7 @@ mod lifecycle {
         assert_eq!((e["kind"].as_str(), e["what"].as_str(), e["why"].as_str()), (Some("squeeze"), Some("close"), Some("stop")));
         assert!(e["ret_pct"].as_f64().unwrap() < -9.9 && e["held_days"].as_f64().is_some() && e["entry_px"].as_f64() == Some(100.0));
         assert!(s.state.open.is_empty() && !trades::registered("SQA"));
-        assert_eq!(saved(&s.cfg, "squeeze").await.unwrap()["open"], json!([]));
+        assert_eq!(saved(&s.k.cfg, "squeeze").await.unwrap()["open"], json!([]));
     }
 
     #[tokio::test]

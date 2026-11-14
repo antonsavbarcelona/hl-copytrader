@@ -231,12 +231,8 @@ impl Breakout {
     /// A coin's closed 1h candles from `start` (s).
     async fn fetch(&self, coin: &str, start: f64) -> Option<Vec<Bar>> {
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1h",
-            "startTime": (start * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        match r {
-            Ok(v) => Some(v.as_array()?.iter()
-                .map(|c| (num(&c["t"]) / 1000.0, num(&c["o"]), num(&c["h"]), num(&c["l"]), num(&c["c"]), num(&c["v"]) * num(&c["c"])))
-                .filter(|x| x.0 + H <= t && x.4 > 0.0).collect()),
+        match crate::market::candles(&self.venue.ex, coin, "1h", start).await {
+            Ok(v) => Some(crate::market::closed(v, "1h", t).into_iter().map(|c| (c.t, c.o, c.h, c.l, c.c, c.notional())).collect()),
             Err(e) => {
                 log!("breakout: {coin} candles not read: {e:#}");
                 None

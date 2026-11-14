@@ -148,17 +148,14 @@ impl TrendLong {
     /// A coin's closed daily candles over the last `n` days (the forming one left out).
     async fn days(&self, coin: &str, n: usize) -> Option<Vec<Day>> {
         let t = now();
-        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
-            "startTime": ((t - (n as f64 + 2.0) * DAY) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        let r = match r {
+        let r = match crate::market::candles(&self.k.venue.ex, coin, "1d", t - (n as f64 + 2.0) * DAY).await {
             Ok(v) => v,
             Err(e) => {
                 log!("trend: {coin} candles not read: {e:#}");
                 return None;
             }
         };
-        let d: Vec<Day> = r.as_array()?.iter().map(|c| (num(&c["t"]) / 1000.0, num(&c["h"]), num(&c["l"]), num(&c["c"]), num(&c["v"]) * num(&c["c"])))
-            .filter(|x| x.0 + DAY <= t && x.3 > 0.0).collect();
+        let d: Vec<Day> = crate::market::closed(r, "1d", t).into_iter().map(|c| (c.t, c.h, c.l, c.c, c.notional())).collect();
         Some(d)
     }
 

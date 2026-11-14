@@ -14,6 +14,7 @@ mod expiry;
 mod hip3;
 mod keeper;
 mod listing;
+mod market;
 mod venue;
 mod notify;
 mod rsidip;

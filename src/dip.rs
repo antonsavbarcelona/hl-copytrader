@@ -646,18 +646,14 @@ impl Dip {
     async fn rsi_1h(&self, coin: &str) -> Option<f64> {
         let mid = self.closes.at(coin, i64::MAX)?;
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1h",
-            "startTime": ((t - 100.0 * 3600.0) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        let v = match r {
+        let v = match crate::market::candles(&self.venue.ex, coin, "1h", t - 100.0 * 3600.0).await {
             Ok(v) => v,
             Err(e) => {
                 log!("dip: {coin} hour candles not read: {e:#}");
                 return None;
             }
         };
-        let mut closes: Vec<f64> = v.as_array()?.iter()
-            .filter(|c| c["T"].as_f64().is_some_and(|end| end / 1000.0 < t))
-            .filter_map(|c| c["c"].as_str()?.parse().ok()).collect();
+        let mut closes: Vec<f64> = crate::market::closed(v, "1h", t).into_iter().map(|c| c.c).collect();
         closes.push(mid);
         rsi(&closes, 14)
     }
@@ -668,10 +664,8 @@ impl Dip {
             return true;
         }
         let t = now();
-        let r = self.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
-            "startTime": ((t - (days + 10.0) * 86_400.0) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        let ok = match r {
-            Ok(v) => v.as_array().and_then(|a| a.first()).and_then(|c| c["t"].as_f64()).is_some_and(|first| first / 1000.0 <= t - days * 86_400.0),
+        let ok = match crate::market::candles(&self.venue.ex, coin, "1d", t - (days + 10.0) * 86_400.0).await {
+            Ok(v) => v.first().is_some_and(|first| first.t <= t - days * 86_400.0),
             Err(e) => {
                 log!("dip: {coin} candles not read (the pump skipped): {e:#}");
                 false

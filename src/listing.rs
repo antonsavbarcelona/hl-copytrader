@@ -100,9 +100,7 @@ impl Listing {
     /// A coin's listing time: its first daily candle within `NEW_WITHIN_DAYS` (0: older).
     async fn listed_at(&self, coin: &str) -> Option<f64> {
         let t = now();
-        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1d",
-            "startTime": ((t - (NEW_WITHIN_DAYS + 5.0) * DAY) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        let first = r.ok()?.as_array()?.first()?["t"].as_f64()? / 1000.0;
+        let first = crate::market::candles(&self.k.venue.ex, coin, "1d", t - (NEW_WITHIN_DAYS + 5.0) * DAY).await.ok()?.first()?.t;
         Some(if first <= t - NEW_WITHIN_DAYS * DAY { 0.0 } else { first })
     }
 

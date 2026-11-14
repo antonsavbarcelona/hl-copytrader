@@ -245,17 +245,13 @@ impl Squeeze {
     /// A coin's closed 4h candles over the last `n` (the forming one left out).
     async fn bars(&self, coin: &str, n: usize) -> Option<Vec<Bar>> {
         let t = now();
-        let r = self.k.venue.ex.info(json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "4h",
-            "startTime": ((t - (n as f64 + 2.0) * BAR) * 1000.0) as u64, "endTime": (t * 1000.0) as u64}})).await;
-        let r = match r {
-            Ok(v) => v,
+        match crate::market::candles(&self.k.venue.ex, coin, "4h", t - (n as f64 + 2.0) * BAR).await {
+            Ok(v) => Some(crate::market::closed(v, "4h", t).into_iter().map(|c| (c.t, c.h, c.l, c.c)).collect()),
             Err(e) => {
                 log!("squeeze: {coin} candles not read: {e:#}");
-                return None;
+                None
             }
-        };
-        Some(r.as_array()?.iter().map(|c| (num(&c["t"]) / 1000.0, num(&c["h"]), num(&c["l"]), num(&c["c"])))
-            .filter(|x| x.0 + BAR <= t && x.3 > 0.0).collect())
+        }
     }
 
     /// After a 4h candle's close (its open `bar`): the trades' exits on the close, then the breakouts bought.

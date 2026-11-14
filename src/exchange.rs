@@ -14,7 +14,7 @@ pub const MAINNET: &str = "https://api.hyperliquid.xyz";
 
 /// The account's address-based request headroom (`userRateLimit`: the cap, 1 request per USDC traded
 /// + 10 000, less the requests used): each action counts its orders / cancels down, a "Too many
-/// cumulative requests" reply sets it to 0, and `live::watch_rate_limit` re-reads it each minute.
+/// cumulative requests" reply sets it to 0, and `venue::watch_rate_limit` re-reads it each minute.
 /// Unknown (no watcher: the tests, the paper) = unlimited. On 2026-11-10 the wick's moves spent it all
 /// (~8 000 requests a day against ~$1 700 traded): every order refused for hours, a ZRO exit among them.
 static HEADROOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
@@ -97,6 +97,14 @@ pub fn round_px(px: f64, sz_decimals: u32) -> f64 {
     (px * d).round() / d
 }
 
+/// Size rounded toward zero to the coin's size decimals.
+pub fn round_size(sz: f64, decimals: u32) -> f64 {
+    let m = 10f64.powi(decimals as i32);
+    // A hair up first: 0.00014 is 13.999... steps in binary, still 14 of them.
+    let steps = sz * m;
+    (steps + steps.signum() * 1e-9).trunc() / m
+}
+
 fn keccak(data: &[u8]) -> [u8; 32] {
     Keccak256::digest(data).into()
 }
@@ -134,7 +142,8 @@ pub fn sign(key: &SigningKey, action: &Action, nonce: u64, mainnet: bool) -> Res
     Ok(json!({"r": hex_int(&r), "s": hex_int(&s), "v": 27 + rec.to_byte() as u64}))
 }
 
-/// The address a key signs as (lowercase 0x hex).
+/// The address a key signs as (lowercase 0x hex): the tests check the signing against the SDK's.
+#[cfg(test)]
 pub fn address(key: &SigningKey) -> String {
     let point = key.verifying_key().to_encoded_point(false);
     let hash = keccak(&point.as_bytes()[1..]);
@@ -162,10 +171,6 @@ impl Exchange {
 
     pub fn mainnet(&self) -> bool {
         self.mainnet
-    }
-
-    pub fn signer(&self) -> String {
-        address(&self.key)
     }
 
     /// A 429 / 5xx retried with a backoff (1, 2, 4, 8, 16 s): on 2026-11-03 a 429 on the startup's meta crashed the
@@ -304,5 +309,20 @@ mod wire_tests {
         assert_eq!(round_px(45.2264, 2), 45.226);
         assert_eq!(round_px(104321.7, 5), 104320.0);
         assert_eq!(round_px(0.12345678, 4), 0.12);    // 6 - 4 decimals
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn a_size_rounds_toward_zero_to_its_decimals() {
+        assert_eq!(round_size(0.00014, 5), 0.00014);   // 13.999.. steps in binary: still 14
+        assert_eq!(round_size(1.239, 2), 1.23);
+        assert_eq!(round_size(-1.239, 2), -1.23);
+        assert_eq!(round_size(5.0, 0), 5.0);
+        assert_eq!(round_size(0.004, 2), 0.0);
+        assert_eq!(round_size(123456.7, 0), 123456.0);
     }
 }

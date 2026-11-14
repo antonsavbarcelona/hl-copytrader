@@ -65,10 +65,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::account::round_size;
+use crate::exchange::round_size;
 use crate::api::{Api, now};
 use crate::config::Config;
-use crate::live::{Venue, equity_of};
+use crate::venue::{Venue, equity_of};
 use crate::log;
 use crate::store::Store;
 
@@ -334,7 +334,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         log!("dip: off (DIP_ENABLED=0)");
         return Ok(());
     }
-    let Some((venue, unified)) = crate::live::venue_from_env(Some(books.clone())).await? else {
+    let Some((venue, unified)) = crate::venue::venue_from_env(Some(books.clone())).await? else {
         log!("dip: LIVE_KEY / LIVE_ACCOUNT not set, off");
         return Ok(());
     };

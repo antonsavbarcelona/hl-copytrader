@@ -1,19 +1,12 @@
-//! Where a run lives: Postgres when `DATABASE_URL` is set (tables created on first start),
-//! else files in the data directory: the copies (`copy_accounts`; `state.json`) and what they
-//! did (`events`; `events.jsonl`), the bot's health every 10 minutes (`bot_status`;
-//! `status.jsonl`) and the day's list of followed traders (`selection`; `selection.json`, see
-//! `stable`).
+//! Where a run lives: Postgres when `DATABASE_URL` is set (tables created on first start), else files in the data
+//! directory: what the strategies did (`events`; `events.jsonl`) and their states (`docs`; `<name>.json`).
 //!
-//! On Postgres, `MIGRATIONS` run once each, in order, at the first start that has them
-//! (`schema_migrations` keeps which ran).
+//! On Postgres, `MIGRATIONS` run once each, in order, at the first start that has them (`schema_migrations` keeps
+//! which ran; the copy-trading's were removed with it on 2026-11-14, their tables left as they were).
 //!
-//! The engine never waits on it: events and state snapshots go to a writer task, which
-//! batches them (one insert per second for events; for the state, only the accounts that
-//! changed since the last save) and, on Postgres, reconnects and retries when the database
-//! is away, keeping what it has not written yet.
+//! The strategies never wait on the events: they go to a writer task, which batches them (one insert a second) and,
+//! on Postgres, reconnects and retries when the database is away, keeping what it has not written yet.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,97 +14,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::engine::Trader;
 use crate::log;
-use crate::stable::Selection;
-
-/// One copy account as saved: its full state plus a few columns to query by.
-pub struct Row {
-    pub address: String,
-    pub name: Option<String>,
-    pub equity: f64,
-    pub roi_pct: f64,
-    pub copy_fills: i64,
-    pub open_positions: i32,
-    pub liquidated: bool,
-    /// On the golden list, and the PnL it is judged by (since measured, see `engine`).
-    pub golden: bool,
-    pub measured_pnl: f64,
-    /// The `Trader`, serialized.
-    pub state: String,
-}
-
-enum Cmd {
-    Event(Value),
-    /// A row for one of the tables that take whole rows (`INSERT_TABLES`).
-    Insert(&'static str, Value),
-    Save(Vec<Row>),
-    Status(Value),
-    Flush(oneshot::Sender<()>),
-}
 
 #[derive(Clone)]
 pub struct Store {
-    tx: mpsc::UnboundedSender<Cmd>,
+    tx: mpsc::UnboundedSender<Value>,
 }
 
 impl Store {
     pub fn event(&self, ev: Value) {
-        let _ = self.tx.send(Cmd::Event(ev));
-    }
-
-    pub fn save(&self, rows: Vec<Row>) {
-        let _ = self.tx.send(Cmd::Save(rows));
-    }
-
-    /// Adds `row` (an object of its columns, `run_id` filled in here) to `table`, one of
-    /// `INSERT_TABLES` (a file `<table>.jsonl` without a database).
-    pub fn insert(&self, table: &'static str, row: Value) {
-        debug_assert!(INSERT_TABLES.contains(&table));
-        let _ = self.tx.send(Cmd::Insert(table, row));
-    }
-
-    pub fn status(&self, status: Value) {
-        let _ = self.tx.send(Cmd::Status(status));
-    }
-
-    /// Waits until everything sent so far is written.
-    pub async fn flush(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(Cmd::Flush(tx)).is_ok() {
-            let _ = rx.await;
-        }
-    }
-}
-
-/// The saved copy accounts of this run, by address.
-pub async fn load(cfg: &Config) -> Result<HashMap<String, Trader>> {
-    match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            migrate(&client).await?;
-            let rows = client.query("SELECT address, state::text FROM copy_accounts WHERE run_id = $1", &[&cfg.run_id]).await?;
-            let mut out = HashMap::new();
-            for r in rows {
-                let (address, state): (String, String) = (r.get(0), r.get(1));
-                out.insert(address, serde_json::from_str(&state)?);
-            }
-            Ok(out)
-        }
-        None => {
-            #[derive(serde::Deserialize, Default)]
-            struct Saved {
-                traders: HashMap<String, Trader>,
-            }
-            let path = cfg.data_dir.join("state.json");
-            Ok(match std::fs::read_to_string(&path) {
-                Ok(s) => serde_json::from_str::<Saved>(&s).with_context(|| format!("{}", path.display()))?.traders,
-                Err(_) => HashMap::new(),
-            })
-        }
+        let _ = self.tx.send(ev);
     }
 }
 
@@ -137,8 +52,7 @@ pub async fn open(cfg: &Config) -> Result<Store> {
 
 // ------------------------------------------------------------------------------------ files
 
-async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
-    let state_path = dir.join("state.json");
+async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Value>) {
     let mut events = match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")) {
         Ok(f) => std::io::BufWriter::new(f),
         Err(e) => {
@@ -146,38 +60,10 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
             return;
         }
     };
-    // Every account as last saved (the file holds all of them).
-    let mut all: HashMap<String, String> = HashMap::new();
-    let obj = |m: &HashMap<String, String>| m.iter().map(|(a, s)| format!("{}:{s}", Value::String(a.clone()))).collect::<Vec<_>>().join(",");
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Cmd::Event(ev) => {
-                let _ = writeln!(events, "{ev}");
-            }
-            Cmd::Insert(table, row) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("{table}.jsonl"))) {
-                    let _ = writeln!(f, "{row}");
-                }
-            }
-            Cmd::Status(s) => {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("status.jsonl")) {
-                    let _ = writeln!(f, "{s}");
-                }
-            }
-            Cmd::Save(rows) => {
-                for r in rows {
-                    all.insert(r.address, r.state);
-                }
-                let tmp = state_path.with_extension("tmp");
-                if std::fs::write(&tmp, format!("{{\"traders\":{{{}}}}}", obj(&all))).is_ok() {
-                    let _ = std::fs::rename(&tmp, &state_path);
-                }
-                let _ = events.flush();
-            }
-            Cmd::Flush(done) => {
-                let _ = events.flush();
-                let _ = done.send(());
-            }
+    while let Some(ev) = rx.recv().await {
+        let _ = writeln!(events, "{ev}");
+        if rx.is_empty() {
+            let _ = events.flush();
         }
     }
     let _ = events.flush();
@@ -186,21 +72,6 @@ async fn file_writer(dir: PathBuf, mut rx: mpsc::UnboundedReceiver<Cmd>) {
 // --------------------------------------------------------------------------------- postgres
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS copy_accounts (
-    run_id          text        NOT NULL,
-    address         text        NOT NULL,
-    name            text,
-    equity          float8      NOT NULL,
-    roi_pct         float8      NOT NULL,
-    copy_fills      bigint      NOT NULL,
-    open_positions  integer     NOT NULL,
-    liquidated      boolean     NOT NULL,
-    golden          boolean     NOT NULL DEFAULT false,
-    measured_pnl    float8      NOT NULL DEFAULT 0,
-    state           jsonb       NOT NULL,
-    updated_at      timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (run_id, address)
-);
 CREATE TABLE IF NOT EXISTS events (
     id       bigserial   PRIMARY KEY,
     run_id   text        NOT NULL,
@@ -212,24 +83,6 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_run_at ON events (run_id, at);
 CREATE INDEX IF NOT EXISTS events_run_address ON events (run_id, address, at);
-CREATE TABLE IF NOT EXISTS bot_status (
-    run_id          text        NOT NULL,
-    at              timestamptz NOT NULL,
-    copy_accounts   integer     NOT NULL,
-    followed        integer     NOT NULL,
-    open_positions  integer     NOT NULL,
-    api_weight      integer     NOT NULL,
-    api_backlog_s   float8      NOT NULL,
-    tick_avg_ms     float8      NOT NULL,
-    tick_max_ms     float8      NOT NULL,
-    data            jsonb       NOT NULL,
-    PRIMARY KEY (run_id, at)
-);
-CREATE TABLE IF NOT EXISTS selection (
-    run_id      text        PRIMARY KEY,
-    state       jsonb       NOT NULL,
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
 CREATE TABLE IF NOT EXISTS docs (
     run_id      text        NOT NULL,
     name        text        NOT NULL,
@@ -243,262 +96,8 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 ";
 
-/// The tables `Store::insert` writes to.
-const INSERT_TABLES: &[&str] = &["liq_touches", "liq_trades", "liq_daily", "trader_weeks", "allocator_decisions", "allocator_trades", "allocator_status"];
-
 /// One-off changes to what is in the database, by name, oldest first.
-const MIGRATIONS: &[(&str, &str)] = &[
-    // The traders followed until now were picked by one month's ROI (see `stable`), and the
-    // signals are gone: every run starts over, the signals' tables and columns dropped.
-    ("2026-10-07-reset",
-     "TRUNCATE copy_accounts, events, bot_status, selection RESTART IDENTITY;
-      DROP TABLE IF EXISTS signal_accounts, signal_trades, signal_maker_trades, smart_state;
-      ALTER TABLE bot_status DROP COLUMN IF EXISTS signals_avg_ms, DROP COLUMN IF EXISTS signals_max_ms"),
-    // The golden list: copies judged by their PnL since then.
-    ("2026-10-09-golden",
-     "ALTER TABLE copy_accounts ADD COLUMN IF NOT EXISTS golden boolean NOT NULL DEFAULT false,
-                                ADD COLUMN IF NOT EXISTS measured_pnl float8 NOT NULL DEFAULT 0"),
-    // The live account's health check at every start (`live`): a smallest trade, in and out.
-    ("2026-10-09-live-checks",
-     "CREATE TABLE IF NOT EXISTS live_checks (
-          id        bigserial   PRIMARY KEY,
-          run_id    text        NOT NULL,
-          at        timestamptz NOT NULL DEFAULT now(),
-          net       text        NOT NULL,
-          account   text        NOT NULL,
-          ok        boolean     NOT NULL,
-          coin      text,
-          size      float8,
-          open_px   float8,
-          close_px  float8,
-          fee       float8,
-          pnl       float8,
-          equity    float8,
-          took_ms   integer,
-          error     text
-      )"),
-    // The golden list starts with the copies at a profit on 2026-10-09 of the accounts that can
-    // be copied (swing traders; not market makers, HFT or grids: see the README).
-    ("2026-10-09-golden-seed",
-     "UPDATE copy_accounts SET golden = true, state = jsonb_set(state, '{golden}', 'true')
-      WHERE address IN (
-          '0x72774e2fe1992d5da8c6e9cef73fd2ab980c0b98',
-          '0x95da8596c44dd09f4b8becce87ad3b7894fb2328',
-          '0x0f4fbea1aaecd66967af7ef02c7fa4693999834a',
-          '0xc0b2a1ce425d0cd8bc321c445fa6ae0eaed2e688',
-          '0x8fc7c0442e582bca195978c5a4fdec2e7c5bb0f7',
-          '0x9c68cd0568eb47bad36ecd8090e6c1d1396a7783',
-          '0x1a94785cc11b1b4225374a8e0015f788b222a538',
-          '0x9a991732cd4cf14712b07fbeb8c5d87de90dd21a',
-          '0x25554a80781ee62414c3747e81c3f50157c634b1',
-          '0x1d74a7760df9d563d0b6610b1705266c4e2fdb26',
-          '0x8aa077f5998d234ac8641d73d6bc4976e2a210fc',
-          '0xe79d69fd1ed52dd14d7f55155259519ea20d0534',
-          '0x9db82c502472d76742fdd69609dfcc6e01327401')"),
-    // ... and the other 6 of the 19 that can be copied, at a loss then: all 19 golden.
-    ("2026-10-09-golden-seed-all",
-     "UPDATE copy_accounts SET golden = true, state = jsonb_set(state, '{golden}', 'true')
-      WHERE address IN (
-          '0x40a632026febd007b0e4431a29170507f7aa3896',
-          '0xa8cbf4200595efcd94b7526d04deafe0f284af2d',
-          '0x0ffd670749d4179558b6b367e30e72ce2efea28f',
-          '0x5f96906b85010f729e36d5a4141d027194a47b60',
-          '0x2d23559bab0bbcb483056e77c9b2837438215cc2',
-          '0xf29c6bc1147a841519b382459a6d7a373c6b9971')"),
-    // The liquidation research (`liq`), kept apart from the copies: the touches of liquidation
-    // clusters, the trades simulated on them, and each day's results per strategy.
-    ("2026-10-09-liq-tables",
-     "CREATE TABLE IF NOT EXISTS liq_touches (
-          id            bigserial   PRIMARY KEY,
-          run_id        text        NOT NULL,
-          touch         text        NOT NULL,
-          at            timestamptz NOT NULL,
-          coin          text        NOT NULL,
-          side          text        NOT NULL,
-          cluster_usd   float8      NOT NULL,
-          accounts      integer     NOT NULL,
-          bin_lo        float8      NOT NULL,
-          bin_hi        float8      NOT NULL,
-          touch_px      float8      NOT NULL,
-          oi_usd        float8,
-          bp_5m         float8,
-          bp_15m        float8,
-          bp_60m        float8,
-          best_bp       float8,
-          best_after_s  float8,
-          bounce_bp     float8,
-          worst_bp      float8,
-          through       boolean
-      );
-      CREATE INDEX IF NOT EXISTS liq_touches_at ON liq_touches (run_id, at);
-      CREATE TABLE IF NOT EXISTS liq_trades (
-          id            bigserial   PRIMARY KEY,
-          run_id        text        NOT NULL,
-          touch         text        NOT NULL,
-          strategy      text        NOT NULL,
-          coin          text        NOT NULL,
-          cluster_usd   float8      NOT NULL,
-          dir           integer     NOT NULL,
-          opened_at     timestamptz NOT NULL,
-          closed_at     timestamptz NOT NULL,
-          entry_px      float8      NOT NULL,
-          exit_px       float8      NOT NULL,
-          exit_why      text        NOT NULL,
-          notional      float8      NOT NULL,
-          fee           float8      NOT NULL,
-          pnl_usd       float8      NOT NULL,
-          pnl_bp        float8      NOT NULL,
-          equity_after  float8      NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS liq_trades_closed ON liq_trades (run_id, strategy, closed_at);
-      CREATE TABLE IF NOT EXISTS liq_daily (
-          id            bigserial   PRIMARY KEY,
-          run_id        text        NOT NULL,
-          day           date        NOT NULL,
-          strategy      text        NOT NULL,
-          cluster_size  text        NOT NULL,
-          trades        integer     NOT NULL,
-          win_pct       float8,
-          avg_pnl_bp    float8,
-          pnl_usd       float8      NOT NULL,
-          equity_end    float8
-      )"),
-    // Round 2: each account's trial week by week (`engine::verdict`), with its steadiness
-    // measures and how it trades when its copy made money.
-    ("2026-10-10-trader-weeks",
-     "CREATE TABLE IF NOT EXISTS trader_weeks (
-          id            bigserial   PRIMARY KEY,
-          run_id        text        NOT NULL,
-          address       text        NOT NULL,
-          week          integer     NOT NULL,
-          started_at    timestamptz NOT NULL,
-          ended_at      timestamptz NOT NULL,
-          their_pnl     float8,
-          our_pnl       float8      NOT NULL,
-          verdict       text        NOT NULL,
-          why           text        NOT NULL,
-          golden        boolean     NOT NULL,
-          losing_weeks  integer     NOT NULL,
-          steady        boolean,
-          perp_equity   float8,
-          months_pnl    jsonb,
-          weeks_up      integer,
-          weeks_down    integer,
-          orders_per_day float8,
-          maker_pct     float8,
-          liquid_pct    float8,
-          edge_bp       float8,
-          not_copyable  text
-      );
-      CREATE INDEX IF NOT EXISTS trader_weeks_address ON trader_weeks (run_id, address, week)"),
-    // The traders the backtest found worth copying, copied on paper to check it (`engine`).
-    ("2026-10-11-backtest-picks", include_str!("backtest_picks.sql")),
-    // The backtest's statistics of its picks, the allocator's until a paper copy has its own.
-    ("2026-10-12-backtest-stats", include_str!("backtest_stats.sql")),
-    // ... and of all the wallets with copy trades, not only the picks.
-    ("2026-10-12-backtest-stats-all", include_str!("backtest_stats_all.sql")),
-    // The allocator portfolios' decisions on each entry (`alloc`).
-    ("2026-10-12-allocator",
-     "CREATE TABLE IF NOT EXISTS allocator_decisions (
-          id              bigserial   PRIMARY KEY,
-          run_id          text        NOT NULL,
-          at              timestamptz NOT NULL,
-          portfolio       text        NOT NULL,
-          trader          text        NOT NULL,
-          coin            text        NOT NULL,
-          side            text        NOT NULL,
-          action          text        NOT NULL,
-          eligible        boolean     NOT NULL,
-          rank            integer,
-          score           float8,
-          requested_risk  float8      NOT NULL,
-          granted_risk    float8      NOT NULL,
-          reject_reason   text
-      );
-      CREATE INDEX IF NOT EXISTS allocator_decisions_at ON allocator_decisions (run_id, portfolio, at)"),
-    // The allocator portfolios' positions closed, and their generation (`alloc::GENERATION`:
-    // the portfolios started again) on both.
-    ("2026-10-12-allocator-trades",
-     "ALTER TABLE allocator_decisions ADD COLUMN IF NOT EXISTS generation integer;
-      CREATE TABLE IF NOT EXISTS allocator_trades (
-          id          bigserial   PRIMARY KEY,
-          run_id      text        NOT NULL,
-          generation  integer     NOT NULL,
-          portfolio   text        NOT NULL,
-          trader      text        NOT NULL,
-          coin        text        NOT NULL,
-          side        text        NOT NULL,
-          opened_at   timestamptz NOT NULL,
-          closed_at   timestamptz NOT NULL,
-          held_h      float8      NOT NULL,
-          entry_px    float8      NOT NULL,
-          exit_px     float8      NOT NULL,
-          risk        float8      NOT NULL,
-          risk_usd    float8      NOT NULL,
-          notional    float8      NOT NULL,
-          pnl         float8      NOT NULL,
-          fees        float8      NOT NULL,
-          r           float8      NOT NULL,
-          reason      text        NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS allocator_trades_closed ON allocator_trades (generation, portfolio, closed_at)"),
-    // The backtest's statistics over time, for the allocator's scores over time.
-    ("2026-10-13-backtest-stats-time", include_str!("backtest_stats_time.sql")),
-    // The allocator's grid (generation 4): each portfolio's status an hour (too many for
-    // bot_status), and how far a position grew with the trader's adds.
-    ("2026-10-13-allocator-status",
-     "ALTER TABLE allocator_trades ADD COLUMN IF NOT EXISTS max_x float8;
-      CREATE TABLE IF NOT EXISTS allocator_status (
-          id             bigserial   PRIMARY KEY,
-          run_id         text        NOT NULL,
-          generation     integer     NOT NULL,
-          at             timestamptz NOT NULL,
-          portfolio      text        NOT NULL,
-          equity         float8      NOT NULL,
-          return_pct     float8      NOT NULL,
-          open_risk_pct  float8      NOT NULL,
-          long_risk_pct  float8      NOT NULL,
-          legs           integer     NOT NULL,
-          entries        bigint      NOT NULL,
-          refused        bigint      NOT NULL,
-          stops          bigint      NOT NULL,
-          not_picked     bigint      NOT NULL,
-          fees           float8      NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS allocator_status_at ON allocator_status (generation, portfolio, at)"),
-    // The rolling backtest (`rollstats`): each trader's fills (gzip JSON, its window and a
-    // margin), and the statistics of each day's 90-day window.
-    ("2026-10-16-rollstats",
-     "CREATE TABLE IF NOT EXISTS trader_fills (
-          address     text        PRIMARY KEY,
-          fills       bytea       NOT NULL,
-          fetched_to  bigint,
-          updated_at  timestamptz NOT NULL DEFAULT now()
-      );
-      CREATE TABLE IF NOT EXISTS backtest_stats_daily (
-          day         date    NOT NULL,
-          address     text    NOT NULL,
-          trips       integer NOT NULL,
-          pnl         float8  NOT NULL,
-          win_usd     float8  NOT NULL,
-          loss_usd    float8  NOT NULL,
-          max_dd_pct  float8  NOT NULL,
-          pnl_sq      float8  NOT NULL,
-          slip_bps    float8  NOT NULL,
-          coins       jsonb   NOT NULL,
-          sharpe_d    float8,
-          sortino_d   float8,
-          calmar      float8,
-          pnl_30d     float8,
-          weeks_pos   float8,
-          weeks       integer,
-          PRIMARY KEY (day, address)
-      )"),
-    // The breaker's entries refused (`_BRK`), in each portfolio's status: without the column
-    // the row failed, and the writer, retrying its whole batch, wrote nothing after it
-    // (2026-10-16 21:17-22:50).
-    ("2026-10-16-allocator-braked", "ALTER TABLE allocator_status ADD COLUMN IF NOT EXISTS braked bigint"),
-];
+const MIGRATIONS: &[(&str, &str)] = &[];
 
 async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
     client.batch_execute(SCHEMA).await.context("creating tables")?;
@@ -520,114 +119,6 @@ async fn migrate(client: &tokio_postgres::Client) -> Result<()> {
                 let _ = client.batch_execute("ROLLBACK").await;
                 return Err(e).with_context(|| format!("migration {name}"));
             }
-        }
-    }
-    Ok(())
-}
-
-/// The backtest's picks (`backtest_picks`; `backtest_picks.json`, a list of addresses, without a
-/// database): copied on paper whatever the lists say.
-pub async fn load_picks(cfg: &Config) -> Result<std::collections::HashSet<String>> {
-    Ok(match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            migrate(&client).await?;
-            client.query("SELECT address FROM backtest_picks", &[]).await?.into_iter().map(|r| r.get::<_, String>(0).to_lowercase()).collect()
-        }
-        None => std::fs::read_to_string(cfg.data_dir.join("backtest_picks.json")).ok()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()).unwrap_or_default().into_iter().map(|a| a.to_lowercase()).collect(),
-    })
-}
-
-/// The day of the latest rolling statistics (`backtest_stats_daily`), unix s; None: none yet.
-/// The latest day of `backtest_stats_daily` (unix s) and its number of rows: a change means
-/// new statistics to load (the archive pick, written from outside, adds a day's rows).
-pub async fn stats_mark(cfg: &Config) -> Result<Option<(f64, i64)>> {
-    let Some(url) = &cfg.database_url else { return Ok(None) };
-    let client = pg_connect(url).await?;
-    let row = client.query_one(
-        "SELECT extract(epoch FROM d)::float8, (SELECT count(*) FROM backtest_stats_daily WHERE day = d) FROM (SELECT max(day) AS d FROM backtest_stats_daily) m",
-        &[]).await?;
-    let day: Option<f64> = row.get(0);
-    Ok(day.map(|d| (d, row.get(1))))
-}
-
-pub async fn stats_day(cfg: &Config) -> Result<Option<f64>> {
-    let Some(url) = &cfg.database_url else { return Ok(None) };
-    let client = pg_connect(url).await?;
-    migrate(&client).await?;
-    let row = client.query_one("SELECT extract(epoch FROM max(day))::float8 FROM backtest_stats_daily", &[]).await?;
-    Ok(row.get(0))
-}
-
-/// The backtest's statistics: the latest day's of the rolling backtest (`backtest_stats_daily`),
-/// else the original one's (`backtest_stats`; `backtest_stats.json` without a database:
-/// address -> {trips, pnl, win_usd, loss_usd, max_dd_pct, pnl_sq, slip_bps, coins, sharpe_d,
-/// sortino_d, calmar, pnl_30d, weeks_pos, weeks}).
-pub async fn load_backtest_stats(cfg: &Config) -> Result<HashMap<String, crate::alloc::TraderStats>> {
-    let rows: Vec<(String, Value)> = match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            migrate(&client).await?;
-            let cols = "address, json_build_object('trips', trips, 'pnl', pnl, 'win_usd', win_usd, 'loss_usd', loss_usd,
-                'max_dd_pct', max_dd_pct, 'pnl_sq', pnl_sq, 'slip_bps', slip_bps, 'coins', coins, 'sharpe_d', sharpe_d, 'sortino_d', sortino_d,
-                'calmar', calmar, 'pnl_30d', pnl_30d, 'weeks_pos', weeks_pos, 'weeks', weeks)::text";
-            let day: Option<String> = client.query_one("SELECT max(day)::text FROM backtest_stats_daily", &[]).await?.get(0);
-            let q = match &day {
-                Some(d) => format!("SELECT {cols} FROM backtest_stats_daily WHERE day = '{d}'"),
-                None => format!("SELECT {cols} FROM backtest_stats"),
-            };
-            let rows: Vec<(String, Value)> = client.query(&q, &[]).await?
-                .into_iter().filter_map(|r| Some((r.get::<_, String>(0).to_lowercase(), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect();
-            log!("backtest statistics: {} traders, {}", rows.len(), day.map(|d| format!("the rolling backtest's of {d}")).unwrap_or("the original backtest's".into()));
-            rows
-        }
-        None => std::fs::read_to_string(cfg.data_dir.join("backtest_stats.json")).ok()
-            .and_then(|s| serde_json::from_str::<HashMap<String, Value>>(&s).ok()).unwrap_or_default().into_iter().collect(),
-    };
-    Ok(rows.into_iter().map(|(a, v)| {
-        let n = |k: &str| v[k].as_f64().unwrap_or(0.0);
-        let trips = v["trips"].as_u64().unwrap_or(0);
-        let mut s = crate::alloc::TraderStats::from_trips(&a, "backtest", trips, 0, n("win_usd"), n("loss_usd"), n("pnl_sq"), n("max_dd_pct"), n("slip_bps"));
-        s.pnl_net = n("pnl");
-        (s.sharpe, s.sortino, s.calmar, s.weeks_pos) = (n("sharpe_d"), n("sortino_d"), n("calmar"), n("weeks_pos"));
-        s.pnl_30d = v["pnl_30d"].as_f64();
-        s.weeks = v["weeks"].as_u64().unwrap_or(0) as u32;
-        s.coins = v["coins"].as_object().map(|o| o.iter().map(|(c, x)| (c.clone(), x.as_u64().unwrap_or(0) as u32)).collect()).unwrap_or_default();
-        (a, s)
-    }).collect())
-}
-
-/// The day's list of followed traders saved by this run, if any.
-pub async fn load_selection(cfg: &Config) -> Result<Option<Selection>> {
-    let s = match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            migrate(&client).await?;
-            client.query_opt("SELECT state::text FROM selection WHERE run_id = $1", &[&cfg.run_id]).await?.map(|r| r.get::<_, String>(0))
-        }
-        None => std::fs::read_to_string(cfg.data_dir.join("selection.json")).ok(),
-    };
-    Ok(s.and_then(|s| serde_json::from_str(&s).ok()))
-}
-
-/// Saves the day's list (once a day: written at once, not through the writer).
-pub async fn save_selection(cfg: &Config, sel: &Selection) -> Result<()> {
-    let s = serde_json::to_string(sel)?;
-    match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            client.execute(
-                "INSERT INTO selection (run_id, state, updated_at) VALUES ($1, $2::text::jsonb, now())
-                 ON CONFLICT (run_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
-                &[&cfg.run_id, &s],
-            ).await?;
-        }
-        None => {
-            std::fs::create_dir_all(&cfg.data_dir)?;
-            let (path, tmp) = (cfg.data_dir.join("selection.json"), cfg.data_dir.join("selection.tmp"));
-            std::fs::write(&tmp, s)?;
-            std::fs::rename(&tmp, &path)?;
         }
     }
     Ok(())
@@ -663,28 +154,6 @@ pub async fn save_doc(cfg: &Config, name: &str, state: &Value) -> Result<()> {
             let (path, tmp) = (cfg.data_dir.join(format!("{name}.json")), cfg.data_dir.join(format!("{name}.tmp")));
             std::fs::write(&tmp, s)?;
             std::fs::rename(&tmp, &path)?;
-        }
-    }
-    Ok(())
-}
-
-/// Records a live health check (`live_checks`; `live_checks.jsonl` without a database).
-pub async fn save_live_check(cfg: &Config, rec: &Value) -> Result<()> {
-    match &cfg.database_url {
-        Some(url) => {
-            let client = pg_connect(url).await?;
-            client.execute(
-                "INSERT INTO live_checks (run_id, net, account, ok, coin, size, open_px, close_px, fee, pnl, equity, took_ms, error)
-                 SELECT $1, r.net, r.account, r.ok, r.coin, r.size, r.open_px, r.close_px, r.fee, r.pnl, r.equity, r.took_ms, r.error
-                 FROM jsonb_to_record($2::text::jsonb) AS r(net text, account text, ok boolean, coin text, size float8, open_px float8,
-                      close_px float8, fee float8, pnl float8, equity float8, took_ms int4, error text)",
-                &[&cfg.run_id, &rec.to_string()],
-            ).await?;
-        }
-        None => {
-            std::fs::create_dir_all(&cfg.data_dir)?;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(cfg.data_dir.join("live_checks.jsonl"))?;
-            writeln!(f, "{rec}")?;
         }
     }
     Ok(())
@@ -726,50 +195,18 @@ async fn pg_connect_now(url: &str) -> Result<tokio_postgres::Client> {
     Ok(client)
 }
 
-fn hash(s: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
-
-async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut rx: mpsc::UnboundedReceiver<Value>) {
     let mut client = Some(client);
     let mut events: Vec<Value> = Vec::new();
-    // Accounts waiting to be written (latest snapshot of each), and what was last written.
-    let mut pending: HashMap<String, Row> = HashMap::new();
-    let mut written: HashMap<String, u64> = HashMap::new();
-    let mut statuses: Vec<Value> = Vec::new();
-    let mut inserts: Vec<(&'static str, Value)> = Vec::new();
-    let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut open = true;
-    while open || !events.is_empty() || !pending.is_empty() || !statuses.is_empty() || !inserts.is_empty() || !waiting.is_empty() {
-        // Gather until the next tick (or a flush, a big batch, or the end), then write.
+    while open || !events.is_empty() {
+        // Gather until the next tick (or a big batch, or the end), then write.
         let due = tokio::select! {
-            cmd = rx.recv(), if open => match cmd {
-                Some(Cmd::Event(ev)) => {
+            ev = rx.recv(), if open => match ev {
+                Some(ev) => {
                     events.push(ev);
                     events.len() >= 1000
-                }
-                Some(Cmd::Save(rows)) => {
-                    for r in rows {
-                        if written.get(&r.address) != Some(&hash(&r.state)) {
-                            pending.insert(r.address.clone(), r);
-                        }
-                    }
-                    false
-                }
-                Some(Cmd::Status(s)) => {
-                    statuses.push(s);
-                    false
-                }
-                Some(Cmd::Insert(table, row)) => {
-                    inserts.push((table, row));
-                    false
-                }
-                Some(Cmd::Flush(done)) => {
-                    waiting.push(done);
-                    true
                 }
                 None => {
                     open = false;
@@ -778,7 +215,7 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
             },
             _ = tick.tick() => true,
         };
-        if !due || (events.is_empty() && pending.is_empty() && statuses.is_empty() && inserts.is_empty() && waiting.is_empty()) {
+        if !due || events.is_empty() {
             continue;
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
@@ -788,7 +225,7 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
                     Some(c)
                 }
                 Err(e) => {
-                    log!("store: postgres unavailable ({e:#}), {} events, {} accounts waiting", events.len(), pending.len());
+                    log!("store: postgres unavailable ({e:#}), {} events waiting", events.len());
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
@@ -798,22 +235,12 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
         // A connection gone quiet (dropped on the way, not closed) would hang the write for good:
         // given up after WRITE_TIMEOUT, the connection dropped (the server rolls the batch back),
         // and written again on a new one.
-        let res = match tokio::time::timeout(WRITE_TIMEOUT, write(c, &run, &events, &pending, &statuses, &inserts)).await {
+        let res = match tokio::time::timeout(WRITE_TIMEOUT, write_events(c, &run, &events)).await {
             Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!("no answer in {} s", WRITE_TIMEOUT.as_secs())),
         };
         match res {
-            Ok(()) => {
-                events.clear();
-                statuses.clear();
-                inserts.clear();
-                for (a, r) in pending.drain() {
-                    written.insert(a, hash(&r.state));
-                }
-                for done in waiting.drain(..) {
-                    let _ = done.send(());
-                }
-            }
+            Ok(()) => events.clear(),
             Err(e) => {
                 log!("store: postgres write failed ({e:#}), retrying");
                 client = None;
@@ -823,94 +250,20 @@ async fn pg_writer(url: String, run: String, client: tokio_postgres::Client, mut
     }
 }
 
-/// A batch in one transaction: all of it or none (a batch half written and retried wrote its
-/// first tables again: 436 217 copies of decision rows on 2026-10-16).
-async fn write(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
-               inserts: &[(&'static str, Value)]) -> Result<()> {
-    c.batch_execute("BEGIN").await.context("beginning a batch")?;
-    match write_batch(c, run, events, accounts, statuses, inserts).await {
-        Ok(()) => c.batch_execute("COMMIT").await.context("committing a batch"),
-        Err(e) => {
-            let _ = c.batch_execute("ROLLBACK").await;
-            Err(e)
-        }
-    }
-}
-
-async fn write_batch(c: &tokio_postgres::Client, run: &str, events: &[Value], accounts: &HashMap<String, Row>, statuses: &[Value],
-               inserts: &[(&'static str, Value)]) -> Result<()> {
-    // One statement a table (a row a round trip fell behind a burst of entries).
-    let mut tables: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
-    for (table, row) in inserts {
-        let mut row = row.clone();
-        row["run_id"] = Value::String(run.to_string());
-        tables.entry(table).or_default().push(row);
-    }
-    for (table, rows) in tables {
-        // The columns are the rows' keys (ours, not outside input), each converted by the
-        // table's own type for it; a key a row lacks is null in it.
-        let cols: BTreeSet<&String> = rows.iter().filter_map(Value::as_object).flat_map(|o| o.keys()).collect();
-        let cols = cols.into_iter().map(String::as_str).collect::<Vec<_>>().join(", ");
-        c.execute(&format!("INSERT INTO {table} ({cols}) SELECT {cols} FROM jsonb_populate_recordset(NULL::{table}, $1::text::jsonb)"),
-            &[&Value::Array(rows).to_string()]).await.with_context(|| format!("inserting into {table}"))?;
-    }
-    if !statuses.is_empty() {
-        let rows = serde_json::to_string(statuses)?;
-        c.execute(
-            "INSERT INTO bot_status (run_id, at, copy_accounts, followed, open_positions, api_weight, api_backlog_s, tick_avg_ms,
-                 tick_max_ms, data)
-             SELECT $1, to_timestamp(r.at), r.copy_accounts, r.followed, r.open_positions, r.api_weight, r.api_backlog_s, r.tick_avg_ms,
-                 r.tick_max_ms, d
-             FROM jsonb_array_elements($2::text::jsonb) AS d,
-                  jsonb_to_record(d) AS r(at float8, copy_accounts int4, followed int4, open_positions int4, api_weight int4,
-                      api_backlog_s float8, tick_avg_ms float8, tick_max_ms float8)
-             ON CONFLICT DO NOTHING",
-            &[&run, &rows],
-        )
-        .await
-        .context("saving status")?;
-    }
-    if !events.is_empty() {
-        let at: Vec<f64> = events.iter().map(|e| e["at"].as_f64().unwrap_or(0.0)).collect();
-        let kind: Vec<String> = events.iter().map(|e| e["kind"].as_str().unwrap_or("").to_string()).collect();
-        let address: Vec<Option<String>> = events.iter().map(|e| e["user"].as_str().map(str::to_string)).collect();
-        let coin: Vec<Option<String>> = events.iter().map(|e| e["coin"].as_str().map(str::to_string)).collect();
-        let data: Vec<String> = events.iter().map(|e| e.to_string()).collect();
-        c.execute(
-            "INSERT INTO events (run_id, at, kind, address, coin, data)
-             SELECT $1, to_timestamp(e.at), e.kind, e.address, e.coin, e.data::jsonb
-             FROM unnest($2::float8[], $3::text[], $4::text[], $5::text[], $6::text[]) AS e(at, kind, address, coin, data)",
-            &[&run, &at, &kind, &address, &coin, &data],
-        )
-        .await
-        .context("inserting events")?;
-    }
-    if !accounts.is_empty() {
-        let rows: Vec<&Row> = accounts.values().collect();
-        let address: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
-        let name: Vec<Option<&str>> = rows.iter().map(|r| r.name.as_deref()).collect();
-        let equity: Vec<f64> = rows.iter().map(|r| r.equity).collect();
-        let roi: Vec<f64> = rows.iter().map(|r| r.roi_pct).collect();
-        let fills: Vec<i64> = rows.iter().map(|r| r.copy_fills).collect();
-        let open: Vec<i32> = rows.iter().map(|r| r.open_positions).collect();
-        let liq: Vec<bool> = rows.iter().map(|r| r.liquidated).collect();
-        let golden: Vec<bool> = rows.iter().map(|r| r.golden).collect();
-        let measured: Vec<f64> = rows.iter().map(|r| r.measured_pnl).collect();
-        let state: Vec<&str> = rows.iter().map(|r| r.state.as_str()).collect();
-        c.execute(
-            "INSERT INTO copy_accounts (run_id, address, name, equity, roi_pct, copy_fills, open_positions, liquidated, golden, measured_pnl,
-                                        state, updated_at)
-             SELECT $1, a.address, a.name, a.equity, a.roi, a.fills, a.open, a.liq, a.golden, a.measured, a.state::jsonb, now()
-             FROM unnest($2::text[], $3::text[], $4::float8[], $5::float8[], $6::int8[], $7::int4[], $8::bool[], $9::bool[], $10::float8[],
-                         $11::text[])
-                  AS a(address, name, equity, roi, fills, open, liq, golden, measured, state)
-             ON CONFLICT (run_id, address) DO UPDATE SET name = excluded.name, equity = excluded.equity, roi_pct = excluded.roi_pct,
-                 copy_fills = excluded.copy_fills, open_positions = excluded.open_positions, liquidated = excluded.liquidated,
-                 golden = excluded.golden, measured_pnl = excluded.measured_pnl, state = excluded.state, updated_at = excluded.updated_at",
-            &[&run, &address, &name, &equity, &roi, &fills, &open, &liq, &golden, &measured, &state],
-        )
-        .await
-        .context("saving copy accounts")?;
-    }
+/// The events in one statement (all of them or none).
+async fn write_events(c: &tokio_postgres::Client, run: &str, events: &[Value]) -> Result<()> {
+    let at: Vec<f64> = events.iter().map(|e| e["at"].as_f64().unwrap_or(0.0)).collect();
+    let kind: Vec<String> = events.iter().map(|e| e["kind"].as_str().unwrap_or("").to_string()).collect();
+    let address: Vec<Option<String>> = events.iter().map(|e| e["user"].as_str().map(str::to_string)).collect();
+    let coin: Vec<Option<String>> = events.iter().map(|e| e["coin"].as_str().map(str::to_string)).collect();
+    let data: Vec<String> = events.iter().map(|e| e.to_string()).collect();
+    c.execute(
+        "INSERT INTO events (run_id, at, kind, address, coin, data)
+         SELECT $1, to_timestamp(e.at), e.kind, e.address, e.coin, e.data::jsonb
+         FROM unnest($2::float8[], $3::text[], $4::text[], $5::text[], $6::text[]) AS e(at, kind, address, coin, data)",
+        &[&run, &at, &kind, &address, &coin, &data],
+    )
+    .await
+    .context("inserting events")?;
     Ok(())
 }

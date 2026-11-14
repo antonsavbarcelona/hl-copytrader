@@ -1,10 +1,10 @@
 #!/bin/sh
-# Container entry point: the paper run, kept in Postgres (or files when there is none).
+# Container entry point: the bot, its events and states kept in Postgres (or files when there is none).
 #   DATABASE_URL  Postgres to keep the run in (tables created on first start); else files:
-#   DATA_DIR      where state.json / events.jsonl live (default: Railway's volume, else /data)
+#   DATA_DIR      where the states / events.jsonl live (default: Railway's volume, else /data)
 #   RUN_ID        name of this run in the database (default main)
 #   API_WEIGHT    info API weight per minute (default 800: alone on its IP, of 1200)
-#   EXTRA_ARGS    more `run` options, e.g. "--start 2000"
+#   EXTRA_ARGS    more `run` options, e.g. "--run test"
 set -e
 DATA="${DATA_DIR:-${RAILWAY_VOLUME_MOUNT_PATH:-/data}}"
 if [ -z "$DATABASE_URL" ] && [ -n "$RAILWAY_ENVIRONMENT" ] && [ -z "$RAILWAY_VOLUME_MOUNT_PATH" ] && [ -z "$DATA_DIR" ]; then

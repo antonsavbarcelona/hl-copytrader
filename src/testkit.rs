@@ -4,7 +4,7 @@
 //! filled at the mid, reduce-only clipped to the position, positions and their fills. Faults on demand:
 //! an order's status that lags (stale "open" for N reads), the cross leverage refused (a HIP-3 coin kept
 //! isolated), stops refused, IOC orders that only match beyond a slippage, a margin refusal.
-//! The bot's own code (`live::Venue`, `trades::*`) runs against it unchanged: `Exchange::new(base, key)`.
+//! The bot's own code (`venue::Venue`, `trades::*`) runs against it unchanged: `Exchange::new(base, key)`.
 #![cfg(test)]
 
 use std::collections::{HashMap, HashSet};
@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::exchange::Exchange;
-use crate::live::Venue;
+use crate::venue::Venue;
 
 /// A throwaway key (no account behind it): the fake does not check signatures.
 pub(crate) const KEY: &str = "0123456789012345678901234567890123456789012345678901234567890123";
@@ -394,7 +394,7 @@ impl FakeHl {
         FakeHl { st, base }
     }
 
-    /// A venue on the fake: the main-dex and HIP-3 coins as `live::venue_from_env` and `with_hip3` read them.
+    /// A venue on the fake: the main-dex and HIP-3 coins as `venue::venue_from_env` and `with_hip3` read them.
     pub(crate) fn venue(&self) -> Venue {
         let ex = Exchange::new(&self.base, KEY).unwrap();
         let s = self.st.lock().unwrap();

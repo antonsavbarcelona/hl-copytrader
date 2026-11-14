@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::api::{now, num};
 use crate::config::Config;
-use crate::live::Venue;
+use crate::venue::Venue;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -207,7 +207,7 @@ impl Listing {
         if self.state.open.is_empty() {
             return;
         }
-        let held = match crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
             Ok((eq, p)) => {
                 trades::set_equity(eq);
                 Some(p)
@@ -258,7 +258,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         log!("listing: off (LIST_ENABLED=0)");
         return Ok(());
     }
-    let Some((venue, unified)) = crate::live::venue_from_env(None).await? else {
+    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
         log!("listing: LIVE_KEY / LIVE_ACCOUNT not set, off");
         return Ok(());
     };

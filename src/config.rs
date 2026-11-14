@@ -1,30 +1,10 @@
-//! Run settings.
+//! Run settings: where the run lives and the info API's budget. The strategies' own settings live in their modules.
 
 use std::path::PathBuf;
-
-/// Hyperliquid taker fee (base tier).
-pub const TAKER_FEE: f64 = 0.00045;
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
-    /// Each followed account gets its own copy account starting with this much.
-    pub start_usd: f64,
-    /// Our order lands this long after the account's fill reaches us.
-    pub exec_delay_ms: u64,
-    /// Hyperliquid taker fee (base tier).
-    pub taker_fee: f64,
-    /// Exchange minimum order value (closing a position is always allowed).
-    pub min_order_usd: f64,
-    /// Each position of a trader we enter risks this much of our equity (%) to our stop...
-    pub risk_pct: f64,
-    /// ... which is this far against our average entry (%).
-    pub stop_pct: f64,
-    /// The live account (`live`) enters no new leg while it holds this many (the paper copies
-    /// have no such cap: each is its own account).
-    pub max_positions: usize,
-    /// An active account's positions are read again this often (drift correction).
-    pub reconcile_s: f64,
     /// Info API weight per minute this process may use (1200 per IP in total).
     pub weight_per_min: f64,
     /// Postgres to keep the run in (env `DATABASE_URL`); files in `data_dir` without it.
@@ -37,14 +17,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("data"),
-            start_usd: 1000.0,
-            exec_delay_ms: 0,
-            taker_fee: TAKER_FEE,
-            min_order_usd: 10.0,
-            risk_pct: 2.0,
-            stop_pct: 20.0,
-            max_positions: 50,
-            reconcile_s: 2.0 * 3600.0,
             weight_per_min: 400.0,
             database_url: std::env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()),
             run_id: std::env::var("RUN_ID").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "main".into()),
@@ -53,6 +25,8 @@ impl Default for Config {
 }
 
 impl Config {
+    /// `--data DIR`, `--weight N`, `--run NAME`; any other option (with its value) is left out and returned (the copy
+    /// trading's `--start`, `--risk`, ... may still sit in a deploy's `EXTRA_ARGS`: not an error).
     pub fn from_args(args: &[String]) -> anyhow::Result<(Self, Vec<String>)> {
         let mut c = Self::default();
         let mut rest = Vec::new();
@@ -61,11 +35,6 @@ impl Config {
             let v = || args.get(i + 1).cloned().ok_or_else(|| anyhow::anyhow!("{} needs a value", args[i]));
             match args[i].as_str() {
                 "--data" => c.data_dir = PathBuf::from(v()?),
-                "--start" => c.start_usd = v()?.parse()?,
-                "--risk" => c.risk_pct = v()?.parse()?,
-                "--stop" => c.stop_pct = v()?.parse()?,
-                "--max-positions" => c.max_positions = v()?.parse()?,
-                "--delay-ms" => c.exec_delay_ms = v()?.parse()?,
                 "--weight" => c.weight_per_min = v()?.parse()?,
                 "--run" => c.run_id = v()?,
                 _ => {
@@ -78,5 +47,25 @@ impl Config {
             i += 2;
         }
         Ok((c, rest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn the_run_options_and_the_rest_left_out() {
+        let (c, rest) = Config::from_args(&args("--data /d --weight 800 --run x --start 2000")).unwrap();
+        assert_eq!((c.data_dir, c.weight_per_min, c.run_id.as_str()), (PathBuf::from("/d"), 800.0, "x"));
+        assert_eq!(rest, args("--start 2000"));
+        let (d, rest) = Config::from_args(&[]).unwrap();
+        assert!(rest.is_empty() && d.weight_per_min == 400.0 && d.data_dir == PathBuf::from("data"));
+        assert!(Config::from_args(&args("--weight")).is_err());
+        assert!(Config::from_args(&args("--weight lots")).is_err());
     }
 }

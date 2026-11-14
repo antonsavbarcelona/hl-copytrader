@@ -7,7 +7,7 @@
 | Layer | Where | What it proves |
 |---|---|---|
 | Unit | `#[cfg(test)] mod` in each module | pure rules: signals, sizes, rounding, the family registry, hours, reply parsing |
-| End-to-end | `src/e2e_tests.rs` on `src/testkit.rs` | the bot's real order code (`live::Venue`, `trades::*`, the wick's cancel settlement) over real HTTP and real signing against a fake Hyperliquid |
+| End-to-end | `src/e2e_tests.rs` on `src/testkit.rs` | the bot's real order code (`venue::Venue`, `trades::*`, the wick's cancel settlement) over real HTTP and real signing against a fake Hyperliquid |
 
 ### The fake Hyperliquid (`testkit::FakeHl`)
 

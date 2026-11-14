@@ -122,7 +122,7 @@ use serde_json::{Value, json};
 use crate::api::{Api, now, num};
 use crate::config::Config;
 use crate::dip::Closes;
-use crate::live::{Placed, Venue};
+use crate::venue::{Placed, Venue};
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -1001,11 +1001,11 @@ impl Wick {
             return;
         }
         let mut pos: HashMap<String, f64> = HashMap::new();
-        match crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+        match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
             Ok((_, p)) => pos.extend(p),
             Err(e) => log!("wick: the positions not read for the orphan check: {e:#}"),
         }
-        for d in crate::live::usdc_dexes(&self.venue.ex).await {
+        for d in crate::venue::usdc_dexes(&self.venue.ex).await {
             match self.venue.dex_positions(&d).await {
                 Ok(p) => pos.extend(p),
                 Err(e) => log!("wick: {d} positions not read for the orphan check: {e:#}"),
@@ -1073,7 +1073,7 @@ impl Wick {
             }
         }
         v.sort_by(|a, b| a.0.total_cmp(&b.0));
-        crate::live::set_release(v.into_iter().map(|(_, c, o, m)| (c, o, m)).collect());
+        crate::venue::set_release(v.into_iter().map(|(_, c, o, m)| (c, o, m)).collect());
     }
 
     /// The margin the account's open positions hold (all strategies'), by the model: notional / the coin's leverage.
@@ -1129,7 +1129,7 @@ impl Wick {
     /// A bid moved to `lvl` in one request (`Venue::modify`): only an order still open with nothing filled (a fill in
     /// part goes the cancel's way, settled as a trade); None: not moved (the caller cancels and places).
     async fn try_move(&mut self, c: &str, b: &Bid, rung: usize, lvl: f64, size: f64) -> Option<u64> {
-        if !crate::live::modify_on() {
+        if !crate::venue::modify_on() {
             return None;
         }
         match self.venue.filled(b.oid).await {
@@ -1199,9 +1199,9 @@ impl Wick {
             }
         }
         for (c, (lvl, pct, shut)) in want {
-            // no requests to spare (`live::RATE_RESERVE`): nothing placed or moved; a bid its level left
+            // no requests to spare (`venue::RATE_RESERVE`): nothing placed or moved; a bid its level left
             // behind (the level past it: the MRNA case) only cancelled; one the level moved away from stays
-            let spend = crate::live::wick_may_spend();
+            let spend = crate::venue::wick_may_spend();
             let size = trades::size_for(rung_risk(&c, rung, shut, self.p.risk_usd), self.p.rung_exits(&c, rung, shut, pct).1, lvl);
             let mut old = None;
             if let Some(b) = self.book(rung).get(&c).cloned() {
@@ -1273,7 +1273,7 @@ impl Wick {
                 // Post-only refused (the price already under the level) or no margin: next time; the margin: the budget
                 // capped at what the orders hold now, for 10 minutes (the market entries keep what is left).
                 Err(e) => {
-                    if crate::live::no_margin(&format!("{e:#}")) {
+                    if crate::venue::no_margin(&format!("{e:#}")) {
                         let held = self.held_margin();
                         if self.cap.is_none_or(|(_, until)| now() >= until) {
                             log!("wick: no margin for {c}: the orders capped at their {held:.2} for 10 minutes");
@@ -1414,7 +1414,7 @@ impl Wick {
                 }
             }
             let pos = if d.is_empty() {
-                crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await.map(|x| {
+                crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await.map(|x| {
                     trades::set_equity(x.0);
                     x.1
                 })
@@ -1528,7 +1528,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         log!("wick: off (WICK_ENABLED=0)");
         return Ok(());
     }
-    let Some((core, unified)) = crate::live::venue_from_env(None).await? else {
+    let Some((core, unified)) = crate::venue::venue_from_env(None).await? else {
         log!("wick: LIVE_KEY / LIVE_ACCOUNT not set, off");
         return Ok(());
     };

@@ -151,9 +151,9 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
     // The live venue with the HIP-3 perps (HIP3_LIVE on unless "0"): without it the signals only.
-    let mut venue: Option<(crate::live::Venue, HashMap<String, u32>)> = None;
+    let mut venue: Option<(crate::venue::Venue, HashMap<String, u32>)> = None;
     if p.live {
-        match crate::live::venue_from_env(None).await {
+        match crate::venue::venue_from_env(None).await {
             Ok(Some((v, _))) => match v.with_hip3().await {
                 Ok(x) => venue = Some(x),
                 Err(e) => log!("hip3: the HIP-3 perps not read, signals only: {e:#}"),

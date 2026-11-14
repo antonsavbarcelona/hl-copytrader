@@ -51,7 +51,7 @@ use serde_json::{Value, json};
 use crate::api::{Api, now};
 use crate::config::Config;
 use crate::dip::Closes;
-use crate::live::{Placed, Venue};
+use crate::venue::{Placed, Venue};
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -340,7 +340,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         return Ok(());
     }
     let p = Params::from_env();
-    let venue = crate::live::venue_from_env(None).await?;
+    let venue = crate::venue::venue_from_env(None).await?;
     let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     for pos in state.open.iter().filter(|x| x.live()) {
         trades::register(&pos.coin, "rsidip", pos.reserve(&p), 1.0);
@@ -459,7 +459,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             if let Some((v, unified)) = &venue {
                 if t - check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
                     check_at = t;
-                    match crate::live::equity_of(&v.ex, &v.account, *unified).await {
+                    match crate::venue::equity_of(&v.ex, &v.account, *unified).await {
                         Ok((eq, held)) => {
                             trades::set_equity(eq);
                             let mut keep = Vec::new();

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::api::now;
 use crate::config::Config;
-use crate::live::Venue;
+use crate::venue::Venue;
 use crate::log;
 use crate::store::Store;
 use crate::trades::{self, Trade};
@@ -138,7 +138,7 @@ impl Expiry {
             if self.state.done.contains(&key) || !self.venue.coins.contains_key(coin) {
                 continue;
             }
-            if let Ok((eq, _)) = crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+            if let Ok((eq, _)) = crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
                 trades::set_equity(eq);
             }
             let risk = trades::risk_usd(self.p.risk_usd);
@@ -175,7 +175,7 @@ impl Expiry {
         if self.state.open.is_empty() {
             return;
         }
-        let held = match crate::live::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
+        let held = match crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await {
             Ok((eq, p)) => {
                 trades::set_equity(eq);
                 Some(p)
@@ -226,7 +226,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         log!("expiry: off (EXP_ENABLED=0)");
         return Ok(());
     }
-    let Some((venue, unified)) = crate::live::venue_from_env(None).await? else {
+    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
         log!("expiry: LIVE_KEY / LIVE_ACCOUNT not set, off");
         return Ok(());
     };

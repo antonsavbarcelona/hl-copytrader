@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::api::now;
-use crate::live::{Placed, Venue};
+use crate::venue::{Placed, Venue};
 
 /// A HIP-3 coin only isolated: at 3 (the liquidation ~30% away, past the 20-25% stops). The cross ones at their max
 /// (2026-11-01; was 10 from 2026-10-28, V77: the bids' margin a third of the isolated 3x's; on cross the liquidation is

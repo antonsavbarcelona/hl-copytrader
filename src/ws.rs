@@ -18,21 +18,6 @@ use crate::log;
 const WS: &str = "wss://api.hyperliquid.xyz/ws";
 const SILENCE_S: u64 = 30;
 
-/// One account's side of a trade.
-#[derive(Clone, Debug)]
-pub struct UserFill {
-    pub user: String,
-    pub coin: String,
-    /// + bought, - sold (signed size).
-    pub delta: f64,
-    pub px: f64,
-    pub time_ms: u64,
-    /// The exchange's trade id (one trade, both its sides).
-    pub tid: u64,
-    /// When it reached us, on the exchange's clock.
-    pub recv: f64,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Book {
     /// (price, size), best first.
@@ -92,52 +77,6 @@ async fn run(name: &str, subs: Vec<Value>, mut on_msg: impl FnMut(&Value)) {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-}
-
-/// Fills of the followed accounts.
-pub async fn run_trades(coins: Vec<String>, followed: Arc<RwLock<HashSet<String>>>, tx: mpsc::UnboundedSender<UserFill>) {
-    let subs = coins.iter().map(|c| json!({"type": "trades", "coin": c})).collect();
-    // A plain lock, held for one message (never across an await).
-    let followed2 = followed.clone();
-    // A (re)subscription first sends recent trades again: per coin, the latest trade time seen
-    // and the trade ids at it drop those already passed on; before any, trades from before we
-    // started are dropped (the positions read at enrolment already hold them).
-    let started_ms = (exchange_now() * 1000.0) as u64;
-    let mut seen: HashMap<String, (u64, HashSet<u64>)> = HashMap::new();
-    run("trades", subs, move |v| {
-        if v["channel"] != "trades" {
-            return;
-        }
-        let Some(list) = v["data"].as_array() else { return };
-        let mut list: Vec<&Value> = list.iter().collect();
-        list.sort_by_key(|t| (t["time"].as_u64().unwrap_or(0), t["tid"].as_u64().unwrap_or(0)));
-        let set = followed2.read().unwrap();
-        let recv = exchange_now();
-        for t in list {
-            let coin = t["coin"].as_str().unwrap_or("").to_string();
-            let (time_ms, tid) = (t["time"].as_u64().unwrap_or(0), t["tid"].as_u64().unwrap_or(0));
-            let (last, ids) = seen.entry(coin.clone()).or_insert_with(|| (started_ms, HashSet::new()));
-            if time_ms < *last || (time_ms == *last && !ids.insert(tid)) {
-                continue;
-            }
-            if time_ms > *last {
-                *last = time_ms;
-                ids.clear();
-                ids.insert(tid);
-            }
-            let users = t["users"].as_array();
-            let (Some(buyer), Some(seller)) = (users.and_then(|u| u.first()).and_then(Value::as_str),
-                                                users.and_then(|u| u.get(1)).and_then(Value::as_str)) else { continue };
-            let (px, sz) = (num(&t["px"]), num(&t["sz"]));
-            for (user, sign) in [(buyer.to_lowercase(), 1.0), (seller.to_lowercase(), -1.0)] {
-                if set.contains(&user) {
-                    let _ = tx.send(UserFill { user, coin: coin.clone(), delta: sign * sz, px, time_ms, tid, recv });
-                }
-            }
-        }
-    })
-    .await;
-    drop(followed);
 }
 
 /// Keeps `books` current for every coin.

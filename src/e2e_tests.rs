@@ -1,4 +1,4 @@
-//! End-to-end: the bot's order code (`live::Venue`, `trades::*`, the wick's cancel settlement) against the fake
+//! End-to-end: the bot's order code (`venue::Venue`, `trades::*`, the wick's cancel settlement) against the fake
 //! Hyperliquid of `testkit`: real HTTP, real signing, the API's reply shapes, the matching faked. Each test has its own
 //! coins (the family registry in `trades` is process-wide).
 
@@ -108,15 +108,15 @@ async fn a_margin_refusal_takes_the_weakest_resting_orders_off_and_tries_once_mo
     let f = FakeHl::start(&[("E2H", 2, 10, 100.0), ("E2H2", 2, 10, 50.0)]).await;
     let v = f.venue();
     let bid = match v.limit("E2H2", 1.0, 45.0, false, "Gtc").await.unwrap() {
-        crate::live::Placed::Resting(o) => o,
+        crate::venue::Placed::Resting(o) => o,
         _ => panic!("the bid should rest"),
     };
-    crate::live::set_release(vec![("E2H2".into(), bid, 1_000.0)]);
+    crate::venue::set_release(vec![("E2H2".into(), bid, 1_000.0)]);
     f.with(|s| s.margin_refusals = 1);
     let (got, _, _) = v.market("E2H", 1.0, false).await.unwrap();
     assert!(close(got, 1.0));
     assert_eq!(f.order(bid).unwrap().status, "canceled");
-    crate::live::set_release(vec![]);
+    crate::venue::set_release(vec![]);
 }
 
 #[tokio::test]
@@ -263,7 +263,7 @@ async fn a_bid_filled_just_before_its_cancel_is_kept_while_its_status_lags_then_
     let v = f.venue();
     f.with(|s| s.lag_next_order = 2); // its status says "open, nothing filled" for two reads
     let oid = match v.limit("xyz:E2R", 1.0, 96.0, false, "Gtc").await.unwrap() {
-        crate::live::Placed::Resting(o) => o,
+        crate::venue::Placed::Resting(o) => o,
         _ => panic!("the bid should rest"),
     };
     f.set_mid("xyz:E2R", 95.0); // filled
@@ -281,7 +281,7 @@ async fn a_bid_cancelled_with_nothing_filled_goes_off_the_book() {
     let f = FakeHl::start(&[("xyz:E2S", 2, 10, 100.0)]).await;
     let v = f.venue();
     let oid = match v.limit("xyz:E2S", 1.0, 96.0, false, "Gtc").await.unwrap() {
-        crate::live::Placed::Resting(o) => o,
+        crate::venue::Placed::Resting(o) => o,
         _ => panic!("the bid should rest"),
     };
     v.cancel("xyz:E2S", oid).await;
@@ -294,7 +294,7 @@ async fn a_bid_filled_in_part_before_its_cancel_is_the_part_traded() {
     let f = FakeHl::start(&[("xyz:E2T", 2, 10, 100.0)]).await;
     let v = f.venue();
     let oid = match v.limit("xyz:E2T", 1.0, 96.0, false, "Gtc").await.unwrap() {
-        crate::live::Placed::Resting(o) => o,
+        crate::venue::Placed::Resting(o) => o,
         _ => panic!("the bid should rest"),
     };
     f.partial_fill(oid, 0.3);
@@ -317,7 +317,7 @@ async fn an_unknown_order_status_is_kept_not_dropped() {
 
 #[test]
 fn a_top_up_only_when_low_bounded_by_the_side_and_the_day() {
-    use crate::live::{RATE_RESERVE, TOPUP_DAY_MAX_USD, TOPUP_SIDE_MAX_USD, TOPUP_TARGET, topup_side_usd};
+    use crate::venue::{RATE_RESERVE, TOPUP_DAY_MAX_USD, TOPUP_SIDE_MAX_USD, TOPUP_TARGET, topup_side_usd};
     assert_eq!(topup_side_usd(RATE_RESERVE, 0.0), None);
     assert_eq!(topup_side_usd(RATE_RESERVE + 500, 0.0), None);
     // 2026-11-10: 1 070 over: to the target, at most one side's max
@@ -338,7 +338,7 @@ async fn a_top_up_never_leaves_a_position_nor_touches_a_coin_in_use() {
 
     // clean: BTC bought, sold back reduce-only, flat
     let f = start().await;
-    let vol = crate::live::topup(&f.venue(), 1000.0).await.unwrap();
+    let vol = crate::venue::topup(&f.venue(), 1000.0).await.unwrap();
     assert!(close(vol, 2000.0), "{vol}");
     assert!(close(f.position("BTC"), 0.0) && close(f.position("ETH"), 0.0));
     assert_eq!(orders(&f), vec![(0, false), (0, true)]);
@@ -347,40 +347,40 @@ async fn a_top_up_never_leaves_a_position_nor_touches_a_coin_in_use() {
     // a strategy's BTC short: ETH used, the short untouched
     let f = start().await;
     f.hand_trade("BTC", -0.01);
-    assert!(close(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
+    assert!(close(crate::venue::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
     assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.0));
     // and a wick bid resting on ETH: nothing traded at all
     let v = f.venue();
     v.limit("ETH", 0.1, 2500.0, false, "Alo").await.unwrap();
     let before = orders(&f).len();
-    assert_eq!(crate::live::topup(&v, 300.0).await.unwrap(), 0.0);
+    assert_eq!(crate::venue::topup(&v, 300.0).await.unwrap(), 0.0);
     assert_eq!(orders(&f).len(), before);
     assert!(close(f.position("BTC"), -0.01) && close(f.position("ETH"), 0.0));
 
     // a strategy's trade on BTC in the registry (its order not yet on the exchange): ETH used
     let f = start().await;
     trades::register("BTC", "test_strategy", 10.0, -1.0);
-    assert!(close(crate::live::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
+    assert!(close(crate::venue::topup(&f.venue(), 300.0).await.unwrap(), 600.0));
     trades::unregister("BTC", "test_strategy");
     assert!(close(f.position("BTC"), 0.0) && close(f.position("ETH"), 0.0));
 
     // the buy's reply lost after it filled: the position read and sold back
     let f = start().await;
     f.with(|s| s.lose_order = 1);
-    assert!(crate::live::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
+    assert!(crate::venue::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
     assert!(close(f.position("BTC"), 0.0), "{}", f.position("BTC"));
 
     // the buy refused outright: nothing open, an error
     let f = start().await;
     f.with(|s| s.ioc_needs = 0.5);
-    assert!(crate::live::topup(&f.venue(), 1000.0).await.is_err());
+    assert!(crate::venue::topup(&f.venue(), 1000.0).await.is_err());
     assert!(close(f.position("BTC"), 0.0));
     assert!(!trades::registered("BTC"));
 
     // the sell's reply lost after it filled: seen flat on the next look, not sold twice
     let f = start().await;
     f.with(|s| s.lose_order = 2);
-    assert!(crate::live::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
+    assert!(crate::venue::topup(&f.venue(), 1000.0).await.unwrap() > 0.0);
     assert!(close(f.position("BTC"), 0.0));
     let sells = orders(&f).iter().filter(|o| o.1).count();
     assert_eq!(sells, 1, "sold once: {:?}", orders(&f));
@@ -392,7 +392,7 @@ async fn a_top_up_never_leaves_a_position_nor_touches_a_coin_in_use() {
 async fn a_bid_moves_in_one_request_to_its_new_price() {
     let f = FakeHl::start(&[("E2Y", 2, 10, 100.0)]).await;
     let v = f.venue();
-    let crate::live::Placed::Resting(old) = v.limit("E2Y", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(old) = v.limit("E2Y", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
     let n = f.with(|s| s.actions.len());
     let new = v.modify("E2Y", old, 1.2, 91.5, "Alo").await.unwrap();
     assert_eq!(f.with(|s| s.actions.len()) - n, 1, "one request");
@@ -403,7 +403,7 @@ async fn a_bid_moves_in_one_request_to_its_new_price() {
     assert_eq!(f.order(old).unwrap().status, "canceled");
 
     // an ask the mirror
-    let crate::live::Placed::Resting(ask) = v.limit("E2Y", -1.0, 108.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(ask) = v.limit("E2Y", -1.0, 108.0, false, "Alo").await.unwrap() else { panic!() };
     let new = v.modify("E2Y", ask, -1.0, 108.5, "Alo").await.unwrap();
     assert!(f.order(new).is_some_and(|o| !o.buy && close(o.px, 108.5)));
 }
@@ -413,7 +413,7 @@ async fn a_move_keeping_its_oid_or_with_a_bare_reply_still_knows_its_order() {
     let f = FakeHl::start(&[("E2Z", 2, 10, 100.0)]).await;
     let v = f.venue();
     f.with(|s| s.modify_keeps_oid = true);
-    let crate::live::Placed::Resting(old) = v.limit("E2Z", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(old) = v.limit("E2Z", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
     assert_eq!(v.modify("E2Z", old, 1.0, 91.0, "Alo").await.unwrap(), old);
     assert!(close(f.order(old).unwrap().px, 91.0));
 
@@ -428,7 +428,7 @@ async fn a_bid_filled_or_crossing_is_not_moved_and_nothing_new_rests() {
     let f = FakeHl::start(&[("E3A", 2, 10, 100.0)]).await;
     let v = f.venue();
     // filled before the move (a wick through it): refused, nothing new placed, the fill stays the bid's
-    let crate::live::Placed::Resting(old) = v.limit("E3A", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(old) = v.limit("E3A", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
     f.set_mid("E3A", 91.0);
     f.set_mid("E3A", 95.0);
     assert!(v.modify("E3A", old, 1.0, 93.0, "Alo").await.is_err());
@@ -437,7 +437,7 @@ async fn a_bid_filled_or_crossing_is_not_moved_and_nothing_new_rests() {
     assert!(close(v.filled(old).await.unwrap().0, 1.0), "the settlement still sees the fill");
 
     // a new price through the book (post-only): refused, the old bid still resting
-    let crate::live::Placed::Resting(b) = v.limit("E3A", 1.0, 90.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(b) = v.limit("E3A", 1.0, 90.0, false, "Alo").await.unwrap() else { panic!() };
     assert!(v.modify("E3A", b, 1.0, 96.0, "Alo").await.is_err());
     let o = f.open_orders("E3A");
     assert!(o.len() == 1 && o[0].oid == b && close(o[0].px, 90.0), "{o:?}");
@@ -449,7 +449,7 @@ async fn a_hip3_bid_moved_with_a_bare_reply_is_found_on_its_own_dex_not_placed_t
     let f = FakeHl::start(&[("xyz:E3B", 2, 10, 100.0)]).await;
     let v = f.venue();
     f.with(|s| s.modify_bare_reply = true);
-    let crate::live::Placed::Resting(old) = v.limit("xyz:E3B", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
+    let crate::venue::Placed::Resting(old) = v.limit("xyz:E3B", 1.0, 92.0, false, "Alo").await.unwrap() else { panic!() };
     let new = v.modify("xyz:E3B", old, 1.0, 91.0, "Alo").await.unwrap();
     let o = f.open_orders("xyz:E3B");
     assert_eq!(o.len(), 1, "{o:?}");

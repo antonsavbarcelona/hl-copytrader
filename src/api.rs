@@ -1,4 +1,4 @@
-//! Hyperliquid's public info API and the official leaderboard. Requests are paced by their
+//! Hyperliquid's public info API. Requests are paced by their
 //! weight (the API allows 1200 weight per minute per IP, shared with anything else running
 //! on this machine).
 
@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 const INFO: &str = "https://api.hyperliquid.xyz/info";
-const LEADERBOARD: &str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
@@ -36,66 +35,17 @@ pub fn num(v: &Value) -> f64 {
 }
 
 #[derive(Clone, Debug)]
-pub struct Leader {
-    pub address: String,
-    pub account_value: f64,
-    pub month_volume: f64,
-    pub month_pnl: f64,
-    /// PnL over the last 7 days.
-    pub week_pnl: f64,
-    pub name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
 pub struct CoinInfo {
     pub name: String,
-    pub sz_decimals: u32,
 }
 
 /// A coin's state on the exchange.
 #[derive(Clone, Debug, Default)]
 pub struct CoinCtx {
-    /// Funding rate (hourly) and mark price.
+    /// Funding rate (hourly).
     pub funding: f64,
-    pub mark: f64,
-    /// Traded in the last 24 h (USD) and open interest (coins).
+    /// Traded in the last 24 h (USD).
     pub day_volume: f64,
-    pub open_interest: f64,
-}
-
-/// How a position of the account is set up on the exchange.
-#[derive(Clone, Debug, Default)]
-pub struct PosSetup {
-    pub entry: f64,
-    /// Leverage setting: isolated or cross, and its value.
-    pub isolated: bool,
-    pub leverage: f64,
-    /// None when the account's margin would never be used up (cross, low leverage).
-    pub liq_px: Option<f64>,
-}
-
-/// A stop or take-profit order resting on the exchange (trigger order).
-#[derive(Clone, Debug)]
-pub struct Trigger {
-    pub coin: String,
-    /// Stop (Stop Market / Stop Limit) rather than take profit.
-    pub stop: bool,
-    /// Sells (closes a long).
-    pub sell: bool,
-    pub trigger_px: f64,
-    /// None = the whole position (a position TP/SL).
-    pub size: Option<f64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct AccountState {
-    /// Perp account value (the leaderboard's accountValue also counts spot and vaults).
-    pub account_value: f64,
-    /// coin -> signed size (main perp dex).
-    pub positions: HashMap<String, f64>,
-    pub setups: HashMap<String, PosSetup>,
-    /// Exchange time of the snapshot, unix ms.
-    pub time_ms: u64,
 }
 
 /// Weight budget per minute, spent evenly.
@@ -116,17 +66,6 @@ impl Api {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(60)).user_agent("hl-copytrader").build()?;
         let per_weight = Duration::from_secs_f64(60.0 / weight_per_min.max(1.0));
         Ok(Self { http, pacer: Arc::new(Mutex::new(Pacer { per_weight, next: Instant::now() })), used: Default::default() })
-    }
-
-    /// Weight spent since the last call, and how far ahead the requests are booked (s): a
-    /// backlog that keeps growing means the budget is too small for what is read.
-    pub fn usage(&self) -> (u64, f64) {
-        (self.used.swap(0, Ordering::Relaxed), self.backlog())
-    }
-
-    /// How far behind the budget is (s): requests queued for that long.
-    pub fn backlog(&self) -> f64 {
-        self.pacer.try_lock().map(|p| p.next.saturating_duration_since(Instant::now()).as_secs_f64()).unwrap_or(0.0)
     }
 
     async fn pace(&self, weight: u32) {
@@ -169,11 +108,11 @@ impl Api {
             let name = u["name"].as_str().unwrap_or("").to_string();
             if let Some(c) = ctxs.get(i) {
                 ctx.insert(name.clone(), CoinCtx {
-                    funding: num(&c["funding"]), mark: num(&c["markPx"]), day_volume: num(&c["dayNtlVlm"]), open_interest: num(&c["openInterest"]),
+                    funding: num(&c["funding"]), day_volume: num(&c["dayNtlVlm"]),
                 });
             }
             if !u["isDelisted"].as_bool().unwrap_or(false) {
-                coins.push(CoinInfo { name, sz_decimals: u["szDecimals"].as_u64().unwrap_or(0) as u32 });
+                coins.push(CoinInfo { name });
             }
         }
         Ok((coins, ctx))
@@ -215,59 +154,6 @@ impl Api {
             .filter_map(|(u, c)| Some((u["name"].as_str()?.to_string(), num(&c["dayNtlVlm"])))).collect())
     }
 
-    pub async fn account(&self, user: &str) -> Result<AccountState> {
-        let v = self.info(json!({"type": "clearinghouseState", "user": user}), 2).await?;
-        let mut positions = HashMap::new();
-        let mut setups = HashMap::new();
-        for p in v["assetPositions"].as_array().cloned().unwrap_or_default() {
-            let pos = &p["position"];
-            let szi = num(&pos["szi"]);
-            if szi != 0.0 {
-                let coin = pos["coin"].as_str().unwrap_or("").to_string();
-                positions.insert(coin.clone(), szi);
-                setups.insert(coin, PosSetup {
-                    entry: num(&pos["entryPx"]),
-                    isolated: pos["leverage"]["type"] == "isolated",
-                    leverage: num(&pos["leverage"]["value"]),
-                    liq_px: Some(num(&pos["liquidationPx"])).filter(|&x| x > 0.0),
-                });
-            }
-        }
-        Ok(AccountState {
-            account_value: num(&v["marginSummary"]["accountValue"]),
-            positions,
-            setups,
-            time_ms: v["time"].as_u64().unwrap_or(0),
-        })
-    }
-
-    /// Its latest fills (up to 2000), perp and spot, raw.
-    pub async fn fills(&self, user: &str) -> Result<Vec<Value>> {
-        let v = self.info(json!({"type": "userFills", "user": user}), 20).await?;
-        Ok(v.as_array().cloned().unwrap_or_default())
-    }
-
-    /// Its PnL and account value histories (see `stable::History`).
-    pub async fn portfolio(&self, user: &str) -> Result<crate::stable::History> {
-        let v = self.info(json!({"type": "portfolio", "user": user}), 20).await?;
-        crate::stable::History::from_portfolio(&v).ok_or_else(|| anyhow::anyhow!("portfolio {user}: no perp history"))
-    }
-
-    /// Its resting stop and take-profit orders.
-    pub async fn triggers(&self, user: &str) -> Result<Vec<Trigger>> {
-        let v = self.info(json!({"type": "frontendOpenOrders", "user": user}), 20).await?;
-        Ok(v.as_array().cloned().unwrap_or_default().iter().filter(|o| o["isTrigger"].as_bool().unwrap_or(false)).map(|o| {
-            let size = num(&o["sz"]);
-            Trigger {
-                coin: o["coin"].as_str().unwrap_or("").to_string(),
-                stop: o["orderType"].as_str().unwrap_or("").starts_with("Stop"),
-                sell: o["side"] == "A",
-                trigger_px: num(&o["triggerPx"]),
-                size: if o["isPositionTpsl"].as_bool().unwrap_or(false) || size <= 0.0 { None } else { Some(size) },
-            }
-        }).collect())
-    }
-
     /// Sets the exchange clock offset from a few timed requests (the one with the shortest round
     /// trip, its server time taken as at the middle); returns (offset s, round trip s).
     pub async fn sync_clock(&self) -> Result<(f64, f64)> {
@@ -289,28 +175,4 @@ impl Api {
         Ok((offset, rtt))
     }
 
-    /// Every leaderboard account that traded perps this month.
-    pub async fn leaders(&self) -> Result<Vec<Leader>> {
-        let v: Value = self.http.get(LEADERBOARD).send().await?.json().await?;
-        let mut out = Vec::new();
-        for r in v["leaderboardRows"].as_array().cloned().unwrap_or_default() {
-            let (mut month, mut week_pnl) = ((0.0, 0.0), 0.0);
-            for w in r["windowPerformances"].as_array().cloned().unwrap_or_default() {
-                if w[0] == "month" {
-                    month = (num(&w[1]["vlm"]), num(&w[1]["pnl"]));
-                } else if w[0] == "week" {
-                    week_pnl = num(&w[1]["pnl"]);
-                }
-            }
-            out.push(Leader {
-                address: r["ethAddress"].as_str().unwrap_or("").to_lowercase(),
-                account_value: num(&r["accountValue"]),
-                month_volume: month.0,
-                month_pnl: month.1,
-                week_pnl,
-                name: r["displayName"].as_str().map(str::to_string),
-            });
-        }
-        Ok(out)
-    }
 }

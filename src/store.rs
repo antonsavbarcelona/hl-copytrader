@@ -28,6 +28,23 @@ impl Store {
     pub fn event(&self, ev: Value) {
         let _ = self.tx.send(ev);
     }
+
+    /// A store whose events the test reads back.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Store, mpsc::UnboundedReceiver<Value>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Store { tx }, rx)
+    }
+}
+
+/// The events sent so far.
+#[cfg(test)]
+pub(crate) fn drain(rx: &mut mpsc::UnboundedReceiver<Value>) -> Vec<Value> {
+    let mut v = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        v.push(e);
+    }
+    v
 }
 
 /// Starts the writer for this run.

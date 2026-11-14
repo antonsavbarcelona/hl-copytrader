@@ -559,3 +559,119 @@ mod parity {
         std::fs::write(format!("{dir}/rust_signals.csv"), out).unwrap();
     }
 }
+
+#[cfg(test)]
+mod lifecycle {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg, saved};
+
+    async fn setup(coin: &str) -> (FakeHl, Breakout, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
+        let (store, rx) = Store::for_test();
+        let p = Params::from_env();
+        let states = p.sides.iter().map(|s| (s.kind, State::default())).collect();
+        let b = Breakout { venue: f.venue(), unified: false, cfg: cfg(), store, p, states, bars: HashMap::new(), stepped: 0.0 };
+        (f, b, rx)
+    }
+
+    async fn hold(b: &mut Breakout, kind: &'static str, coin: &str, size: f64) -> Trade {
+        let tr = trades::open_market(&b.venue, coin, size, 0.03, Some(0.09), 48.0 * H).await.unwrap();
+        trades::register(coin, kind, tr.risk(), tr.size);
+        b.states.get_mut(kind).unwrap().open.push(Pos { tr: tr.clone(), risk: tr.risk() });
+        tr
+    }
+
+    #[tokio::test]
+    async fn a_stop_filled_ends_the_trade_told_and_saved() {
+        let (f, mut b, mut rx) = setup("BKA").await;
+        hold(&mut b, "breakout", "BKA", 1.0).await;
+        f.set_mid("BKA", 96.0);
+        b.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        let e = &ev[0];
+        assert_eq!((e["kind"].as_str(), e["what"].as_str(), e["why"].as_str(), e["coin"].as_str()), (Some("breakout"), Some("close"), Some("stop"), Some("BKA")));
+        assert!(e["px"].as_f64().unwrap() < 97.5 && e["ret_pct"].as_f64().unwrap() < -2.5 && e["pnl_usd"].as_f64().unwrap() < 0.0);
+        assert!(e["entry_px"].as_f64().unwrap() == 100.0 && e["held_h"].as_f64().is_some() && e["at"].as_f64().is_some());
+        assert!(b.states["breakout"].open.is_empty() && !trades::registered("BKA"));
+        assert_eq!(saved(&b.cfg, "breakout").await.unwrap()["open"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_take_filled_ends_the_short() {
+        let (f, mut b, mut rx) = setup("BKB").await;
+        hold(&mut b, "breakout_short", "BKB", -1.0).await;
+        f.set_mid("BKB", 90.0);
+        b.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!((ev.len(), ev[0]["why"].as_str(), ev[0]["kind"].as_str()), (1, Some("take"), Some("breakout_short")), "{ev:?}");
+        assert!((ev[0]["px"].as_f64().unwrap() - 91.0).abs() < 1e-9 && ev[0]["ret_pct"].as_f64().unwrap() > 8.9);
+        assert!(b.states["breakout_short"].open.is_empty() && f.position("BKB") == 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_trade_still_held_stays() {
+        let (f, mut b, mut rx) = setup("BKC").await;
+        hold(&mut b, "breakout", "BKC", 1.0).await;
+        f.set_mid("BKC", 101.0);
+        b.check().await;
+        assert!(crate::store::drain(&mut rx).is_empty());
+        assert_eq!(b.states["breakout"].open.len(), 1);
+        assert!(trades::registered("BKC"));
+    }
+
+    #[tokio::test]
+    async fn its_time_up_it_is_closed_at_market() {
+        let (f, mut b, mut rx) = setup("BKD").await;
+        hold(&mut b, "breakout", "BKD", 1.0).await;
+        b.states.get_mut("breakout").unwrap().open[0].tr.exit_at = now() - 1.0;
+        f.set_mid("BKD", 102.0);
+        b.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!((ev.len(), ev[0]["why"].as_str()), (1, Some("time")), "{ev:?}");
+        assert!((ev[0]["px"].as_f64().unwrap() - 102.0).abs() < 1e-9);
+        assert!(f.position("BKD") == 0.0 && f.open_orders("BKD").is_empty(), "the stop and the take cancelled");
+        assert!(b.states["breakout"].open.is_empty() && !trades::registered("BKD"));
+    }
+
+    #[tokio::test]
+    async fn a_step_trades_a_batch_breakout_and_skips_a_lone_one() {
+        // 3 coins: a quiet week then a break on the last hour; the long needs >= 1 other long in the 72 h before
+        let (f, mut b, mut rx) = setup("BKE").await;
+        let f2 = f; // one fake: add the others
+        f2.with(|s| {
+            s.assets.insert(1, ("BKF".into(), 2, 10));
+            s.mids.insert("BKF".into(), 100.0);
+        });
+        b.venue = f2.venue();
+        let now_h = (now() / H).floor() * H;
+        let bar = now_h - H;                                       // the candle just closed
+        let mk = |break_at: f64| -> Vec<Bar> {
+            let n = 900usize;
+            (0..n).map(|i| {
+                let t = bar - (n - 1 - i) as f64 * H;
+                let wide = i < 600;
+                let c = 100.0 * (1.0 + if i % 2 == 0 { 1.0 } else { -1.0 } * if wide { 0.05 } else { 0.0025 });
+                let mut x = (t, c, c * if wide { 1.10 } else { 1.005 }, c * if wide { 0.90 } else { 0.995 }, c, 1e4);
+                if (t - break_at).abs() < 1.0 { x = (t, 100.0, 102.0, 100.0, 101.5, 1e4) }
+                if t > break_at { x = (t, 101.5, 102.0, 101.0, 101.6, 1e4) }
+                x
+            }).collect()
+        };
+        f2.set_candles("BKE", "1h", &mk(bar).iter().map(|x| (x.0, x.1, x.2, x.3, x.4, x.5)).collect::<Vec<_>>());
+        f2.set_candles("BKF", "1h", &mk(bar - 10.0 * H).iter().map(|x| (x.0, x.1, x.2, x.3, x.4, x.5)).collect::<Vec<_>>());
+        f2.set_volume("BKE", 5e6);
+        f2.set_volume("BKF", 5e6);
+        b.p.gap_s = 0.0;
+        f2.set_mid("BKE", 101.5);
+        f2.set_mid("BKF", 101.6);
+        b.step(bar).await;
+        let ev = crate::store::drain(&mut rx);
+        let opened: Vec<&Value> = ev.iter().filter(|e| e["what"] == "open").collect();
+        assert_eq!(opened.len(), 1, "{ev:?}");
+        assert_eq!((opened[0]["coin"].as_str(), opened[0]["cnt"].as_u64()), (Some("BKE"), Some(1)));
+        assert!(f2.position("BKE") > 0.0 && f2.open_orders("BKE").len() == 2, "in with its stop and take");
+        assert_eq!(b.states["breakout"].open.len(), 1);
+        assert_eq!(b.stepped, bar);
+    }
+}

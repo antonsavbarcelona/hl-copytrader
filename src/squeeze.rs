@@ -532,3 +532,80 @@ mod tests {
         assert!(paper(&open, 0.2, 1.0, 3.0, 60, 10, &|_| true).is_empty());
     }
 }
+
+#[cfg(test)]
+mod lifecycle {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg, saved};
+
+    async fn setup(coin: &str, p: Params) -> (FakeHl, Squeeze, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
+        let (store, rx) = Store::for_test();
+        let s = Squeeze { venue: f.venue(), unified: false, cfg: cfg(), store, p, state: State::default() };
+        (f, s, rx)
+    }
+
+    async fn hold(s: &mut Squeeze, coin: &str, size: f64, close_stop: f64) {
+        let tr = trades::open_market(&s.venue, coin, size, 0.10, None, 5.0 * DAY).await.unwrap();
+        trades::register(coin, s.p.kind, tr.risk(), tr.size);
+        s.state.open.push(Pos { tr, close_stop, risk: 5.0 });
+    }
+
+    #[tokio::test]
+    async fn the_resting_stop_filled_ends_it_told_and_saved() {
+        let (f, mut s, mut rx) = setup("SQA", Params::from_env()).await;
+        hold(&mut s, "SQA", 1.0, 95.0).await;
+        f.set_mid("SQA", 89.0);
+        s.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        let e = &ev[0];
+        assert_eq!((e["kind"].as_str(), e["what"].as_str(), e["why"].as_str()), (Some("squeeze"), Some("close"), Some("stop")));
+        assert!(e["ret_pct"].as_f64().unwrap() < -9.9 && e["held_days"].as_f64().is_some() && e["entry_px"].as_f64() == Some(100.0));
+        assert!(s.state.open.is_empty() && !trades::registered("SQA"));
+        assert_eq!(saved(&s.cfg, "squeeze").await.unwrap()["open"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn still_held_it_stays() {
+        let (f, mut s, mut rx) = setup("SQB", Params::short_from_env()).await;
+        hold(&mut s, "SQB", -1.0, 105.0).await;
+        f.set_mid("SQB", 103.0);
+        s.check().await;
+        assert!(crate::store::drain(&mut rx).is_empty() && s.state.open.len() == 1 && trades::registered("SQB"));
+    }
+
+    #[tokio::test]
+    async fn a_4h_close_over_the_short_s_stop_ends_it_at_the_step() {
+        let (f, mut s, mut rx) = setup("SQC", Params::short_from_env()).await;
+        hold(&mut s, "SQC", -1.0, 104.0).await;
+        let bar = ((now() - AFTER_CLOSE_S) / BAR).floor() * BAR - BAR;
+        f.set_candles("SQC", "4h", &[(bar - BAR, 100.0, 101.0, 99.0, 100.0, 1.0), (bar, 100.0, 105.0, 100.0, 104.5, 1.0)]);
+        f.set_mid("SQC", 104.5);
+        s.step(bar).await;
+        let ev = crate::store::drain(&mut rx);
+        let c: Vec<&Value> = ev.iter().filter(|e| e["what"] == "close").collect();
+        assert_eq!((c.len(), c[0]["why"].as_str()), (1, Some("close_stop")), "{ev:?}");
+        assert!((c[0]["px"].as_f64().unwrap() - 104.5).abs() < 1e-9);
+        assert!(f.position("SQC") == 0.0 && f.open_orders("SQC").is_empty() && s.state.open.is_empty() && !trades::registered("SQC"));
+        assert_eq!(s.state.stepped, bar);
+    }
+
+    #[tokio::test]
+    async fn its_time_up_it_ends_at_the_step_and_a_close_inside_keeps_it() {
+        let (f, mut s, mut rx) = setup("SQD", Params::from_env()).await;
+        hold(&mut s, "SQD", 1.0, 95.0).await;
+        let bar = ((now() - AFTER_CLOSE_S) / BAR).floor() * BAR - BAR;
+        f.set_candles("SQD", "4h", &[(bar, 100.0, 101.0, 99.0, 100.5, 1.0)]);
+        s.step(bar).await;
+        assert!(crate::store::drain(&mut rx).iter().all(|e| e["what"] != "close"), "a close over the stop: kept");
+        assert_eq!(s.state.open.len(), 1);
+        s.state.open[0].tr.exit_at = now() - 1.0;
+        f.set_mid("SQD", 101.0);
+        s.step(bar + BAR).await;
+        let ev = crate::store::drain(&mut rx);
+        let c: Vec<&Value> = ev.iter().filter(|e| e["what"] == "close").collect();
+        assert_eq!((c.len(), c[0]["why"].as_str()), (1, Some("time")), "{ev:?}");
+        assert!(s.state.open.is_empty() && f.position("SQD") == 0.0);
+    }
+}

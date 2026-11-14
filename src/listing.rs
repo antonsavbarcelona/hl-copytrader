@@ -308,3 +308,70 @@ mod tests {
         assert!(m.contains("ТЕЙК") && m.contains("+$16.00"));
     }
 }
+
+#[cfg(test)]
+mod lifecycle {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg, saved};
+
+    async fn setup(coin: &str) -> (FakeHl, Listing, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
+        let (store, rx) = Store::for_test();
+        let s = Listing { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default() };
+        (f, s, rx)
+    }
+
+    async fn hold(s: &mut Listing, coin: &str) {
+        let tr = trades::open_market(&s.venue, coin, -1.0, 0.04, Some(0.05), 3600.0).await.unwrap();
+        trades::register(coin, "listing", tr.risk(), tr.size);
+        s.state.open.push(tr);
+    }
+
+    #[tokio::test]
+    async fn a_stop_filled_ends_the_short_told_and_saved() {
+        let (f, mut s, mut rx) = setup("LSA").await;
+        hold(&mut s, "LSA").await;
+        f.set_mid("LSA", 105.0);
+        s.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        let e = &ev[0];
+        assert_eq!((e["kind"].as_str(), e["what"].as_str(), e["why"].as_str()), (Some("listing"), Some("close"), Some("stop")));
+        assert!(e["ret_pct"].as_f64().unwrap() < -3.9 && e["pnl_usd"].as_f64().unwrap() < 0.0 && e["entry_px"].as_f64() == Some(100.0));
+        assert!(s.state.open.is_empty() && !trades::registered("LSA"));
+        assert_eq!(saved(&s.cfg, "listing").await.unwrap()["open"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_take_filled_ends_it() {
+        let (f, mut s, mut rx) = setup("LSB").await;
+        hold(&mut s, "LSB").await;
+        f.set_mid("LSB", 94.0);
+        s.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!((ev.len(), ev[0]["why"].as_str()), (1, Some("take")), "{ev:?}");
+        assert!(s.state.open.is_empty() && f.position("LSB") == 0.0);
+    }
+
+    #[tokio::test]
+    async fn still_held_it_stays() {
+        let (f, mut s, mut rx) = setup("LSC").await;
+        hold(&mut s, "LSC").await;
+        f.set_mid("LSC", 99.0);
+        s.check().await;
+        assert!(crate::store::drain(&mut rx).is_empty() && s.state.open.len() == 1 && trades::registered("LSC"));
+    }
+
+    #[tokio::test]
+    async fn its_time_up_it_is_closed_at_market() {
+        let (f, mut s, mut rx) = setup("LSD").await;
+        hold(&mut s, "LSD").await;
+        s.state.open[0].exit_at = now() - 1.0;
+        f.set_mid("LSD", 98.0);
+        s.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!((ev.len(), ev[0]["why"].as_str()), (1, Some("time")), "{ev:?}");
+        assert!((ev[0]["px"].as_f64().unwrap() - 98.0).abs() < 1e-9 && ev[0]["ret_pct"].as_f64().unwrap() > 1.9);
+        assert!(f.position("LSD") == 0.0 && f.open_orders("LSD").is_empty() && s.state.open.is_empty());
+    }
+}

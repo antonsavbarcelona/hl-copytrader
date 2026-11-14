@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::config::Config;
 use crate::exchange::Exchange;
 use crate::venue::Venue;
 
@@ -41,6 +42,10 @@ pub(crate) struct State {
     /// asset id -> (coin, size decimals, max leverage)
     pub(crate) assets: HashMap<u32, (String, u32, u32)>,
     pub(crate) mids: HashMap<String, f64>,
+    /// (coin, interval) -> its candles as the API sends them ({"t": open ms, "o", "h", "l", "c", "v"})
+    pub(crate) candles: HashMap<(String, String), Vec<Value>>,
+    /// coin -> its day's notional volume (metaAndAssetCtxs' dayNtlVlm)
+    pub(crate) volumes: HashMap<String, f64>,
     pub(crate) orders: HashMap<u64, Order>,
     /// coin -> (signed size, entry)
     pub(crate) positions: HashMap<String, (f64, f64)>,
@@ -171,6 +176,22 @@ impl State {
                     .map(|(a, x)| (*a, json!({"name": x.0, "szDecimals": x.1, "maxLeverage": x.2}))).collect();
                 u.sort_by_key(|x| x.0);
                 json!({"universe": u.into_iter().map(|x| x.1).collect::<Vec<_>>(), "collateralToken": 0})
+            }
+            "metaAndAssetCtxs" => {
+                let mut u: Vec<(u32, String, u32, u32)> = self.assets.iter().filter(|(_, x)| on_dex(&x.0)).map(|(a, x)| (*a, x.0.clone(), x.1, x.2)).collect();
+                u.sort_by_key(|x| x.0);
+                let ctx: Vec<Value> = u.iter().map(|x| json!({"dayNtlVlm": self.volumes.get(&x.1).copied().unwrap_or(0.0).to_string(),
+                    "funding": "0", "markPx": self.mids.get(&x.1).copied().unwrap_or(0.0).to_string()})).collect();
+                json!([{"universe": u.iter().map(|x| json!({"name": x.1, "szDecimals": x.2, "maxLeverage": x.3})).collect::<Vec<_>>()}, ctx])
+            }
+            "candleSnapshot" => {
+                let r = &q["req"];
+                let key = (r["coin"].as_str().unwrap_or("").to_string(), r["interval"].as_str().unwrap_or("").to_string());
+                let (from, to) = (r["startTime"].as_f64().unwrap_or(0.0), r["endTime"].as_f64().unwrap_or(f64::MAX));
+                Value::Array(self.candles.get(&key).into_iter().flatten().filter(|c| {
+                    let t = c["t"].as_f64().unwrap_or(0.0);
+                    t >= from && t <= to
+                }).cloned().collect())
             }
             "allMids" => Value::Object(self.mids.iter().filter(|(c, _)| on_dex(c)).map(|(c, m)| (c.clone(), json!(m.to_string()))).collect()),
             "perpDexs" => json!([null]),
@@ -445,5 +466,36 @@ impl FakeHl {
         s.next_oid += 1;
         let oid = s.next_oid;
         s.fill(oid, coin, size > 0.0, mid, size.abs(), true);
+    }
+}
+
+/// A run's settings for a test: no database, the states in a fresh temp folder.
+pub(crate) fn cfg() -> Config {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!("hlct-test-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    Config { data_dir: dir, weight_per_min: 400.0, database_url: None, run_id: "test".into() }
+}
+
+/// A state document a strategy saved (the file `<name>.json` of `cfg`), waited for up to 2 s (saved in the background).
+pub(crate) async fn saved(cfg: &Config, name: &str) -> Option<Value> {
+    for _ in 0..40 {
+        if let Ok(s) = std::fs::read_to_string(cfg.data_dir.join(format!("{name}.json"))) {
+            return serde_json::from_str(&s).ok();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
+impl FakeHl {
+    /// A coin's candles of `interval` ("1h", "4h", "1d"): (open time s, open, high, low, close, volume in coins).
+    pub(crate) fn set_candles(&self, coin: &str, interval: &str, bars: &[(f64, f64, f64, f64, f64, f64)]) {
+        let v = bars.iter().map(|b| json!({"t": (b.0 * 1000.0) as u64, "o": b.1.to_string(), "h": b.2.to_string(), "l": b.3.to_string(),
+            "c": b.4.to_string(), "v": b.5.to_string()})).collect();
+        self.with(|s| { s.candles.insert((coin.to_string(), interval.to_string()), v); });
+    }
+
+    pub(crate) fn set_volume(&self, coin: &str, usd: f64) {
+        self.with(|s| { s.volumes.insert(coin.to_string(), usd); });
     }
 }

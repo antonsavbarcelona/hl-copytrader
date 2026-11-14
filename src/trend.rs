@@ -392,3 +392,32 @@ mod tests {
         assert!(m.contains("трейлу") && m.contains("+$60.00"));
     }
 }
+
+#[cfg(test)]
+mod lifecycle {
+    use super::*;
+    use crate::testkit::{FakeHl, cfg, saved};
+
+    #[tokio::test]
+    async fn the_resting_stop_filled_ends_it_and_a_held_one_stays() {
+        let f = FakeHl::start(&[("TRA", 2, 10, 100.0), ("TRB", 2, 10, 50.0)]).await;
+        let (store, mut rx) = Store::for_test();
+        let mut s = TrendLong { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default() };
+        for c in ["TRA", "TRB"] {
+            let tr = trades::open_market(&s.venue, c, 1.0, 0.10, None, 30.0 * DAY).await.unwrap();
+            trades::register(c, "trend", tr.risk(), tr.size);
+            s.state.open.push(Pos { tr, day: 0.0, risk: 5.0 });
+        }
+        f.set_mid("TRA", 89.0);
+        f.set_mid("TRB", 51.0);
+        s.check().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!((ev[0]["kind"].as_str(), ev[0]["why"].as_str(), ev[0]["coin"].as_str()), (Some("trend"), Some("stop"), Some("TRA")));
+        assert!(ev[0]["held_days"].as_f64().is_some() && ev[0]["ret_pct"].as_f64().unwrap() < -9.9);
+        assert_eq!(s.state.open.len(), 1);
+        assert_eq!(s.state.open[0].tr.coin, "TRB");
+        assert!(!trades::registered("TRA") && trades::registered("TRB"));
+        assert_eq!(saved(&s.cfg, "trend").await.unwrap()["open"].as_array().unwrap().len(), 1);
+    }
+}

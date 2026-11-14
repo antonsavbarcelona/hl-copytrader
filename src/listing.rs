@@ -18,7 +18,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{now, num};
+use crate::api::now;
 use crate::config::Config;
 use crate::keeper::{HeldIn, Keeper};
 use crate::notify::usd;
@@ -106,24 +106,14 @@ impl Listing {
 
     /// The new coins' listing times; the listings due shorted.
     async fn look(&mut self) {
-        let ctx = match self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
+        let ctx = match crate::market::contexts(&self.k.venue.ex, "").await {
             Ok(v) => v,
             Err(e) => {
                 log!("listing: contexts not read: {e:#}");
                 return;
             }
         };
-        let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
-        let c = ctx[1].as_array().cloned().unwrap_or_default();
-        let mut vol = HashMap::new();
-        for (u, c) in u.iter().zip(c.iter()) {
-            if u["isDelisted"] == true {
-                continue;
-            }
-            if let Some(n) = u["name"].as_str() {
-                vol.insert(n.to_string(), (num(&c["dayNtlVlm"]), num(&c["midPx"])));
-            }
-        }
+        let vol: HashMap<String, (f64, f64)> = ctx.into_iter().filter(|c| !c.delisted).map(|c| (c.name, (c.volume, c.mid))).collect();
         let mut changed = false;
         for coin in vol.keys() {
             if self.state.listed.contains_key(coin) {

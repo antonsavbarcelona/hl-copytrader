@@ -31,7 +31,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{now, num};
+use crate::api::now;
 use crate::config::Config;
 use crate::keeper::{HeldIn, Keeper};
 use crate::venue::Venue;
@@ -242,13 +242,8 @@ impl Breakout {
 
     /// The main-dex coins (not delisted, tradable here) and their day volume.
     async fn universe(&self) -> Option<Vec<(String, f64)>> {
-        let ctx = self.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await.ok()?;
-        let u = ctx[0]["universe"].as_array()?.clone();
-        let c = ctx[1].as_array()?.clone();
-        Some(u.iter().zip(c.iter()).filter_map(|(u, c)| {
-            let name = u["name"].as_str()?;
-            (u["isDelisted"] != true && self.venue.coins.contains_key(name)).then(|| (name.to_string(), num(&c["dayNtlVlm"])))
-        }).collect())
+        let ctx = crate::market::contexts(&self.venue.ex, "").await.ok()?;
+        Some(ctx.into_iter().filter(|c| !c.delisted && self.venue.coins.contains_key(&c.name)).map(|c| (c.name, c.volume)).collect())
     }
 
     /// The candles brought up to the last closed one: a coin new to the cache loads `KEEP`, the others the last few.

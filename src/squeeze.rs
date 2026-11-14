@@ -29,7 +29,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{now, num};
+use crate::api::now;
 use crate::config::Config;
 use crate::keeper::{HeldIn, Keeper};
 use crate::notify::usd;
@@ -274,13 +274,9 @@ impl Squeeze {
             .map(|i| (btc[i].0 as i64, btc_up(&btc[..=i], self.p.btc_ma))).collect();
         if self.p.btc_filter && !btc_up(&btc, self.p.btc_ma) {
             log!("squeeze: BTC under its 50-day mean (or not read): no entries");
-        } else if let Ok(ctx) = self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await {
-            let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
-            let c = ctx[1].as_array().cloned().unwrap_or_default();
-            let liquid: Vec<String> = u.iter().zip(c.iter()).filter_map(|(u, c)| {
-                let name = u["name"].as_str()?;
-                (u["isDelisted"] != true && name != "BTC" && self.k.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol).then(|| name.to_string())
-            }).collect();
+        } else if let Ok(ctx) = crate::market::contexts(&self.k.venue.ex, "").await {
+            let liquid: Vec<String> = ctx.into_iter()
+                .filter(|c| !c.delisted && c.name != "BTC" && self.k.venue.coins.contains_key(&c.name) && c.volume >= self.p.min_vol).map(|c| c.name).collect();
             let (mut cands, mut own, mut papers) = (Vec::new(), 0.0, 0usize);
             let hold = (self.p.hold_s / BAR).round() as usize;
             let btc_ok = |t: f64| !self.p.btc_filter || btc_at.get(&(t as i64)).copied().unwrap_or(false);

@@ -107,24 +107,11 @@ impl Api {
 
     /// Active perp coins (main dex) and, per coin, its funding and mark.
     pub async fn meta(&self) -> Result<(Vec<CoinInfo>, HashMap<String, CoinCtx>)> {
-        let v = self.info(json!({"type": "metaAndAssetCtxs"}), 20).await?;
-        let mut coins = Vec::new();
-        let mut ctx = HashMap::new();
-        let universe = v[0]["universe"].as_array().cloned().unwrap_or_default();
-        let ctxs = v[1].as_array().cloned().unwrap_or_default();
-        for (i, u) in universe.iter().enumerate() {
-            let name = u["name"].as_str().unwrap_or("").to_string();
-            if let Some(c) = ctxs.get(i) {
-                ctx.insert(name.clone(), CoinCtx {
-                    funding: num(&c["funding"]), day_volume: num(&c["dayNtlVlm"]),
-                });
-            }
-            if !u["isDelisted"].as_bool().unwrap_or(false) {
-                coins.push(CoinInfo { name });
-            }
-        }
-        Ok((coins, ctx))
+        let all = crate::market::contexts(self, "").await?;
+        let ctx = all.iter().map(|c| (c.name.clone(), CoinCtx { funding: c.funding, day_volume: c.volume })).collect();
+        Ok((all.into_iter().filter(|c| !c.delisted).map(|c| CoinInfo { name: c.name }).collect(), ctx))
     }
+
 
     /// The HIP-3 perp dexes' names (the main dex left out).
     pub async fn dexes(&self) -> Result<Vec<String>> {
@@ -154,11 +141,7 @@ impl Api {
 
     /// A HIP-3 dex's coins and their day volume ($).
     pub async fn dex_volumes(&self, dex: &str) -> Result<HashMap<String, f64>> {
-        let v = self.info(json!({"type": "metaAndAssetCtxs", "dex": dex}), 20).await?;
-        let universe = v[0]["universe"].as_array().cloned().unwrap_or_default();
-        let ctxs = v[1].as_array().cloned().unwrap_or_default();
-        Ok(universe.iter().zip(ctxs.iter()).filter(|(u, _)| !u["isDelisted"].as_bool().unwrap_or(false))
-            .filter_map(|(u, c)| Some((u["name"].as_str()?.to_string(), num(&c["dayNtlVlm"])))).collect())
+        Ok(crate::market::contexts(self, dex).await?.into_iter().filter(|c| !c.delisted).map(|c| (c.name, c.volume)).collect())
     }
 
     /// Sets the exchange clock offset from a few timed requests (the one with the shortest round

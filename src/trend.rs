@@ -20,7 +20,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::api::{now, num};
+use crate::api::now;
 use crate::config::Config;
 use crate::keeper::{HeldIn, Keeper};
 use crate::notify::usd;
@@ -188,17 +188,11 @@ impl TrendLong {
         if !btc_up(&btc, self.p.btc_ma) {
             log!("trend: BTC under its {}-day mean (or not read): no entries today", self.p.btc_ma);
         } else {
-            let ctx = self.k.venue.ex.info(json!({"type": "metaAndAssetCtxs"})).await;
+            let ctx = crate::market::contexts(&self.k.venue.ex, "").await;
             let mut liquid = Vec::new();
             if let Ok(ctx) = ctx {
-                let u = ctx[0]["universe"].as_array().cloned().unwrap_or_default();
-                let c = ctx[1].as_array().cloned().unwrap_or_default();
-                for (u, c) in u.iter().zip(c.iter()) {
-                    let Some(name) = u["name"].as_str() else { continue };
-                    if u["isDelisted"] != true && name != "BTC" && self.k.venue.coins.contains_key(name) && num(&c["dayNtlVlm"]) >= self.p.min_vol * 0.5 {
-                        liquid.push(name.to_string());
-                    }
-                }
+                liquid = ctx.into_iter().filter(|c| !c.delisted && c.name != "BTC" && self.k.venue.coins.contains_key(&c.name) && c.volume >= self.p.min_vol * 0.5)
+                    .map(|c| c.name).collect();
             } else {
                 log!("trend: contexts not read: no entries today");
             }

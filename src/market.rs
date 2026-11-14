@@ -42,6 +42,31 @@ impl Info for Api {
     }
 }
 
+/// A coin's context on a dex: its day's notional volume, its funding (hourly), its mid and oracle prices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Ctx {
+    pub(crate) name: String,
+    pub(crate) delisted: bool,
+    pub(crate) volume: f64,
+    pub(crate) funding: f64,
+    pub(crate) mid: f64,
+    pub(crate) oracle: f64,
+}
+
+/// The coins of a dex ("" the main one) with their contexts, in the universe's order (the delisted ones too).
+pub(crate) async fn contexts(src: &impl Info, dex: &str) -> Result<Vec<Ctx>> {
+    let body = if dex.is_empty() { json!({"type": "metaAndAssetCtxs"}) } else { json!({"type": "metaAndAssetCtxs", "dex": dex}) };
+    Ok(parse_contexts(&src.ask(body, 20).await?))
+}
+
+/// `metaAndAssetCtxs`' reply as `Ctx`s.
+pub(crate) fn parse_contexts(v: &Value) -> Vec<Ctx> {
+    let u = v[0]["universe"].as_array().cloned().unwrap_or_default();
+    let c = v[1].as_array().cloned().unwrap_or_default();
+    u.iter().zip(c.iter()).filter_map(|(u, c)| Some(Ctx { name: u["name"].as_str()?.to_string(), delisted: u["isDelisted"] == true,
+        volume: num(&c["dayNtlVlm"]), funding: num(&c["funding"]), mid: num(&c["midPx"]), oracle: num(&c["oraclePx"]) })).collect()
+}
+
 /// An interval's length (s): "1m", "5m", "15m", "1h", "4h", "1d", ...
 pub(crate) fn step(interval: &str) -> f64 {
     let (n, unit) = interval.split_at(interval.len().saturating_sub(1));
@@ -91,6 +116,11 @@ mod tests {
         assert_eq!(c, vec![Candle { t: 3600.0, o: 1.0, h: 2.0, l: 0.5, c: 1.5, v: 10.0 }]);
         assert_eq!(c[0].notional(), 15.0);
         assert!(parse(&json!({"error": "x"})).is_empty());
+        let ctx = parse_contexts(&json!([{"universe": [{"name": "A"}, {"name": "B", "isDelisted": true}, {"x": 1}]},
+            [{"dayNtlVlm": "5", "funding": "0.0001", "midPx": "2", "oraclePx": "2.1"}, {"dayNtlVlm": "1"}, {}]]));
+        assert_eq!(ctx, vec![Ctx { name: "A".into(), delisted: false, volume: 5.0, funding: 0.0001, mid: 2.0, oracle: 2.1 },
+            Ctx { name: "B".into(), delisted: true, volume: 1.0, ..Default::default() }]);
+        assert!(parse_contexts(&json!({"error": "x"})).is_empty());
         let x = |t: f64, c: f64| Candle { t, o: c, h: c, l: c, c, v: 1.0 };
         assert_eq!(closed(vec![x(0.0, 1.0), x(3600.0, 0.0), x(7200.0, 2.0)], "1h", 7200.0), vec![x(0.0, 1.0)]);
     }

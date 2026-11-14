@@ -54,6 +54,7 @@ use crate::dip::Closes;
 use crate::venue::{Placed, Venue};
 use crate::notify::usd;
 use crate::log;
+use crate::keeper::{HeldIn, Keeper};
 use crate::store::Store;
 use crate::trades::{self, Trade};
 
@@ -354,43 +355,14 @@ fn closed(store: &Store, state: &mut State, pos: &Pos, why: &str, px: f64, t: f6
         "ret_pct": pnl / pos.cost * 100.0, "held_h": (t - pos.at) / 3600.0, "closed": state.closed, "wins": state.wins, "total_usd": state.pnl_usd}));
 }
 
-/// The live positions: the account read; one due (`exit_at`) out at market, one whose stop or take filled ends; the
-/// paper ones untouched. -> whether any ended.
-async fn sweep_live(v: &Venue, unified: bool, store: &Store, state: &mut State, t: f64) -> bool {
-    let mut changed = false;
-    match crate::venue::equity_of(&v.ex, &v.account, unified).await {
-        Ok((eq, held)) => {
-            trades::set_equity(eq);
-            let mut keep = Vec::new();
-            for pos in std::mem::take(&mut state.open) {
-                let Some(tr) = pos.tr.clone() else {
-                    keep.push(pos);
-                    continue;
-                };
-                let out = if t >= tr.exit_at {
-                    match trades::close(v, &tr).await {
-                        Ok(px) => Some(("time", px)),
-                        Err(e) => {
-                            event(store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("exit: {e:#}")}));
-                            None
-                        }
-                    }
-                } else {
-                    trades::gone(v, &tr, held.get(&pos.coin).copied().unwrap_or(0.0), "rsidip").await
-                };
-                match out {
-                    Some((why, px)) => {
-                        closed(store, state, &pos, why, px, t);
-                        changed = true;
-                    }
-                    None => keep.push(pos),
-                }
-            }
-            state.open.extend(keep);
-        }
-        Err(e) => log!("rsidip: account not read: {e:#}"),
+/// The live positions (`Keeper::sweep_out`): one whose stop or take filled ends, one due (`exit_at`) out at market;
+/// each told with the tally (`closed`); the paper ones untouched. -> whether any ended.
+async fn sweep_live(k: &Keeper, state: &mut State, t: f64) -> bool {
+    let out = k.sweep_out(&mut state.open, |p| p.tr.as_ref(), true, true).await;
+    for (pos, why, px) in &out {
+        closed(&k.store, state, pos, why, *px, t);
     }
-    changed
+    !out.is_empty()
 }
 
 /// Starts the RSI dip unless `RSIDIP_ENABLED` is "0" (see the module).
@@ -420,6 +392,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         p.sizing(), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
     let cfg = cfg.clone();
+    let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, cfg.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
     tokio::spawn(async move {
         let mut closes = Closes::default();
         let mut volume: HashMap<String, f64> = HashMap::new();
@@ -495,10 +468,10 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
             }
             let mut changed = false;
             // The live positions on the account: out on time; gone (the stop or the take filled).
-            if let Some((v, unified)) = &venue {
+            if let Some(k) = &keeper {
                 if t - check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
                     check_at = t;
-                    changed |= sweep_live(v, *unified, &store, &mut state, t).await;
+                    changed |= sweep_live(k, &mut state, t).await;
                 }
             }
             // The paper positions' exits, on the mids now: the take, the stop, the time.
@@ -721,7 +694,11 @@ mod tests {
 #[cfg(test)]
 mod lifecycle {
     use super::*;
-    use crate::testkit::FakeHl;
+    use crate::testkit::{FakeHl, cfg};
+
+    fn keeper(v: &Venue, store: &Store) -> Keeper {
+        Keeper::new(v.clone(), false, cfg(), store.clone(), "rsidip", message, HeldIn::Hours)
+    }
 
     #[tokio::test]
     async fn a_live_stop_or_take_ends_it_with_the_tally_and_the_paper_one_is_left() {
@@ -739,7 +716,7 @@ mod lifecycle {
         let mut state = State { open: vec![a, b, paper], ..Default::default() };
         f.set_mid("RDA", 100.0 * (1.0 - p.stop) * 0.99);      // through the stop
         f.set_mid("RDB", 100.0 * (1.0 + p.take) * 1.01);      // over the take
-        assert!(sweep_live(&v, false, &store, &mut state, now()).await);
+        assert!(sweep_live(&keeper(&v, &store), &mut state, now()).await);
         assert_eq!(state.open.len(), 1);
         assert_eq!(state.open[0].coin, "RDP");
         assert_eq!((state.closed, state.wins), (2, 1));
@@ -764,7 +741,7 @@ mod lifecycle {
         c.tr.as_mut().unwrap().exit_at = now() - 1.0;
         let mut state = State { open: vec![c], ..Default::default() };
         f.set_mid("RDC", 101.0);
-        assert!(sweep_live(&v, false, &store, &mut state, now()).await);
+        assert!(sweep_live(&keeper(&v, &store), &mut state, now()).await);
         assert!(state.open.is_empty() && f.position("RDC") == 0.0 && f.open_orders("RDC").is_empty());
         let ev = crate::store::drain(&mut rx);
         assert_eq!((ev.len(), ev[0]["why"].as_str()), (1, Some("time")), "{ev:?}");
@@ -772,7 +749,7 @@ mod lifecycle {
         d.tr.as_mut().unwrap().exit_at = now() - 1.0;
         state.open.push(d);
         f.with(|s| s.ioc_needs = 0.5);
-        assert!(!sweep_live(&v, false, &store, &mut state, now()).await);
+        assert!(!sweep_live(&keeper(&v, &store), &mut state, now()).await);
         assert_eq!(state.open.len(), 1);
         let ev = crate::store::drain(&mut rx);
         assert!(ev.iter().any(|e| e["what"] == "error" && e["error"].as_str().unwrap().starts_with("exit:")), "{ev:?}");

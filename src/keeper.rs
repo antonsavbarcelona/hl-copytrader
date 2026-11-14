@@ -132,38 +132,53 @@ impl Keeper {
     }
 
     /// The open trades (`tr` reads a trade of one): with `fills` the positions read and those whose stop or take filled
-    /// (or closed by hand) end; those due (`exit_at` passed) go out at market when `time_exit`. -> whether any ended (the
-    /// caller saves its state).
+    /// (or closed by hand) end; those due (`exit_at` passed) go out at market when `time_exit`. Each end told (`ended`).
+    /// -> whether any ended (the caller saves its state).
     pub(crate) async fn sweep<P>(&self, open: &mut Vec<P>, tr: impl Fn(&P) -> &Trade, time_exit: bool, fills: bool) -> bool {
-        if open.is_empty() {
-            return false;
+        let out = self.sweep_out(open, |p| Some(tr(p)), time_exit, fills).await;
+        for (p, why, px) in &out {
+            self.ended(tr(p), why, *px);
         }
-        let (held, read) = if fills { self.held(open.iter().map(|p| tr(p).coin.as_str())).await } else { Default::default() };
+        !out.is_empty()
+    }
+
+    /// `sweep` with the ends handed back, not told (a strategy with its own close event): (the position, why, the price),
+    /// taken out of `open`; a position without a trade (`tr` None: a paper one) left as it is. A failed exit is told.
+    pub(crate) async fn sweep_out<P>(&self, open: &mut Vec<P>, tr: impl Fn(&P) -> Option<&Trade>, time_exit: bool, fills: bool) -> Vec<(P, &'static str, f64)> {
+        let mut ended = Vec::new();
+        if !open.iter().any(|p| tr(p).is_some()) {
+            return ended;
+        }
+        let (held, read) = if fills { self.held(open.iter().filter_map(|p| tr(p)).map(|t| t.coin.as_str())).await } else { Default::default() };
         let mut keep = Vec::new();
-        let mut changed = false;
         for p in std::mem::take(open) {
-            let t = tr(&p);
+            let Some(t) = tr(&p) else {
+                keep.push(p);
+                continue;
+            };
             let gone = if read.contains(dex_of(&t.coin)) {
                 trades::gone(&self.venue, t, held.get(&t.coin).copied().unwrap_or(0.0), self.reg).await
             } else {
                 None
             };
             let out = match gone {
-                Some((why, px)) => {
-                    self.ended(t, why, px);
-                    true
-                }
-                None if time_exit && now() >= t.exit_at => self.exit(t, "time").await,
-                None => false,
+                Some(x) => Some(x),
+                None if time_exit && now() >= t.exit_at => match trades::close(&self.venue, t).await {
+                    Ok(px) => Some(("time", px)),
+                    Err(e) => {
+                        self.event(json!({"what": self.error_what, "coin": t.coin, "error": format!("exit: {e:#}")}));
+                        None
+                    }
+                },
+                None => None,
             };
-            if out {
-                changed = true;
-            } else {
-                keep.push(p);
+            match out {
+                Some((why, px)) => ended.push((p, why, px)),
+                None => keep.push(p),
             }
         }
         *open = keep;
-        changed
+        ended
     }
 }
 

@@ -365,6 +365,217 @@ async fn sweep_live(k: &Keeper, state: &mut State, t: f64) -> bool {
     !out.is_empty()
 }
 
+/// The RSI dip running: its account (None: paper only), its prices and state.
+struct RsiDip {
+    cfg: Config,
+    store: Store,
+    api: Api,
+    venue: Option<(Venue, bool)>,
+    keeper: Option<Keeper>,
+    p: Params,
+    state: State,
+    closes: Closes,
+    volume: HashMap<String, f64>,
+    backfilled: HashSet<String>,
+    /// Coin -> (the hour it was read in, its 1h EMA200).
+    h1: HashMap<String, (i64, Option<f64>)>,
+    vol_at: f64,
+    backfill_at: f64,
+    check_at: f64,
+    last_bar: i64,
+}
+
+impl RsiDip {
+    /// A poll (every `POLL_S`): the volumes, the mids, the candles; the live positions checked, the paper ones' exits;
+    /// on a 5m close the adds and the signals.
+    async fn tick(&mut self) {
+        let RsiDip { cfg, store, api, venue, keeper, p, state, closes, volume, backfilled, h1, vol_at, backfill_at, check_at, last_bar } = self;
+        let save = |cfg: &Config, state: &State| {
+            crate::store::save_state(cfg, DOC, "rsidip", state);
+        };
+        let t = now();
+        let bar = (t / 60.0).floor() as i64 / BAR_MIN;
+        if t - *vol_at >= VOLUME_EVERY_S {
+            match api.meta().await {
+                Ok((_, ctx)) => {
+                    *volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
+                    *vol_at = t;
+                }
+                Err(e) => log!("rsidip: volumes not read: {e:#}"),
+            }
+        }
+        let mids = match api.mids("").await {
+            Ok(m) => m,
+            Err(e) => {
+                log!("rsidip: mids not read: {e:#}");
+                return;
+            }
+        };
+        for (c, px) in &mids {
+            closes.update(c, bar, *px, KEEP);
+        }
+        // The 5m candles after a start: the liquid coins (and BTC) without enough bars.
+        if t - *backfill_at >= BACKFILL_EVERY_S {
+            let short = |c: &String| !backfilled.contains(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_BARS);
+            let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| (**v >= p.min_vol || c.as_str() == "BTC") && short(c)).collect();
+            todo.sort_by(|a, b| b.1.total_cmp(a.1));
+            if let Some(c) = todo.first().map(|x| x.0.clone()) {
+                backfilled.insert(c.clone());
+                match api.bar_closes(&c, BAR_MIN, t - KEEP as f64 * 300.0).await {
+                    Ok(v) => closes.backfill(&c, &v, KEEP),
+                    Err(e) => log!("rsidip: {c} candles not read: {e:#}"),
+                }
+            }
+            *backfill_at = t;
+        }
+        // The 1h EMA200s: a liquid coin not read this hour, the biggest first, one a poll.
+        let hour = (t / 3600.0).floor() as i64;
+        if p.h1_under > 0.0 {
+            let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| **v >= p.min_vol && c.as_str() != "BTC" && h1.get(*c).is_none_or(|x| x.0 < hour)).collect();
+            todo.sort_by(|a, b| b.1.total_cmp(a.1));
+            if let Some(c) = todo.first().map(|x| x.0.clone()) {
+                match api.bar_closes(&c, 60, t - H1_HOURS * 3600.0).await {
+                    Ok(v) => {
+                        let closes: Vec<f64> = v.iter().filter(|x| x.0 < hour).map(|x| x.1).collect();      // the completed hours
+                        h1.insert(c, (hour, h1_ema(&closes)));
+                    }
+                    Err(e) => {
+                        log!("rsidip: {c} hourly candles not read: {e:#}");
+                        let old = h1.get(&c).and_then(|x| x.1);
+                        h1.insert(c, (hour, old));
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        // The live positions on the account: out on time; gone (the stop or the take filled).
+        if let Some(k) = &keeper {
+            if t - *check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
+                *check_at = t;
+                changed |= sweep_live(k, state, t).await;
+            }
+        }
+        // The paper positions' exits, on the mids now: the take, the stop, the time.
+        let mut keep = Vec::new();
+        for pos in std::mem::take(&mut state.open) {
+            let Some(&mid) = mids.get(&pos.coin).filter(|_| !pos.live()) else {
+                keep.push(pos);
+                continue;
+            };
+            let avg = pos.avg();
+            let why = if mid >= avg * (1.0 + p.take) { Some("take") } else if mid <= avg * (1.0 - p.stop) { Some("stop") } else if t - pos.at >= p.hold_s { Some("time") } else { None };
+            let Some(why) = why else {
+                keep.push(pos);
+                continue;
+            };
+            closed(&store, state, &pos, why, if why == "take" { avg * (1.0 + p.take) } else { mid }, t);
+            changed = true;
+        }
+        state.open = keep;
+        if bar > *last_bar {
+            let b = bar - 1;          // the bar that just closed
+            // The adds: a close the step under the last buy (live: at market, the stop and the take moved).
+            let mut keep = Vec::new();
+            for mut pos in std::mem::take(&mut state.open) {
+                let (Some(c), Some(&mid)) = (closes.0.get(&pos.coin).map(|q| series(q, b)), mids.get(&pos.coin)) else {
+                    keep.push(pos);
+                    continue;
+                };
+                if pos.units > p.adds || !c.last().is_some_and(|x| *x <= pos.last * (1.0 - p.add_step)) {
+                    keep.push(pos);
+                    continue;
+                }
+                let usd_buy = pos.cost / pos.units as f64;          // the first buy's $ again
+                match &venue {
+                    Some((v, _)) if pos.live() => {
+                        if let Err(e) = add_live(v, &mut pos, usd_buy, mid, &p).await {
+                            event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("add: {e:#}; closing the position")}));
+                            let tr = pos.tr.clone().unwrap_or_default();
+                            match trades::close(v, &tr).await {
+                                Ok(px) => closed(&store, state, &pos, "error", px, t),
+                                Err(e) => {
+                                    event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("not closed: {e:#}")}));
+                                    keep.push(pos);
+                                }
+                            }
+                            changed = true;
+                            continue;
+                        }
+                    }
+                    _ => pos.buy(mid, usd_buy),
+                }
+                let avg = pos.avg();
+                event(&store, json!({"what": "add", "live": pos.live(), "coin": pos.coin, "px": pos.last, "units": pos.units, "avg": avg,
+                    "take_px": avg * (1.0 + p.take), "stop_px": avg * (1.0 - p.stop)}));
+                keep.push(pos);
+                changed = true;
+            }
+            state.open = keep;
+            // The signals.
+            let btc = closes.0.get("BTC").map(|q| series(q, b)).filter(|c| c.len() > 3).map(|c| c[c.len() - 1] / c[c.len() - 4] - 1.0);
+            if btc.is_some_and(|x| x.abs() < p.btc_max) {
+                let mut cands: Vec<(String, f64, f64, bool)> = Vec::new();
+                for (c, q) in &closes.0 {
+                    if c == "BTC" || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || state.open.iter().any(|x| &x.coin == c) {
+                        continue;
+                    }
+                    if let Some((r, u, w)) = signal(&series(q, b), &p, h1.get(c).and_then(|x| x.1)) {
+                        cands.push((c.clone(), r, u, w));
+                    }
+                }
+                cands.sort_by(|a, b| a.2.total_cmp(&b.2));      // the deepest first
+                for (c, r, u, wide) in cands {
+                    let Some(&mid) = mids.get(&c) else { continue };
+                    let n_live = state.open.iter().filter(|x| x.live()).count();
+                    let usd_buy = p.buy_usd();
+                    let reserve = usd_buy * p.stop * p.buys();
+                    let live = venue.as_ref().filter(|(v, _)| v.coins.contains_key(&c) && n_live < p.max_open
+                        && trades::trial_open(p.trial, state.opened) && trades::can_open(&c, "rsidip", 1.0, reserve));
+                    let mut pos = match live {
+                        Some((v, _)) => match open_live(v, &c, usd_buy, mid, &p).await {
+                            Ok(pos) => {
+                                state.opened += 1;
+                                trades::register(&c, "rsidip", pos.reserve(&p), 1.0);
+                                pos
+                            }
+                            Err(e) => {
+                                event(&store, json!({"what": "error", "live": true, "coin": c, "error": format!("open: {e:#}")}));
+                                continue;
+                            }
+                        },
+                        None if state.open.len() - n_live < p.max_open => {
+                            let mut pos = Pos { coin: c.clone(), at: t, ..Default::default() };
+                            pos.buy(mid, usd_buy);
+                            pos
+                        }
+                        None => continue,
+                    };
+                    pos.rsi = r;
+                    pos.under = u;
+                    let trial = if pos.live() && !trades::trial_open(p.trial, state.opened) { ", ПРОБА окончена: дальше на бумаге" } else { "" };
+                    event(&store, json!({"what": "open", "live": pos.live(), "coin": c, "px": pos.last, "usd": pos.cost, "rsi": r, "under": u, "wide": wide,
+                        "under_h1": h1.get(&c).and_then(|x| x.1).map(|e| pos.last / e - 1.0),
+                        "take_px": pos.avg() * (1.0 + p.take), "stop_px": pos.avg() * (1.0 - p.stop), "hold_h": p.hold_s / 3600.0, "trial": trial}));
+                    state.open.push(pos);
+                    changed = true;
+                }
+            }
+            if bar % 12 == 0 {
+                let ready = closes.0.iter().filter(|(c, q)| volume.get(*c).copied().unwrap_or(0.0) >= p.min_vol && q.len() >= MIN_BARS).count();
+                let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
+                let deep: Vec<String> = h1.iter().filter_map(|(c, x)| Some((c, mids.get(c)? / x.1? - 1.0))).filter(|x| x.1 <= -p.h1_under).map(|x| format!("{} {:.1}%", x.0, x.1 * 100.0)).collect();
+                log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} with the 1h EMA200 (deep under it: {}), {} open ({} live), {} closed, {}",
+                    h1.values().filter(|x| x.1.is_some()).count(), if deep.is_empty() { "none".to_string() } else { deep.join(", ") }, state.open.len(),
+                    state.open.iter().filter(|x| x.live()).count(), state.closed, usd(state.pnl_usd));
+            }
+            *last_bar = bar;
+        }
+        if changed {
+            save(&cfg, &state);
+        }
+    }
+}
+
 /// Starts the RSI dip unless `RSIDIP_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::runner::off("rsidip", "RSIDIP_ENABLED") {
@@ -372,7 +583,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let p = Params::from_env();
     let venue = crate::venue::venue_from_env(None).await?;
-    let mut state: State = crate::store::load_state(cfg, DOC).await?;
+    let state: State = crate::store::load_state(cfg, DOC).await?;
     for pos in state.open.iter().filter(|x| x.live()) {
         trades::register(&pos.coin, "rsidip", pos.reserve(&p), 1.0);
     }
@@ -392,200 +603,13 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
     let cfg = cfg.clone();
     let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, cfg.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
+    let mut r = RsiDip { cfg, store, api, venue, keeper, p, state, closes: Closes::default(), volume: HashMap::new(), backfilled: HashSet::new(), h1: HashMap::new(),
+        vol_at: 0.0, backfill_at: 0.0, check_at: 0.0, last_bar: (now() / 60.0).floor() as i64 / BAR_MIN };
     tokio::spawn(async move {
-        let mut closes = Closes::default();
-        let mut volume: HashMap<String, f64> = HashMap::new();
-        let mut backfilled: HashSet<String> = HashSet::new();
-        // Coin -> (the hour it was read in, its 1h EMA200).
-        let mut h1: HashMap<String, (i64, Option<f64>)> = HashMap::new();
-        let (mut vol_at, mut backfill_at, mut check_at) = (0.0, 0.0, 0.0);
-        let mut last_bar = (now() / 60.0).floor() as i64 / BAR_MIN;
-        let save = |cfg: &Config, state: &State| {
-            crate::store::save_state(&cfg, DOC, "rsidip", state);
-        };
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
             tick.tick().await;
-            let t = now();
-            let bar = (t / 60.0).floor() as i64 / BAR_MIN;
-            if t - vol_at >= VOLUME_EVERY_S {
-                match api.meta().await {
-                    Ok((_, ctx)) => {
-                        volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
-                        vol_at = t;
-                    }
-                    Err(e) => log!("rsidip: volumes not read: {e:#}"),
-                }
-            }
-            let mids = match api.mids("").await {
-                Ok(m) => m,
-                Err(e) => {
-                    log!("rsidip: mids not read: {e:#}");
-                    continue;
-                }
-            };
-            for (c, px) in &mids {
-                closes.update(c, bar, *px, KEEP);
-            }
-            // The 5m candles after a start: the liquid coins (and BTC) without enough bars.
-            if t - backfill_at >= BACKFILL_EVERY_S {
-                let short = |c: &String| !backfilled.contains(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_BARS);
-                let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| (**v >= p.min_vol || c.as_str() == "BTC") && short(c)).collect();
-                todo.sort_by(|a, b| b.1.total_cmp(a.1));
-                if let Some(c) = todo.first().map(|x| x.0.clone()) {
-                    backfilled.insert(c.clone());
-                    match api.bar_closes(&c, BAR_MIN, t - KEEP as f64 * 300.0).await {
-                        Ok(v) => closes.backfill(&c, &v, KEEP),
-                        Err(e) => log!("rsidip: {c} candles not read: {e:#}"),
-                    }
-                }
-                backfill_at = t;
-            }
-            // The 1h EMA200s: a liquid coin not read this hour, the biggest first, one a poll.
-            let hour = (t / 3600.0).floor() as i64;
-            if p.h1_under > 0.0 {
-                let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| **v >= p.min_vol && c.as_str() != "BTC" && h1.get(*c).is_none_or(|x| x.0 < hour)).collect();
-                todo.sort_by(|a, b| b.1.total_cmp(a.1));
-                if let Some(c) = todo.first().map(|x| x.0.clone()) {
-                    match api.bar_closes(&c, 60, t - H1_HOURS * 3600.0).await {
-                        Ok(v) => {
-                            let closes: Vec<f64> = v.iter().filter(|x| x.0 < hour).map(|x| x.1).collect();      // the completed hours
-                            h1.insert(c, (hour, h1_ema(&closes)));
-                        }
-                        Err(e) => {
-                            log!("rsidip: {c} hourly candles not read: {e:#}");
-                            let old = h1.get(&c).and_then(|x| x.1);
-                            h1.insert(c, (hour, old));
-                        }
-                    }
-                }
-            }
-            let mut changed = false;
-            // The live positions on the account: out on time; gone (the stop or the take filled).
-            if let Some(k) = &keeper {
-                if t - check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
-                    check_at = t;
-                    changed |= sweep_live(k, &mut state, t).await;
-                }
-            }
-            // The paper positions' exits, on the mids now: the take, the stop, the time.
-            let mut keep = Vec::new();
-            for pos in std::mem::take(&mut state.open) {
-                let Some(&mid) = mids.get(&pos.coin).filter(|_| !pos.live()) else {
-                    keep.push(pos);
-                    continue;
-                };
-                let avg = pos.avg();
-                let why = if mid >= avg * (1.0 + p.take) { Some("take") } else if mid <= avg * (1.0 - p.stop) { Some("stop") } else if t - pos.at >= p.hold_s { Some("time") } else { None };
-                let Some(why) = why else {
-                    keep.push(pos);
-                    continue;
-                };
-                closed(&store, &mut state, &pos, why, if why == "take" { avg * (1.0 + p.take) } else { mid }, t);
-                changed = true;
-            }
-            state.open = keep;
-            if bar > last_bar {
-                let b = bar - 1;          // the bar that just closed
-                // The adds: a close the step under the last buy (live: at market, the stop and the take moved).
-                let mut keep = Vec::new();
-                for mut pos in std::mem::take(&mut state.open) {
-                    let (Some(c), Some(&mid)) = (closes.0.get(&pos.coin).map(|q| series(q, b)), mids.get(&pos.coin)) else {
-                        keep.push(pos);
-                        continue;
-                    };
-                    if pos.units > p.adds || !c.last().is_some_and(|x| *x <= pos.last * (1.0 - p.add_step)) {
-                        keep.push(pos);
-                        continue;
-                    }
-                    let usd_buy = pos.cost / pos.units as f64;          // the first buy's $ again
-                    match &venue {
-                        Some((v, _)) if pos.live() => {
-                            if let Err(e) = add_live(v, &mut pos, usd_buy, mid, &p).await {
-                                event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("add: {e:#}; closing the position")}));
-                                let tr = pos.tr.clone().unwrap_or_default();
-                                match trades::close(v, &tr).await {
-                                    Ok(px) => closed(&store, &mut state, &pos, "error", px, t),
-                                    Err(e) => {
-                                        event(&store, json!({"what": "error", "live": true, "coin": pos.coin, "error": format!("not closed: {e:#}")}));
-                                        keep.push(pos);
-                                    }
-                                }
-                                changed = true;
-                                continue;
-                            }
-                        }
-                        _ => pos.buy(mid, usd_buy),
-                    }
-                    let avg = pos.avg();
-                    event(&store, json!({"what": "add", "live": pos.live(), "coin": pos.coin, "px": pos.last, "units": pos.units, "avg": avg,
-                        "take_px": avg * (1.0 + p.take), "stop_px": avg * (1.0 - p.stop)}));
-                    keep.push(pos);
-                    changed = true;
-                }
-                state.open = keep;
-                // The signals.
-                let btc = closes.0.get("BTC").map(|q| series(q, b)).filter(|c| c.len() > 3).map(|c| c[c.len() - 1] / c[c.len() - 4] - 1.0);
-                if btc.is_some_and(|x| x.abs() < p.btc_max) {
-                    let mut cands: Vec<(String, f64, f64, bool)> = Vec::new();
-                    for (c, q) in &closes.0 {
-                        if c == "BTC" || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || state.open.iter().any(|x| &x.coin == c) {
-                            continue;
-                        }
-                        if let Some((r, u, w)) = signal(&series(q, b), &p, h1.get(c).and_then(|x| x.1)) {
-                            cands.push((c.clone(), r, u, w));
-                        }
-                    }
-                    cands.sort_by(|a, b| a.2.total_cmp(&b.2));      // the deepest first
-                    for (c, r, u, wide) in cands {
-                        let Some(&mid) = mids.get(&c) else { continue };
-                        let n_live = state.open.iter().filter(|x| x.live()).count();
-                        let usd_buy = p.buy_usd();
-                        let reserve = usd_buy * p.stop * p.buys();
-                        let live = venue.as_ref().filter(|(v, _)| v.coins.contains_key(&c) && n_live < p.max_open
-                            && trades::trial_open(p.trial, state.opened) && trades::can_open(&c, "rsidip", 1.0, reserve));
-                        let mut pos = match live {
-                            Some((v, _)) => match open_live(v, &c, usd_buy, mid, &p).await {
-                                Ok(pos) => {
-                                    state.opened += 1;
-                                    trades::register(&c, "rsidip", pos.reserve(&p), 1.0);
-                                    pos
-                                }
-                                Err(e) => {
-                                    event(&store, json!({"what": "error", "live": true, "coin": c, "error": format!("open: {e:#}")}));
-                                    continue;
-                                }
-                            },
-                            None if state.open.len() - n_live < p.max_open => {
-                                let mut pos = Pos { coin: c.clone(), at: t, ..Default::default() };
-                                pos.buy(mid, usd_buy);
-                                pos
-                            }
-                            None => continue,
-                        };
-                        pos.rsi = r;
-                        pos.under = u;
-                        let trial = if pos.live() && !trades::trial_open(p.trial, state.opened) { ", ПРОБА окончена: дальше на бумаге" } else { "" };
-                        event(&store, json!({"what": "open", "live": pos.live(), "coin": c, "px": pos.last, "usd": pos.cost, "rsi": r, "under": u, "wide": wide,
-                            "under_h1": h1.get(&c).and_then(|x| x.1).map(|e| pos.last / e - 1.0),
-                            "take_px": pos.avg() * (1.0 + p.take), "stop_px": pos.avg() * (1.0 - p.stop), "hold_h": p.hold_s / 3600.0, "trial": trial}));
-                        state.open.push(pos);
-                        changed = true;
-                    }
-                }
-                if bar % 12 == 0 {
-                    let ready = closes.0.iter().filter(|(c, q)| volume.get(*c).copied().unwrap_or(0.0) >= p.min_vol && q.len() >= MIN_BARS).count();
-                    let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
-                    let deep: Vec<String> = h1.iter().filter_map(|(c, x)| Some((c, mids.get(c)? / x.1? - 1.0))).filter(|x| x.1 <= -p.h1_under).map(|x| format!("{} {:.1}%", x.0, x.1 * 100.0)).collect();
-                    log!("rsidip: {ready} of {liquid} liquid coins with {MIN_BARS}+ bars, {} with the 1h EMA200 (deep under it: {}), {} open ({} live), {} closed, {}",
-                        h1.values().filter(|x| x.1.is_some()).count(), if deep.is_empty() { "none".to_string() } else { deep.join(", ") }, state.open.len(),
-                        state.open.iter().filter(|x| x.live()).count(), state.closed, usd(state.pnl_usd));
-                }
-                last_bar = bar;
-            }
-            if changed {
-                save(&cfg, &state);
-            }
+            r.tick().await;
         }
     });
     Ok(())

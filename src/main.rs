@@ -3,6 +3,7 @@
 //! breakouts), sized from one deposit with one open-risk cap (see `trades`), and the order-book recorders.
 //!
 //!     hl-copytrader run [--data DIR] [--weight 400]
+//!     hl-copytrader signal '{"source": "tg", "id": 1, "coin": "BTC", "side": "long", "at": 1794700000}'   (see `ext`)
 
 mod api;
 mod breakout;
@@ -11,6 +12,7 @@ mod config;
 mod dip;
 mod exchange;
 mod expiry;
+mod ext;
 mod hip3;
 mod keeper;
 mod listing;
@@ -51,12 +53,15 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().cloned().unwrap_or_else(|| "run".into());
     let (cfg, rest) = config::Config::from_args(if args.is_empty() { &args[..] } else { &args[1..] })?;
-    if !rest.is_empty() {
-        log!("config: options not used, left out: {rest:?}");
-    }
     match cmd.as_str() {
-        "run" => run(cfg).await,
-        other => anyhow::bail!("unknown command {other} (run)"),
+        "signal" => ext::push(&cfg, rest.first().map(String::as_str).unwrap_or("")).await,
+        "run" => {
+            if !rest.is_empty() {
+                log!("config: options not used, left out: {rest:?}");
+            }
+            run(cfg).await
+        }
+        other => anyhow::bail!("unknown command {other} (run, signal)"),
     }
 }
 
@@ -88,7 +93,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         Err(e) => log!("walls: not recording: {e:#}"),
     }
     squeeze::start(&cfg, store.clone()).await?;
-    breakout::start(&cfg, store).await?;
+    breakout::start(&cfg, store.clone()).await?;
+    ext::start(&cfg, store).await?;
     tokio::spawn(ws::run_books(names, books));
     shutdown_signal().await;
     log!("stopped");

@@ -67,6 +67,13 @@ pub(crate) fn parse_contexts(v: &Value) -> Vec<Ctx> {
         volume: num(&c["dayNtlVlm"]), funding: num(&c["funding"]), mid: num(&c["midPx"]), oracle: num(&c["oraclePx"]) })).collect()
 }
 
+/// Every coin's mid on a dex ("" the main one), the coins without a price left out.
+pub(crate) async fn mids(src: &impl Info, dex: &str) -> Result<std::collections::HashMap<String, f64>> {
+    let body = if dex.is_empty() { json!({"type": "allMids"}) } else { json!({"type": "allMids", "dex": dex}) };
+    let v = src.ask(body, 2).await?;
+    Ok(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect())
+}
+
 /// An interval's length (s): "1m", "5m", "15m", "1h", "4h", "1d", ...
 pub(crate) fn step(interval: &str) -> f64 {
     let (n, unit) = interval.split_at(interval.len().saturating_sub(1));
@@ -133,5 +140,9 @@ mod tests {
         let b = candles(&f.api(), "MKA", "1h", 0.0).await.unwrap();
         assert_eq!(a, b);
         assert_eq!(a.len(), 1);
+        f.set_mid("MKA", 2.5);
+        let m = mids(&f.api(), "").await.unwrap();
+        assert_eq!((m.get("MKA"), m.len()), (Some(&2.5), 1));
+        assert_eq!(mids(&f.venue().ex, "").await.unwrap(), m);
     }
 }

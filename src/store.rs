@@ -107,6 +107,14 @@ CREATE TABLE IF NOT EXISTS docs (
     updated_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, name)
 );
+CREATE TABLE IF NOT EXISTS ext_signals (
+    seq          bigserial   PRIMARY KEY,
+    source       text        NOT NULL,
+    id           text        NOT NULL,
+    body         jsonb       NOT NULL,
+    received_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (source, id)
+);
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name        text        PRIMARY KEY,
     applied_at  timestamptz NOT NULL DEFAULT now()
@@ -174,6 +182,50 @@ pub async fn save_doc(cfg: &Config, name: &str, state: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The external signals' inbox (a parser puts them in, `push_signal`; read by `ext`): the ones numbered after `after`,
+/// in order. On files: `ext_signals.jsonl`, a signal a line, numbered from 1.
+pub(crate) async fn signals_after(cfg: &Config, after: i64) -> Result<Vec<(i64, Value)>> {
+    match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            let rows = client.query("SELECT seq, body::text FROM ext_signals WHERE seq > $1 ORDER BY seq LIMIT 200", &[&after]).await?;
+            Ok(rows.iter().filter_map(|r| Some((r.get::<_, i64>(0), serde_json::from_str(&r.get::<_, String>(1)).ok()?))).collect())
+        }
+        None => {
+            let s = std::fs::read_to_string(cfg.data_dir.join("ext_signals.jsonl")).unwrap_or_default();
+            Ok(s.lines().enumerate().map(|(i, l)| (i as i64 + 1, l)).filter(|(i, _)| *i > after)
+                .filter_map(|(i, l)| Some((i, serde_json::from_str(l).ok()?))).collect())
+        }
+    }
+}
+
+/// An external signal put in the inbox (its `source` and `id` once: false when it is there already).
+pub(crate) async fn push_signal(cfg: &Config, v: &Value) -> Result<bool> {
+    let (source, id) = (v["source"].as_str().unwrap_or("").to_string(), v["id"].to_string());
+    anyhow::ensure!(!source.is_empty() && v.get("id").is_some(), "a signal needs its source and id");
+    match &cfg.database_url {
+        Some(url) => {
+            let client = pg_connect(url).await?;
+            migrate(&client).await?;
+            let n = client.execute("INSERT INTO ext_signals (source, id, body) VALUES ($1, $2, $3::text::jsonb) ON CONFLICT DO NOTHING",
+                &[&source, &id, &v.to_string()]).await?;
+            Ok(n == 1)
+        }
+        None => {
+            std::fs::create_dir_all(&cfg.data_dir)?;
+            let path = cfg.data_dir.join("ext_signals.jsonl");
+            let there = std::fs::read_to_string(&path).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|x| x["source"].as_str() == Some(&source) && x["id"].to_string() == id);
+            if there {
+                return Ok(false);
+            }
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            writeln!(f, "{v}")?;
+            Ok(true)
+        }
+    }
 }
 
 /// A strategy's state document read into its type: the default when none is saved or it does not parse as one.
@@ -324,5 +376,19 @@ mod tests {
         // a file that is not JSON at all
         std::fs::write(cfg.data_dir.join("s.json"), "{oops").unwrap();
         assert_eq!(load_state::<S>(&cfg, "s").await.unwrap(), S::default());
+    }
+
+    #[tokio::test]
+    async fn the_signals_inbox_takes_each_once_and_reads_them_in_order() {
+        let cfg = crate::testkit::cfg();
+        assert!(signals_after(&cfg, 0).await.unwrap().is_empty());
+        let a = serde_json::json!({"source": "tg", "id": 7, "coin": "BTC"});
+        assert!(push_signal(&cfg, &a).await.unwrap());
+        assert!(!push_signal(&cfg, &a).await.unwrap(), "the same source and id: not again");
+        assert!(push_signal(&cfg, &serde_json::json!({"source": "tg", "id": 8, "coin": "ETH"})).await.unwrap());
+        assert!(push_signal(&cfg, &serde_json::json!({"coin": "ETH"})).await.is_err());
+        let all = signals_after(&cfg, 0).await.unwrap();
+        assert_eq!(all.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(signals_after(&cfg, 1).await.unwrap()[0].1["coin"], "ETH");
     }
 }

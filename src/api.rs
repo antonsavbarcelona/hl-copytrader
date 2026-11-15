@@ -132,9 +132,7 @@ impl Api {
 
     /// Every coin's mid on a dex ("" for the main one).
     pub async fn mids(&self, dex: &str) -> Result<HashMap<String, f64>> {
-        let body = if dex.is_empty() { json!({"type": "allMids"}) } else { json!({"type": "allMids", "dex": dex}) };
-        let v = self.info(body, 2).await?;
-        Ok(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect())
+        crate::market::mids(self, dex).await
     }
 
     /// A coin's 1-minute closes from `start` (s) on: (the minute, the close).

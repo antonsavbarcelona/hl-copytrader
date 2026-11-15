@@ -440,11 +440,12 @@ fn crash_trip(fills: &[f64], t: f64) -> bool {
     fills.iter().filter(|x| t - **x <= CRASH_WINDOW_S).count() >= CRASH_FILLS
 }
 
-/// Why a fill is closed at the market at once: the family's open-risk cap only (2026-11-15, the user's call: a fill
-/// over its rung's slots is kept with its stop, take and time - crash/port2.py: +173% -> +185..+218% with the breaker at
-/// the same DD; closing it at once sold the crash's low).
-fn over_reason(fits_family: bool) -> Option<&'static str> {
-    (!fits_family).then_some("family cap")
+/// Why a fill is closed at the market at once: over its rung's slots (the trades open before it) or the family's
+/// open-risk cap. 2026-11-15, the user's call ("стремно держать лишние позы"): closed, as before, with the crash breaker
+/// (crash/port2.py: breaker + closed +170%, DD 10.2%, worst day -5.8%; breaker + kept +185..+228%, the same DD, the worst
+/// day -8.7%).
+fn over_reason(over_slots: bool, fits_family: bool) -> Option<&'static str> {
+    if over_slots { Some("slots") } else if !fits_family { Some("family cap") } else { None }
 }
 
 /// The coins to bid: of those with a volume of `min_vol`+ (left out: those `skip` says), the top `n`
@@ -491,8 +492,8 @@ fn sides_margin((bid, ask): (f64, f64)) -> f64 {
 }
 
 /// Whether `coin`'s rung `rung` (a HIP-3 bid of the shut hours: `shut`) has its slots taken already by the trades
-/// open before this one: a bid filled in the seconds before the others were taken off (told as `over_slots`; kept since
-/// 2026-11-15, see `over_reason`; closed at the market 2026-11-14 .. 15).
+/// open before this one: a bid filled in the seconds before the others were taken off (closed at the market, see
+/// `over_reason`).
 fn slots_full(p: &Params, st: &State, coin: &str, rung: usize, shut: bool) -> bool {
     let h3 = coin.contains(':');
     let n_h3 = |v: &[Trade]| v.iter().filter(|x| x.coin.contains(':')).count();
@@ -1393,9 +1394,9 @@ impl Wick {
             self.p.pct
         };
         let (take, stop, hold_s) = self.p.rung_exits(coin, rung, shut, pct);
-        // over the family's open-risk cap: closed at the market; over its rung's slots only: kept (`over_reason`)
+        // over its rung's slots or the family's open-risk cap: closed at the market (`over_reason`)
         let over_slots = slots_full(&self.p, &self.state, coin, rung, shut);
-        let over = over_reason(trades::risk_fits(rung_risk(coin, rung, shut, self.p.risk_usd)));
+        let over = over_reason(over_slots, trades::risk_fits(rung_risk(coin, rung, shut, self.p.risk_usd)));
         if let Some(why) = over {
             match self.venue.market(coin, -got, true).await {
                 Ok((done, out_px, _)) => self.event(json!({"what": "over", "coin": coin, "rung": rung, "why": why, "px": px, "size": got,
@@ -1922,7 +1923,8 @@ mod crash_tests {
         assert!(crash_trip(&[50.0, 100.0], 100.0), "two within a minute");
         assert!(!crash_trip(&[30.0, 100.0], 100.0), "70 s apart: no");
         assert!(!resized(100.0, 109.0) && resized(100.0, 111.0) && resized(100.0, 89.0) && !resized(0.0, 50.0));
-        assert_eq!((over_reason(true), over_reason(false)), (None, Some("family cap")));
+        assert_eq!((over_reason(false, true), over_reason(false, false)), (None, Some("family cap")));
+        assert_eq!((over_reason(true, true), over_reason(true, false)), (Some("slots"), Some("slots")));
     }
 
     async fn setup(coins: &[(&str, u32, u32, f64)]) -> (FakeHl, Wick, tokio::sync::mpsc::UnboundedReceiver<Value>) {
@@ -1972,17 +1974,20 @@ mod crash_tests {
     }
 
     #[tokio::test]
-    async fn a_fill_over_its_slots_is_kept_with_its_stop_and_one_over_the_family_cap_is_closed_at_market() {
+    async fn a_fill_over_its_slots_or_over_the_family_cap_is_closed_at_market() {
         trades::family_fits(true);
         let (f, mut w, mut rx) = setup(&[("WCC", 2, 10, 100.0), ("WCD", 2, 10, 100.0), ("WCE", 2, 10, 100.0), ("WCF", 2, 10, 100.0)]).await;
         w.p.max_open = 1;
         fill(&f, &mut w, "WCC", 0, 1.0).await;
-        fill(&f, &mut w, "WCD", 0, 1.0).await;          // over the rung's 1 slot: kept
+        fill(&f, &mut w, "WCD", 0, 1.0).await;          // over the rung's 1 slot: closed
         let ev = crate::store::drain(&mut rx);
-        let d = ev.iter().find(|e| e["coin"] == "WCD" && e["what"] == "open").expect("kept");
-        assert_eq!(d["over_slots"].as_bool(), Some(true));
-        assert!(f.position("WCD") > 0.0 && f.open_orders("WCD").len() == 2 && trades::registered("WCD"));
+        let d = ev.iter().find(|e| e["coin"] == "WCD" && e["what"] == "over").expect("told");
+        assert!(ev.iter().any(|e| e["what"] == "crash_off"), "and the breaker tripped");
+        assert_eq!((d["what"].as_str(), d["why"].as_str()), (Some("over"), Some("slots")), "{ev:?}");
+        assert_eq!(f.position("WCD"), 0.0);
+        assert!(f.position("WCC") > 0.0 && trades::registered("WCC"), "the first one kept");
         // the family's cap full: closed at market
+        w.p.max_open = 10; // the slots free
         trades::family_fits(false);
         fill(&f, &mut w, "WCE", 0, 1.0).await;
         let ev = crate::store::drain(&mut rx);

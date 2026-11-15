@@ -365,7 +365,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     };
     let mut states = HashMap::new();
     for s in &p.sides {
-        let st: State = crate::store::load_doc(cfg, s.kind).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        let st: State = crate::store::load_state(cfg, s.kind).await?;
         for pos in &st.open {
             trades::register(&pos.tr.coin, s.kind, pos.risk, pos.tr.size);
         }

@@ -176,6 +176,22 @@ pub async fn save_doc(cfg: &Config, name: &str, state: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A strategy's state document read into its type: the default when none is saved or it does not parse as one.
+pub(crate) async fn load_state<T: serde::de::DeserializeOwned + Default>(cfg: &Config, name: &str) -> Result<T> {
+    Ok(load_doc(cfg, name).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default())
+}
+
+/// A strategy's state document saved in the background (the strategy never waits on it); a failure is logged as
+/// "`kind`: state not saved".
+pub(crate) fn save_state<T: serde::Serialize>(cfg: &Config, name: &str, kind: &str, state: &T) {
+    let (cfg, name, kind, v) = (cfg.clone(), name.to_string(), kind.to_string(), serde_json::to_value(state).unwrap_or_default());
+    tokio::spawn(async move {
+        if let Err(e) = save_doc(&cfg, &name, &v).await {
+            log!("{kind}: state not saved: {e:#}");
+        }
+    });
+}
+
 /// TLS when the URL asks for it (`sslmode=require` / `verify-ca` / `verify-full`, as hosted
 /// databases do), plain otherwise (e.g. Railway's private network).
 /// The longest a connect or a batch's write may take before it is given up and tried again.
@@ -283,4 +299,30 @@ async fn write_events(c: &tokio_postgres::Client, run: &str, events: &[Value]) -
     .await
     .context("inserting events")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+    struct S {
+        n: u32,
+        #[serde(default)]
+        coins: Vec<String>,
+    }
+
+    #[tokio::test]
+    async fn a_state_saved_in_the_background_is_read_back_and_a_missing_or_foreign_one_is_the_default() {
+        let cfg = crate::testkit::cfg();
+        assert_eq!(load_state::<S>(&cfg, "s").await.unwrap(), S::default());
+        save_state(&cfg, "s", "test", &S { n: 3, coins: vec!["BTC".into()] });
+        assert!(crate::testkit::saved(&cfg, "s").await.is_some());
+        assert_eq!(load_state::<S>(&cfg, "s").await.unwrap(), S { n: 3, coins: vec!["BTC".into()] });
+        save_doc(&cfg, "s", &serde_json::json!({"n": "not a number"})).await.unwrap();
+        assert_eq!(load_state::<S>(&cfg, "s").await.unwrap(), S::default());
+        // a file that is not JSON at all
+        std::fs::write(cfg.data_dir.join("s.json"), "{oops").unwrap();
+        assert_eq!(load_state::<S>(&cfg, "s").await.unwrap(), S::default());
+    }
 }

@@ -338,7 +338,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         log!("dip: LIVE_KEY / LIVE_ACCOUNT not set, off");
         return Ok(());
     };
-    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let state: State = crate::store::load_state(cfg, DOC).await?;
     let p = Params::from_env();
     log!("dip: {VERSION} {}{} account {}, {} held; buys a fall of {:.0}% ({:.1}% while the funding >= 0) in {} min (BTC under {:.0}%, ${:.0}M+ a day), {:.0} min hold, stop {:.0}%, risk {}, at most {}; the trial {:?} ({} live)",
         if p.dry { "DRY (signals only) " } else { "" }, if venue.ex.mainnet() { "MAINNET" } else { "testnet" }, venue.account, state.open.len(), p.drop * 100.0, p.funding_drop * 100.0, p.window, p.btc_max * 100.0,
@@ -510,12 +510,7 @@ impl Dip {
     }
 
     fn save(&self) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                log!("dip: state not saved: {e:#}");
-            }
-        });
+        crate::store::save_state(&self.cfg, DOC, "dip", &self.state);
     }
 
     /// The falls of the minute that closed, biggest first, bought within the limits.

@@ -588,12 +588,7 @@ impl Wick {
     }
 
     fn save(&self) {
-        let (cfg, v) = (self.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                log!("wick: state not saved: {e:#}");
-            }
-        });
+        crate::store::save_state(&self.cfg, DOC, "wick", &self.state);
     }
 
     /// The main dex's day volumes and oracles; the HIP-3 dexes' volumes (every `VOLUME_EVERY_S`).
@@ -1541,7 +1536,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     } else {
         core.clone()
     };
-    let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let mut state: State = crate::store::load_state(cfg, DOC).await?;
     if state.trial_round < TRIAL_ROUND {
         log!("wick: the trials start again (round {TRIAL_ROUND}): crypto {} and HIP-3 {} fills before not counted", state.opened, state.h3_opened);
         (state.opened, state.h3_opened, state.trial_round) = (0, 0, TRIAL_ROUND);

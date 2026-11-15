@@ -185,7 +185,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         return Ok(());
     };
     let p = Params::from_env();
-    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let state: State = crate::store::load_state(cfg, DOC).await?;
     for tr in &state.open {
         trades::register(&tr.coin, "listing", tr.risk(), tr.size);
     }

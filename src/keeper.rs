@@ -70,12 +70,7 @@ impl Keeper {
 
     /// The state saved as the document `doc` (in the background).
     pub(crate) fn save<T: Serialize>(&self, doc: &'static str, state: &T) {
-        let (cfg, v, kind) = (self.cfg.clone(), serde_json::to_value(state).unwrap_or_default(), self.kind);
-        tokio::spawn(async move {
-            if let Err(e) = crate::store::save_doc(&cfg, doc, &v).await {
-                log!("{kind}: state not saved: {e:#}");
-            }
-        });
+        crate::store::save_state(&self.cfg, doc, self.kind, state);
     }
 
     /// The account's positions (coin -> signed size) on the dexes of `coins` (the main dex: "", the family's equity set

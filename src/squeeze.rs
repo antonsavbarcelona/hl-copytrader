@@ -375,7 +375,7 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
         log!("{}: LIVE_KEY / LIVE_ACCOUNT not set, off", p.kind);
         return Ok(());
     };
-    let state: State = crate::store::load_doc(cfg, p.kind).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let state: State = crate::store::load_state(cfg, p.kind).await?;
     for pos in &state.open {
         trades::register(&pos.tr.coin, p.kind, pos.risk, pos.tr.size);
     }

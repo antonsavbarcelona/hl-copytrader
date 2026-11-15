@@ -165,7 +165,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         return Ok(());
     };
     let p = Params::from_env();
-    let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let mut state: State = crate::store::load_state(cfg, DOC).await?;
     let keep_from = (now() / 86_400.0) as i64 - 60;
     state.done.retain(|k| k.split(':').next().and_then(|d| d.parse::<i64>().ok()).is_some_and(|d| d >= keep_from));
     for tr in &state.open {

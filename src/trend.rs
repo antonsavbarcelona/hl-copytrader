@@ -161,7 +161,6 @@ impl TrendLong {
 
     /// After a UTC day's close: the trades' chandelier exits, then the day's breakouts bought.
     async fn step(&mut self, day: f64) {
-        let mut changed = false;
         // The exits: the chandelier on the closes, the time.
         let hist = (self.p.max_days as usize) + ATR_DAYS + 5;
         for pos in std::mem::take(&mut self.state.open) {
@@ -173,7 +172,6 @@ impl TrendLong {
             match why {
                 Some(why) => {
                     if self.k.exit(&pos.tr, why).await {
-                        changed = true;
                     } else {
                         self.state.open.push(pos);
                     }
@@ -229,19 +227,14 @@ impl TrendLong {
                         trades::register(&coin, "trend", r, tr.size);
                         self.state.open.push(Pos { tr, day, risk: r });
                         self.state.opened += 1;
-                        changed = true;
                     }
                     Err(e) => self.k.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
                 }
             }
         }
         self.state.stepped = day;
-        if changed {
-            self.k.save(DOC, &self.state);
-        } else {
-            let (cfg, v) = (self.k.cfg.clone(), serde_json::to_value(&self.state).unwrap_or_default());
-            tokio::spawn(async move { let _ = crate::store::save_doc(&cfg, DOC, &v).await; });
-        }
+        // saved either way: the day stepped is kept too
+        self.k.save(DOC, &self.state);
     }
 
     /// The trades swept (see `Keeper::sweep`).
@@ -264,7 +257,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         return Ok(());
     };
     let p = Params::from_env();
-    let state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let state: State = crate::store::load_state(cfg, DOC).await?;
     for pos in &state.open {
         trades::register(&pos.tr.coin, "trend", pos.risk, pos.tr.size);
     }

@@ -149,7 +149,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         return Ok(());
     }
     let p = Params::from_env();
-    let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let mut state: State = crate::store::load_state(cfg, DOC).await?;
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
     // The live venue with the HIP-3 perps (HIP3_LIVE on unless "0"): without it the signals only.
@@ -193,12 +193,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let started = now();
         let mut wkd_pos_at = 0.0;
         let save = |cfg: &Config, state: &State| {
-            let (cfg, v) = (cfg.clone(), serde_json::to_value(state).unwrap_or_default());
-            tokio::spawn(async move {
-                if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                    log!("hip3: state not saved: {e:#}");
-                }
-            });
+            crate::store::save_state(&cfg, DOC, "hip3", state);
         };
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {

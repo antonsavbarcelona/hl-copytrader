@@ -373,7 +373,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let p = Params::from_env();
     let venue = crate::venue::venue_from_env(None).await?;
-    let mut state: State = crate::store::load_doc(cfg, DOC).await?.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let mut state: State = crate::store::load_state(cfg, DOC).await?;
     for pos in state.open.iter().filter(|x| x.live()) {
         trades::register(&pos.coin, "rsidip", pos.reserve(&p), 1.0);
     }
@@ -402,12 +402,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         let (mut vol_at, mut backfill_at, mut check_at) = (0.0, 0.0, 0.0);
         let mut last_bar = (now() / 60.0).floor() as i64 / BAR_MIN;
         let save = |cfg: &Config, state: &State| {
-            let (cfg, v) = (cfg.clone(), serde_json::to_value(state).unwrap_or_default());
-            tokio::spawn(async move {
-                if let Err(e) = crate::store::save_doc(&cfg, DOC, &v).await {
-                    log!("rsidip: state not saved: {e:#}");
-                }
-            });
+            crate::store::save_state(&cfg, DOC, "rsidip", state);
         };
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {

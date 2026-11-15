@@ -1229,3 +1229,131 @@ mod candles {
         assert!(!d.old_enough("DCB", 20.0).await);
     }
 }
+
+#[cfg(test)]
+mod poll {
+    //! The loop's tick on the fake with its clock moved (before it goes on the runner): a 7% fall of a coin with its
+    //! funding not negative bought live with its stop, out at market at its hold's end; a stop filled ends it at the next
+    //! account read; on paper the signal and its result a hold on; BTC moving: skipped.
+    use super::*;
+    use crate::testkit::{Clock, FakeHl, cfg};
+    use crate::ws::Book;
+
+    /// A minute's start + 5 s (2026-11-11 15:00:05 UTC).
+    const T0: f64 = 1_794_409_205.0;
+
+    fn dip(f: &FakeHl, store: Store, live: bool) -> Dip {
+        let mut p = Params::from_env();
+        p.dry = !live;
+        Dip { venue: f.venue(), unified: false, cfg: cfg(), store, p, state: State::default(), closes: Closes::default(),
+            volume: HashMap::new(), funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: Default::default(),
+            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: (now() / 60.0).floor() as i64, vol_at: 0.0,
+            read_at: 0.0, day_at: now(), day_entries: 0, started: now(), checked: false }
+    }
+
+    /// `coin`'s price `m`: the fake's mid and the engine's book.
+    fn px(f: &FakeHl, d: &Dip, coin: &str, m: f64) {
+        f.set_mid(coin, m);
+        d.books.write().unwrap().insert(coin.to_string(), Book { bids: vec![(m * 0.9995, 1e6)], asks: vec![(m * 1.0005, 1e6)], time_ms: 0 });
+    }
+
+    /// `n` ticks `step` s apart, the books fresh at each.
+    async fn ticks(d: &mut Dip, c: &Clock, n: usize, step: f64) {
+        for _ in 0..n {
+            for b in d.books.write().unwrap().values_mut() {
+                b.time_ms = (now() * 1000.0) as u64;
+            }
+            d.tick().await;
+            c.go(step);
+        }
+    }
+
+    async fn setup(coin: &str, live: bool) -> (FakeHl, Dip, tokio::sync::mpsc::UnboundedReceiver<Value>, Clock) {
+        crate::trades::uncapped();
+        let f = FakeHl::start(&[("BTC", 5, 40, 100_000.0), (coin, 2, 10, 100.0)]).await;
+        f.set_volume(coin, 20e6);
+        let (store, rx) = Store::for_test();
+        let c = Clock::at(T0);
+        let d = dip(&f, store, live);
+        px(&f, &d, "BTC", 100_000.0);
+        px(&f, &d, coin, 100.0);
+        (f, d, rx, c)
+    }
+
+    fn find<'a>(ev: &'a [Value], what: &str) -> &'a Value {
+        ev.iter().find(|e| e["what"] == what).unwrap_or_else(|| panic!("no {what}: {ev:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_fall_is_bought_live_with_its_stop_and_sold_at_market_at_its_hold_s_end() {
+        let (f, mut d, mut rx, c) = setup("DPA", true).await;
+        ticks(&mut d, &c, 32, 30.0).await; // 16 minutes flat
+        assert_eq!(d.equity, 1000.0, "the account read");
+        px(&f, &d, "DPA", 93.0); // 7%: over the 5.6% of a funding at 0
+        ticks(&mut d, &c, 3, 30.0).await; // the minute closes: its signals
+        let ev = crate::store::drain(&mut rx);
+        let o = find(&ev, "open");
+        assert_eq!((o["kind"].as_str(), o["coin"].as_str()), (Some("dip"), Some("DPA")));
+        assert!((o["fall"].as_f64().unwrap() + 0.07).abs() < 1e-9);
+        // the stop loses 2% of $1,000: $20 at 20% under 93
+        let size = f.position("DPA");
+        assert!((size - 20.0 / 0.20 / 93.0).abs() < 0.01, "{size}");
+        let stops = f.open_orders("DPA");
+        assert!(stops.len() == 1 && stops[0].trigger.is_some_and(|x| (x - 93.0 * 0.8).abs() < 0.01), "{stops:?}");
+        assert!(d.state.open.contains_key("DPA") && d.state.entries == 1);
+        // a second fall within the cooldown: not again
+        px(&f, &d, "DPA", 85.0);
+        ticks(&mut d, &c, 3, 30.0).await;
+        let ev = crate::store::drain(&mut rx);
+        assert!(ev.iter().all(|e| e["what"] != "open"), "{ev:?}");
+        // the hold (120 min) over: out at market, the stop cancelled
+        c.go(7200.0);
+        ticks(&mut d, &c, 1, 1.0).await;
+        let ev = crate::store::drain(&mut rx);
+        let x = find(&ev, "close");
+        assert_eq!((x["why"].as_str(), x["coin"].as_str()), (Some("hold"), Some("DPA")));
+        assert!(f.position("DPA") == 0.0 && f.open_orders("DPA").is_empty() && d.state.open.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stop_filled_ends_the_trade_at_the_next_account_read() {
+        let (f, mut d, mut rx, c) = setup("DPB", true).await;
+        ticks(&mut d, &c, 32, 30.0).await;
+        px(&f, &d, "DPB", 93.0);
+        ticks(&mut d, &c, 3, 30.0).await;
+        find(&crate::store::drain(&mut rx), "open");
+        px(&f, &d, "DPB", 70.0); // through the stop at 74.4
+        assert_eq!(f.position("DPB"), 0.0, "the stop filled on the exchange");
+        ticks(&mut d, &c, 3, 30.0).await;
+        let ev = crate::store::drain(&mut rx);
+        let s = find(&ev, "stopped");
+        assert!(s["ret_pct"].as_f64().unwrap() < -19.0, "{s}");
+        assert!(d.state.open.is_empty() && ev.iter().all(|e| e["what"] != "close"));
+    }
+
+    #[tokio::test]
+    async fn on_paper_a_signal_and_its_result_a_hold_on_and_btc_moving_skips_it() {
+        let (f, mut d, mut rx, c) = setup("DPC", false).await;
+        ticks(&mut d, &c, 32, 30.0).await;
+        px(&f, &d, "DPC", 92.0);
+        ticks(&mut d, &c, 3, 30.0).await;
+        let ev = crate::store::drain(&mut rx);
+        let s = find(&ev, "signal");
+        assert!(s["coin"] == "DPC" && s["mid"].as_f64() == Some(92.0));
+        assert!(f.position("DPC") == 0.0 && f.open_orders("DPC").is_empty() && d.state.dry_dips.len() == 1);
+        px(&f, &d, "DPC", 95.0);
+        c.go(7200.0);
+        ticks(&mut d, &c, 1, 1.0).await;
+        let r = find(&crate::store::drain(&mut rx), "dip_dry_result").clone();
+        assert!((r["ret_pct"].as_f64().unwrap() - (95.0 / 92.0 - 1.0) * 100.0).abs() < 1e-6, "{r}");
+        // BTC down 3% over the window with the coin: skipped
+        let (f, mut d, mut rx, c) = setup("DPD", false).await;
+        ticks(&mut d, &c, 32, 30.0).await;
+        px(&f, &d, "DPD", 92.0);
+        px(&f, &d, "BTC", 97_000.0);
+        ticks(&mut d, &c, 3, 30.0).await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(find(&ev, "skipped")["why"].as_str(), Some("btc moved"));
+        assert!(ev.iter().all(|e| e["what"] != "signal"));
+    }
+}

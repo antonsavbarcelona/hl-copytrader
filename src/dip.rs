@@ -326,6 +326,16 @@ struct Dip {
     regime_hist: VecDeque<(f64, f64, f64)>,
     /// Whether a coin has traded `PUMP_MIN_AGE_DAYS`+ (its daily candles), read at its first pump.
     old_enough: HashMap<String, bool>,
+    api: Api,
+    last_minute: i64,
+    vol_at: f64,
+    read_at: f64,
+    /// The day's note to the chat: alive, the equity, what it did.
+    day_at: f64,
+    day_entries: u64,
+    /// The start's health check to the chat: once the books, the volumes and the equity are in (or what is missing after 2 min).
+    started: f64,
+    checked: bool,
 }
 
 /// Starts the dip-buy unless `DIP_ENABLED` is "0", with the live account set (see the module).
@@ -362,77 +372,79 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         log!("dip: the pump short is off (PUMP_ENABLED=0)");
     }
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
-        funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new() };
+        funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new(),
+        api, last_minute: (now() / 60.0).floor() as i64, vol_at: 0.0, read_at: 0.0, day_at: now(), day_entries: 0, started: now(), checked: false };
+    d.day_entries = d.state.entries;
     tokio::spawn(async move {
-        let mut last_minute = (now() / 60.0).floor() as i64;
-        let mut vol_at = 0.0;
-        let mut read_at = 0.0;
-        // The day's note to the chat: alive, the equity, what it did.
-        let (mut day_at, mut day_entries) = (now(), d.state.entries);
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        // The start's health check to the chat: once the books, the volumes and the equity are in
-        // (or what is missing after 2 min).
-        let started = now();
-        let mut checked = false;
         loop {
             tick.tick().await;
-            let t = now();
-            if !checked && (d.health_ready() || t - started > 120.0) {
-                checked = true;
-                let h = d.health();
-                log!("dip: {}", h.replace('\n', " | "));
-                crate::notify::send(h);
-            }
-            if t - vol_at >= VOLUME_EVERY_S {
-                match api.meta().await {
-                    Ok((_, ctx)) => {
-                        d.funding = ctx.iter().map(|(c, x)| (c.clone(), x.funding)).collect();
-                        d.volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
-                        vol_at = t;
-                    }
-                    Err(e) => log!("dip: volumes not read: {e:#}"),
-                }
-            }
-            if t - read_at >= 60.0 {
-                read_at = t;
-                d.reconcile().await;
-            }
-            if t - day_at >= 86_400.0 && d.equity > 0.0 {
-                crate::notify::send(format!("📊 покупка падений работает: депозит ${:.2}, открыто {}, покупок за сутки {}",
-                    d.equity, d.state.open.len(), d.state.entries - day_entries));
-                (day_at, day_entries) = (t, d.state.entries);
-            }
-            // The minute's close so far: each coin's mid now.
-            let minute = (t / 60.0).floor() as i64;
-            // The window and the regime's 15 minutes, whichever is longer.
-            let keep = d.p.window.max(15) as usize + 3;
-            {
-                let b = books.read().unwrap();
-                for (c, book) in b.iter() {
-                    if t - book.time_ms as f64 / 1000.0 > BOOK_STALE_S {
-                        continue;
-                    }
-                    if let Some(m) = book.mid() {
-                        d.closes.update(c, minute, m, keep);
-                    }
-                }
-            }
-            if d.regime_hist.back().is_none_or(|x| t - x.0 >= 1.0) {
-                let (b, i, _) = d.breadth(None, minute);
-                d.regime_hist.push_back((t, b, i));
-                while d.regime_hist.front().is_some_and(|x| t - x.0 > 70.0) {
-                    d.regime_hist.pop_front();
-                }
-            }
-            if minute > last_minute {
-                // The minute before closed: its signals, then the exits due.
-                d.signals(minute - 1).await;
-                last_minute = minute;
-            }
-            d.exits().await;
+            d.tick().await;
         }
     });
     Ok(())
+}
+
+impl Dip {
+    /// A tick (every 250 ms): the start's health check once, the volumes and the account as due, the day's note, the
+    /// books' mids into the minute's closes, the regime's sample; the minute that closed: its signals; the exits due.
+    async fn tick(&mut self) {
+        let t = now();
+        if !self.checked && (self.health_ready() || t - self.started > 120.0) {
+            self.checked = true;
+            let h = self.health();
+            log!("dip: {}", h.replace('\n', " | "));
+            crate::notify::send(h);
+        }
+        if t - self.vol_at >= VOLUME_EVERY_S {
+            match self.api.meta().await {
+                Ok((_, ctx)) => {
+                    self.funding = ctx.iter().map(|(c, x)| (c.clone(), x.funding)).collect();
+                    self.volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
+                    self.vol_at = t;
+                }
+                Err(e) => log!("dip: volumes not read: {e:#}"),
+            }
+        }
+        if t - self.read_at >= 60.0 {
+            self.read_at = t;
+            self.reconcile().await;
+        }
+        if t - self.day_at >= 86_400.0 && self.equity > 0.0 {
+            crate::notify::send(format!("📊 покупка падений работает: депозит ${:.2}, открыто {}, покупок за сутки {}",
+                self.equity, self.state.open.len(), self.state.entries - self.day_entries));
+            self.day_at = t;
+            self.day_entries = self.state.entries;
+        }
+        // The minute's close so far: each coin's mid now.
+        let minute = (t / 60.0).floor() as i64;
+        // The window and the regime's 15 minutes, whichever is longer.
+        let keep = self.p.window.max(15) as usize + 3;
+        {
+            let b = self.books.read().unwrap();
+            for (c, book) in b.iter() {
+                if t - book.time_ms as f64 / 1000.0 > BOOK_STALE_S {
+                    continue;
+                }
+                if let Some(m) = book.mid() {
+                    self.closes.update(c, minute, m, keep);
+                }
+            }
+        }
+        if self.regime_hist.back().is_none_or(|x| t - x.0 >= 1.0) {
+            let (b, i, _) = self.breadth(None, minute);
+            self.regime_hist.push_back((t, b, i));
+            while self.regime_hist.front().is_some_and(|x| t - x.0 > 70.0) {
+                self.regime_hist.pop_front();
+            }
+        }
+        if minute > self.last_minute {
+            // The minute before closed: its signals, then the exits due.
+            self.signals(minute - 1).await;
+            self.last_minute = minute;
+        }
+        self.exits().await;
+    }
 }
 
 impl Dip {
@@ -1188,7 +1200,8 @@ mod candles {
         let (store, _) = Store::for_test();
         Dip { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default(), closes: Closes::default(),
             volume: HashMap::new(), funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: Default::default(),
-            regime_hist: VecDeque::new(), old_enough: HashMap::new() }
+            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: 0, vol_at: 0.0, read_at: 0.0, day_at: 0.0,
+            day_entries: 0, started: now(), checked: false }
     }
 
     #[tokio::test]

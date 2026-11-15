@@ -70,6 +70,7 @@ use crate::api::{Api, now};
 use crate::config::Config;
 use crate::venue::{Venue, equity_of};
 use crate::log;
+use crate::runner::Every;
 use crate::store::Store;
 
 const DOC: &str = "dip";
@@ -328,10 +329,11 @@ struct Dip {
     old_enough: HashMap<String, bool>,
     api: Api,
     last_minute: i64,
-    vol_at: f64,
-    read_at: f64,
+    /// The volumes every `VOLUME_EVERY_S` (counted once read), the account every minute.
+    vol: Every,
+    read: Every,
     /// The day's note to the chat: alive, the equity, what it did.
-    day_at: f64,
+    day: Every,
     day_entries: u64,
     /// The start's health check to the chat: once the books, the volumes and the equity are in (or what is missing after 2 min).
     started: f64,
@@ -373,16 +375,22 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
     }
     let mut d = Dip { venue, unified, cfg: cfg.clone(), store, p, state, closes: Closes::default(), volume: HashMap::new(),
         funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: books.clone(), regime_hist: VecDeque::new(), old_enough: HashMap::new(),
-        api, last_minute: (now() / 60.0).floor() as i64, vol_at: 0.0, read_at: 0.0, day_at: now(), day_entries: 0, started: now(), checked: false };
+        api, last_minute: (now() / 60.0).floor() as i64, vol: Every::new(VOLUME_EVERY_S), read: Every::new(60.0),
+        day: Every::since(86_400.0, now()), day_entries: 0, started: now(), checked: false };
     d.day_entries = d.state.entries;
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-        loop {
-            tick.tick().await;
-            d.tick().await;
-        }
-    });
+    crate::runner::spawn(d);
     Ok(())
+}
+
+/// On the runner: a tick every 250 ms (its own timers inside, its positions read in it).
+impl crate::runner::Strategy for Dip {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: 0.25, step: crate::runner::Due::Every(0.0), check_s: f64::INFINITY }
+    }
+
+    async fn step(&mut self, _at: f64) {
+        self.tick().await;
+    }
 }
 
 impl Dip {
@@ -396,24 +404,23 @@ impl Dip {
             log!("dip: {}", h.replace('\n', " | "));
             crate::notify::send(h);
         }
-        if t - self.vol_at >= VOLUME_EVERY_S {
+        if self.vol.ready(t) {
             match self.api.meta().await {
                 Ok((_, ctx)) => {
                     self.funding = ctx.iter().map(|(c, x)| (c.clone(), x.funding)).collect();
                     self.volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
-                    self.vol_at = t;
+                    self.vol.done(t);
                 }
                 Err(e) => log!("dip: volumes not read: {e:#}"),
             }
         }
-        if t - self.read_at >= 60.0 {
-            self.read_at = t;
+        if self.read.due(t) {
             self.reconcile().await;
         }
-        if t - self.day_at >= 86_400.0 && self.equity > 0.0 {
+        if self.day.ready(t) && self.equity > 0.0 {
             crate::notify::send(format!("📊 покупка падений работает: депозит ${:.2}, открыто {}, покупок за сутки {}",
                 self.equity, self.state.open.len(), self.state.entries - self.day_entries));
-            self.day_at = t;
+            self.day.done(t);
             self.day_entries = self.state.entries;
         }
         // The minute's close so far: each coin's mid now.
@@ -1200,8 +1207,8 @@ mod candles {
         let (store, _) = Store::for_test();
         Dip { venue: f.venue(), unified: false, cfg: cfg(), store, p: Params::from_env(), state: State::default(), closes: Closes::default(),
             volume: HashMap::new(), funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: Default::default(),
-            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: 0, vol_at: 0.0, read_at: 0.0, day_at: 0.0,
-            day_entries: 0, started: now(), checked: false }
+            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: 0, vol: Every::new(VOLUME_EVERY_S),
+            read: Every::new(60.0), day: Every::since(86_400.0, now()), day_entries: 0, started: now(), checked: false }
     }
 
     #[tokio::test]
@@ -1247,8 +1254,8 @@ mod poll {
         p.dry = !live;
         Dip { venue: f.venue(), unified: false, cfg: cfg(), store, p, state: State::default(), closes: Closes::default(),
             volume: HashMap::new(), funding: HashMap::new(), positions: HashMap::new(), equity: 0.0, books: Default::default(),
-            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: (now() / 60.0).floor() as i64, vol_at: 0.0,
-            read_at: 0.0, day_at: now(), day_entries: 0, started: now(), checked: false }
+            regime_hist: VecDeque::new(), old_enough: HashMap::new(), api: f.api(), last_minute: (now() / 60.0).floor() as i64,
+            vol: Every::new(VOLUME_EVERY_S), read: Every::new(60.0), day: Every::since(86_400.0, now()), day_entries: 0, started: now(), checked: false }
     }
 
     /// `coin`'s price `m`: the fake's mid and the engine's book.

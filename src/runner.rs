@@ -59,6 +59,11 @@ impl Every {
         Every { s, at: None }
     }
 
+    /// Counted as done at `t` already: first due `s` after it.
+    pub(crate) fn since(s: f64, t: f64) -> Every {
+        Every { s, at: Some(t) }
+    }
+
     /// Due at `t` (and then counted as done).
     pub(crate) fn due(&mut self, t: f64) -> bool {
         let due = self.ready(t);
@@ -165,6 +170,9 @@ mod tests {
         assert!(w.ready(0.0) && w.ready(10.0));
         w.done(10.0);
         assert!(!w.ready(69.0) && w.ready(70.0));
+        // from a start: first due a wait after it
+        let s = Every::since(86_400.0, 100.0);
+        assert!(!s.ready(100.0) && !s.ready(86_499.0) && s.ready(86_500.0));
     }
 
     /// A strategy that writes down what it did.

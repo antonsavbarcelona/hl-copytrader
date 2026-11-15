@@ -213,6 +213,18 @@ thread_local! {
     static UNCAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's answer of `risk_fits` (None: the registry's).
+    static FITS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// This test's thread: `risk_fits` answers `x`.
+#[cfg(test)]
+pub(crate) fn family_fits(x: bool) {
+    FITS.with(|u| u.set(Some(x)));
+}
+
 /// This test's thread without the family's caps (see `UNCAPPED`).
 #[cfg(test)]
 pub(crate) fn uncapped() {
@@ -221,6 +233,10 @@ pub(crate) fn uncapped() {
 
 /// Whether one more trade risking `risk` $ fits the family's open-risk cap (`can_open`'s cap alone).
 pub(crate) fn risk_fits(risk: f64) -> bool {
+    #[cfg(test)]
+    if let Some(x) = FITS.with(|u| u.get()) {
+        return x;
+    }
     let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
     let eq = equity();
     let open_risk: f64 = OPEN.lock().unwrap().as_ref().map_or(0.0, |m| m.values().flatten().map(|x| x.1).sum());

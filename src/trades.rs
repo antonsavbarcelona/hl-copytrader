@@ -199,7 +199,24 @@ pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
             .filter(|(c, v)| crate::clusters::cluster_of(c) == cl && v.iter().any(|k| crate::clusters::capped_kind(&k.0)))
             .count() >= crate::clusters::cap())
     };
+    #[cfg(test)]
+    if UNCAPPED.with(|u| u.get()) {
+        return fits && !crowded;
+    }
     fits && !crowded && (cap == 0 || n < cap) && (risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's thread without the family's open-trade and open-risk caps: the registry is the whole test process's
+    /// (the other tests' trades fill the caps at random), the coin's own checks stay.
+    static UNCAPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This test's thread without the family's caps (see `UNCAPPED`).
+#[cfg(test)]
+pub(crate) fn uncapped() {
+    UNCAPPED.with(|u| u.set(true));
 }
 
 /// Whether one more trade risking `risk` $ fits the family's open-risk cap (`can_open`'s cap alone).

@@ -789,3 +789,133 @@ mod lifecycle {
         assert!(o.iter().all(|x| (x.left - pos.qty).abs() < 1e-9));
     }
 }
+
+/// The poll as a whole on the fake exchange, its clock moved: the candles read after a start, a 5m close's hook
+/// bought (live or on paper), an add on a fall, the exits.
+#[cfg(test)]
+mod poll {
+    use super::*;
+    use crate::testkit::{Clock, FakeHl, cfg};
+
+    const B5: f64 = 300.0;
+
+    /// The fake with `coin` 400 flat 5m bars at 100 then 30 falling to 85 (the bar before `bar` the last), BTC flat;
+    /// both liquid. -> the fake, the RSI dip on it (live with the account, else paper), the events.
+    async fn setup(coin: &str, bar: f64, live: bool) -> (FakeHl, RsiDip, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+        let f = FakeHl::start(&[("BTC", 5, 40, 100.0), (coin, 2, 10, 85.0)]).await;
+        let k0 = bar - 430.0 * B5;
+        let fall: Vec<(f64, f64, f64, f64, f64, f64)> = (0..430).map(|i| {
+            let c = if i < 400 { 100.0 } else { 100.0 - (i - 399) as f64 * 0.5 };
+            (k0 + i as f64 * B5, c, c, c, c, 1.0)
+        }).collect();
+        let flat: Vec<(f64, f64, f64, f64, f64, f64)> = (0..430).map(|i| (k0 + i as f64 * B5, 100.0, 100.0, 100.0, 100.0, 1.0)).collect();
+        f.set_candles(coin, "5m", &fall);
+        f.set_candles("BTC", "5m", &flat);
+        f.set_volume(coin, 50e6);
+        f.set_volume("BTC", 1e9);
+        f.set_mid("BTC", 100.0);
+        let (store, rx) = Store::for_test();
+        let c = cfg();
+        let venue = live.then(|| (f.venue(), false));
+        let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, c.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
+        let r = RsiDip { cfg: c, store, api: f.api(), venue, keeper, p: Params::from_env(), state: State::default(), closes: Closes::default(),
+            volume: HashMap::new(), backfilled: HashSet::new(), h1: HashMap::new(), vol_at: 0.0, backfill_at: 0.0, check_at: 0.0,
+            last_bar: (bar / 60.0) as i64 / BAR_MIN };
+        (f, r, rx)
+    }
+
+    fn opened(ev: &[Value]) -> Vec<&Value> {
+        ev.iter().filter(|e| e["what"] == "open").collect()
+    }
+
+    #[tokio::test]
+    async fn a_hook_under_the_ema_is_bought_live_with_its_stop_and_take_and_the_take_ends_it() {
+        let bar = ((now() / B5).floor() + 1.0) * B5;
+        let clock = Clock::at(bar + 5.0);
+        let (f, mut r, mut rx) = setup("RPA", bar, true).await;
+        trades::uncapped();
+        // the bar `bar`: the candles read (a coin a poll), the mid a tick over the last close
+        f.set_mid("RPA", 85.2);
+        for _ in 0..3 {
+            r.tick().await;
+            clock.go(BACKFILL_EVERY_S);
+        }
+        assert!(opened(&crate::store::drain(&mut rx)).is_empty(), "no signal before the bar closes");
+        // the bar closed: the hook bought at market, its stop and take resting
+        clock.go(B5);
+        r.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let o = opened(&ev);
+        assert_eq!(o.len(), 1, "{ev:?}");
+        assert_eq!((o[0]["coin"].as_str(), o[0]["live"].as_bool(), o[0]["wide"].as_bool()), (Some("RPA"), Some(true), Some(false)));
+        assert!(o[0]["rsi"].as_f64().unwrap() < 35.0 && o[0]["under"].as_f64().unwrap() < -0.08, "{:?}", o[0]);
+        assert!(f.position("RPA") > 0.0 && f.open_orders("RPA").len() == 2 && trades::registered("RPA"));
+        assert_eq!((r.state.open.len(), r.state.opened), (1, 1));
+        // over the take: the take fills; the check sees it
+        f.set_mid("RPA", 85.2 * (1.0 + r.p.take) * 1.01);
+        clock.go(CHECK_EVERY_S);
+        r.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let c: Vec<&Value> = ev.iter().filter(|e| e["what"] == "close").collect();
+        assert_eq!((c.len(), c[0]["why"].as_str(), c[0]["live"].as_bool()), (1, Some("take"), Some(true)), "{ev:?}");
+        assert!(r.state.open.is_empty() && !trades::registered("RPA") && f.position("RPA") == 0.0);
+        assert_eq!((r.state.closed, r.state.wins), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn on_paper_the_same_hook_an_add_on_a_fall_and_the_take_at_the_average() {
+        let bar = ((now() / B5).floor() + 1.0) * B5;
+        let clock = Clock::at(bar + 5.0);
+        let (f, mut r, mut rx) = setup("RPB", bar, false).await;
+        f.set_mid("RPB", 85.2);
+        for _ in 0..3 {
+            r.tick().await;
+            clock.go(BACKFILL_EVERY_S);
+        }
+        clock.go(B5);
+        r.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(opened(&ev).len(), 1, "{ev:?}");
+        assert_eq!(opened(&ev)[0]["live"].as_bool(), Some(false));
+        assert!(f.position("RPB") == 0.0 && !trades::registered("RPB"));
+        // a 5m close the step under the buy: an add at the mid
+        let low = 85.2 * (1.0 - r.p.add_step) * 0.99;
+        f.set_mid("RPB", low);
+        r.tick().await;
+        clock.go(B5);
+        r.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let a: Vec<&Value> = ev.iter().filter(|e| e["what"] == "add").collect();
+        assert_eq!(a.len(), 1, "{ev:?}");
+        assert_eq!(r.state.open[0].units, 2);
+        let avg = r.state.open[0].avg();
+        assert!((a[0]["avg"].as_f64().unwrap() - avg).abs() < 1e-9 && avg < 85.2 && avg > low);
+        // the take at the new average
+        f.set_mid("RPB", avg * (1.0 + r.p.take) + 0.01);
+        clock.go(10.0);
+        r.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let c: Vec<&Value> = ev.iter().filter(|e| e["what"] == "close").collect();
+        assert_eq!((c.len(), c[0]["why"].as_str(), c[0]["units"].as_u64()), (1, Some("take"), Some(2)), "{ev:?}");
+        assert!((c[0]["px"].as_f64().unwrap() - avg * (1.0 + r.p.take)).abs() < 1e-9, "the paper take at its level");
+        assert!(r.state.open.is_empty() && r.state.pnl_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn btc_moving_in_the_bar_no_signal() {
+        let bar = ((now() / B5).floor() + 1.0) * B5;
+        let clock = Clock::at(bar + 5.0);
+        let (f, mut r, mut rx) = setup("RPC", bar, false).await;
+        f.set_mid("RPC", 85.2);
+        for _ in 0..3 {
+            r.tick().await;
+            clock.go(BACKFILL_EVERY_S);
+        }
+        f.set_mid("BTC", 101.0);   // BTC +1% over its last 15 minutes, in the bar that closes
+        r.tick().await;
+        clock.go(B5);
+        r.tick().await;
+        assert!(opened(&crate::store::drain(&mut rx)).is_empty());
+        assert!(r.state.open.is_empty());
+    }
+}

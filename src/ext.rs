@@ -445,6 +445,7 @@ mod lifecycle {
     #[tokio::test]
     async fn a_trade_is_opened_with_its_stop_and_take_resting_then_its_take_ends_it() {
         let (f, mut x, mut rx) = setup("XTA", true).await;
+        trades::uncapped();
         crate::store::push_signal(&x.k.cfg, &json!({"source": "jt", "id": 1, "coin": "XTAUSDT", "side": "long", "at": now() - 60.0, "stop": 96.0, "take": 108.0})).await.unwrap();
         crate::store::push_signal(&x.k.cfg, &json!({"source": "jt", "id": 2, "coin": "NOPE", "side": "long", "at": now()})).await.unwrap();
         x.step(now()).await;

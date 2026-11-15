@@ -35,6 +35,7 @@ use crate::dip::{Closes, cooled};
 use crate::notify::usd;
 use crate::log;
 use crate::keeper::{HeldIn, Keeper};
+use crate::runner::Every;
 use crate::store::Store;
 use crate::venue::Venue;
 
@@ -156,34 +157,43 @@ struct Hip3 {
     closes: Closes,
     lows: HashMap<String, (i64, f64)>,
     dexes: Vec<String>,
-    dex_at: f64,
-    vol_at: f64,
+    /// The dexes read every `DEXES_EVERY_S` (and while none), the volumes every `VOLUME_EVERY_S` (each counted once read),
+    /// the weekend trades' positions every 30 s.
+    dex: Every,
+    vol: Every,
+    wkd_pos: Every,
     volume: HashMap<String, f64>,
     last_minute: i64,
     checked: bool,
     started: f64,
-    wkd_pos_at: f64,
 }
 
 impl Hip3 {
+    #[allow(clippy::too_many_arguments)]
+    fn new(cfg: Config, store: Store, api: Api, venue: Option<(Venue, HashMap<String, u32>)>, wkd_k: Option<Keeper>, p: Params, wp: crate::wkd::Params, state: State) -> Hip3 {
+        Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes: Closes::default(), lows: HashMap::new(), dexes: Vec::new(),
+            dex: Every::new(DEXES_EVERY_S), vol: Every::new(VOLUME_EVERY_S), wkd_pos: Every::new(30.0), volume: HashMap::new(),
+            last_minute: (now() / 60.0).floor() as i64, checked: false, started: now() }
+    }
+
     /// A poll (every `POLL_S`): the dexes, the volumes, the mids; the weekend dips stepped and traded; the falls of the
     /// minute that closed; the results due.
     async fn tick(&mut self) {
-        let Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes, lows, dexes, dex_at, vol_at, volume, last_minute, checked, started, wkd_pos_at } = self;
+        let Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes, lows, dexes, dex, vol, wkd_pos, volume, last_minute, checked, started } = self;
         let save = |cfg: &Config, state: &State| {
             crate::store::save_state(cfg, DOC, "hip3", state);
         };
         let t = now();
-        if t - *dex_at >= DEXES_EVERY_S || dexes.is_empty() {
+        if dex.ready(t) || dexes.is_empty() {
             match api.dexes().await {
                 Ok(d) => {
                     *dexes = d;
-                    *dex_at = t;
+                    dex.done(t);
                 }
                 Err(e) => log!("hip3: dexes not read: {e:#}"),
             }
         }
-        if t - *vol_at >= VOLUME_EVERY_S {
+        if vol.ready(t) {
             let mut v = HashMap::new();
             for d in dexes.iter() {
                 match api.dex_volumes(d).await {
@@ -193,7 +203,7 @@ impl Hip3 {
             }
             if !v.is_empty() {
                 *volume = v;
-                *vol_at = t;
+                vol.done(t);
             }
         }
         let minute = (t / 60.0).floor() as i64;
@@ -257,10 +267,7 @@ impl Hip3 {
             }
             // Out on time; a position gone (its stop or take filled) ends its trade.
             if !state.wkd.live.is_empty() {
-                let check = t - *wkd_pos_at >= 30.0;
-                if check {
-                    *wkd_pos_at = t;
-                }
+                let check = wkd_pos.due(t);
                 if let Some(k) = &wkd_k {
                     wchanged |= k.sweep(&mut state.wkd.live, |t| t, true, check).await;
                 }
@@ -314,6 +321,17 @@ impl Hip3 {
     }
 }
 
+/// On the runner: a poll every `POLL_S` (its own timers inside, its positions checked in it).
+impl crate::runner::Strategy for Hip3 {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: POLL_S, step: crate::runner::Due::Every(0.0), check_s: f64::INFINITY }
+    }
+
+    async fn step(&mut self, _at: f64) {
+        self.tick().await;
+    }
+}
+
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::runner::off("hip3", "HIP3_ENABLED") {
         return Ok(());
@@ -353,16 +371,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     crate::notify::send(format!("🧪 HIP-3 {}, {wkd_mode}", wp.label()));
     let cfg = cfg.clone();
     let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), unified, cfg.clone(), store.clone()));
-    let h = Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes: Closes::default(), lows: HashMap::new(), dexes: Vec::new(), dex_at: 0.0, vol_at: 0.0,
-        volume: HashMap::new(), last_minute: (now() / 60.0).floor() as i64, checked: false, started: now(), wkd_pos_at: 0.0 };
-    tokio::spawn(async move {
-        let mut h = h;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
-        loop {
-            tick.tick().await;
-            h.tick().await;
-        }
-    });
+    crate::runner::spawn(Hip3::new(cfg, store, api, venue, wkd_k, p, wp, state));
     Ok(())
 }
 
@@ -484,9 +493,7 @@ mod poll {
         let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), false, cfg(), store.clone()));
         let mut wp = crate::wkd::Params::from_env();
         wp.live = Some(None);
-        Hip3 { cfg: cfg(), store, api: f.api(), venue, wkd_k, p: Params::from_env(), wp, state: State::default(), closes: Closes::default(),
-            lows: HashMap::new(), dexes: Vec::new(), dex_at: 0.0, vol_at: 0.0, volume: HashMap::new(), last_minute: (now() / 60.0).floor() as i64,
-            checked: false, started: now(), wkd_pos_at: 0.0 }
+        Hip3::new(cfg(), store, f.api(), venue, wkd_k, Params::from_env(), wp, State::default())
     }
 
     /// `n` polls 10 s apart.

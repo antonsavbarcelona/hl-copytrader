@@ -110,6 +110,7 @@ pub(crate) fn env_f(k: &str, d: f64) -> f64 {
 pub(crate) fn set_equity(x: f64) {
     if x > 0.0 {
         *EQUITY.lock().unwrap() = x;
+        crate::guard::seen(x);
     }
 }
 
@@ -126,8 +127,9 @@ pub(crate) fn equity() -> f64 {
 /// +1,108%, the drawdown with the open 17.3% (3.38%: 20.2%), ~2.9 trades a day.
 /// 2 from 2026-10-31 (the user's call: V134, the whole HL portfolio 2025-05 .. 2026-10 with 2 strategies a coin was
 /// x409 at 5% with the open drawdown 24%; 2% keeps the drawdown near 10%).
+/// Halved while the account is deep under its peak (`guard`, 2026-11-15).
 pub(crate) fn family_risk_pct() -> f64 {
-    env_f("FAMILY_RISK_PCT", 2.0)
+    env_f("FAMILY_RISK_PCT", 2.0) * crate::guard::scale()
 }
 
 /// How many of the family's strategies may hold one coin at once: `FAMILY_PER_COIN` (2 from 2026-10-31; was 1).

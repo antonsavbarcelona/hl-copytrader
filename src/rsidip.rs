@@ -119,7 +119,7 @@ impl Params {
     /// (`RSIDIP_RISK_USD` without either or the equity).
     fn buy_risk(&self) -> f64 {
         let eq = trades::equity();
-        if self.risk_pct > 0.0 && eq > 0.0 { self.risk_pct / 100.0 * eq / self.buys() } else { trades::risk_usd(self.risk_usd * self.buys()) / self.buys() }
+        if self.risk_pct > 0.0 && eq > 0.0 { self.risk_pct * crate::guard::scale() / 100.0 * eq / self.buys() } else { trades::risk_usd(self.risk_usd * self.buys()) / self.buys() }
     }
 
     /// The sizing for the log and the chat.

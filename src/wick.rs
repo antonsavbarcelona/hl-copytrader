@@ -159,7 +159,7 @@ fn rung_risk_at(coin: &str, rung: usize, shut: bool, base: f64, pct: f64, eq: f6
     if rung != 0 || shut || !coin.contains(':') {
         return base;
     }
-    if pct > 0.0 && eq > 0.0 { H3_MAIN_RISK_PCT / 100.0 * eq } else { base * H3_MAIN_RISK_PCT / 2.0 }
+    if pct > 0.0 && eq > 0.0 { H3_MAIN_RISK_PCT * crate::guard::scale() / 100.0 * eq } else { base * H3_MAIN_RISK_PCT / 2.0 }
 }
 const POLL_S: f64 = 5.0;
 const ORDERS_EVERY_S: f64 = 15.0;

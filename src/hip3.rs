@@ -143,12 +143,183 @@ fn wkd_keeper(v: Venue, unified: bool, cfg: Config, store: Store) -> Keeper {
 }
 
 /// Starts the HIP-3 dip's signals unless `HIP3_ENABLED` is "0" (see the module).
+/// The HIP-3 dips' signals and the weekend dips running: the dexes, their prices and volumes, the state.
+struct Hip3 {
+    cfg: Config,
+    store: Store,
+    api: Api,
+    venue: Option<(Venue, HashMap<String, u32>)>,
+    wkd_k: Option<Keeper>,
+    p: Params,
+    wp: crate::wkd::Params,
+    state: State,
+    closes: Closes,
+    lows: HashMap<String, (i64, f64)>,
+    dexes: Vec<String>,
+    dex_at: f64,
+    vol_at: f64,
+    volume: HashMap<String, f64>,
+    last_minute: i64,
+    checked: bool,
+    started: f64,
+    wkd_pos_at: f64,
+}
+
+impl Hip3 {
+    /// A poll (every `POLL_S`): the dexes, the volumes, the mids; the weekend dips stepped and traded; the falls of the
+    /// minute that closed; the results due.
+    async fn tick(&mut self) {
+        let Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes, lows, dexes, dex_at, vol_at, volume, last_minute, checked, started, wkd_pos_at } = self;
+        let save = |cfg: &Config, state: &State| {
+            crate::store::save_state(cfg, DOC, "hip3", state);
+        };
+        let t = now();
+        if t - *dex_at >= DEXES_EVERY_S || dexes.is_empty() {
+            match api.dexes().await {
+                Ok(d) => {
+                    *dexes = d;
+                    *dex_at = t;
+                }
+                Err(e) => log!("hip3: dexes not read: {e:#}"),
+            }
+        }
+        if t - *vol_at >= VOLUME_EVERY_S {
+            let mut v = HashMap::new();
+            for d in dexes.iter() {
+                match api.dex_volumes(d).await {
+                    Ok(x) => v.extend(x),
+                    Err(e) => log!("hip3: {d} volumes not read: {e:#}"),
+                }
+            }
+            if !v.is_empty() {
+                *volume = v;
+                *vol_at = t;
+            }
+        }
+        let minute = (t / 60.0).floor() as i64;
+        let keep = WINDOWS[1] as usize + 3;
+        if let Ok(m) = api.mids("").await {
+            if let Some(b) = m.get("BTC") {
+                closes.update("BTC", minute, *b, keep);
+            }
+        }
+        for d in dexes.iter() {
+            match api.mids(d).await {
+                Ok(m) => {
+                    for (c, px) in m {
+                        closes.update(&c, minute, px, keep);
+                        let lo = lows.entry(c).or_insert((minute, px));
+                        if lo.0 != minute || px < lo.1 {
+                            *lo = (minute, if lo.0 == minute { lo.1.min(px) } else { px });
+                        }
+                    }
+                }
+                Err(e) => log!("hip3: {d} mids not read: {e:#}"),
+            }
+        }
+        // The weekend dips' shadow: the signals and their paper results.
+        let (wev, wentries) = state.wkd.step(&wp, &closes, &lows, &volume, minute, t);
+        let mut wchanged = !wev.is_empty();
+        for ev in wev {
+            event(&store, ev);
+        }
+        // Traded (WKD_LIVE): bought on the poll after the signal (px: the signal's mid, or the paper entry), within the trial, the slots and the family's cap.
+        if let Some((v, _)) = &venue {
+            for (coin, px) in wentries {
+                let Some(trial) = wp.live else { continue };
+                if !crate::trades::trial_open(trial, state.wkd.opened) {
+                    log!("hip3: weekend {coin} not traded (the trial's {} trades done)", state.wkd.opened);
+                    continue;
+                }
+                let risk = crate::trades::risk_usd(wp.risk_usd);
+                if !v.coins.contains_key(&coin) || state.wkd.live.len() >= wp.max_open || !crate::trades::can_open(&coin, "wkd", 1.0, risk) {
+                    log!("hip3: weekend {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
+                    continue;
+                }
+                let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
+                let size = crate::trades::size_for(risk, wp.stop(), mid);
+                let book = v.book_now(&coin, true, size).await;
+                let r = crate::trades::open_market_at(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s(), mid).await;
+                match r {
+                    Ok(tr) => {
+                        event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "mid": mid, "book": book, "size": tr.size, "notional": tr.size * tr.entry_px,
+                            "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": wp.hold_s() / 3600.0}));
+                        crate::trades::register(&coin, "wkd", tr.risk(), tr.size);
+                        state.wkd.live.push(tr);
+                        state.wkd.opened += 1;
+                        if !crate::trades::trial_open(trial, state.wkd.opened) {
+                            crate::notify::send(format!("🏁 HIP-3 выходные: проба окончена ({} сделки), дальше только сигналы", state.wkd.opened));
+                        }
+                    }
+                    Err(e) => event(&store, json!({"what": "wkd_error", "coin": coin, "error": format!("{e:#}")})),
+                }
+                wchanged = true;
+            }
+            // Out on time; a position gone (its stop or take filled) ends its trade.
+            if !state.wkd.live.is_empty() {
+                let check = t - *wkd_pos_at >= 30.0;
+                if check {
+                    *wkd_pos_at = t;
+                }
+                if let Some(k) = &wkd_k {
+                    wchanged |= k.sweep(&mut state.wkd.live, |t| t, true, check).await;
+                }
+            }
+        }
+        if wchanged {
+            save(&cfg, &state);
+        }
+        if !*checked && (t - *started > 120.0) {
+            *checked = true;
+            let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
+            let ok = !dexes.is_empty() && !volume.is_empty() && closes.at("BTC", i64::MAX).is_some();
+            crate::notify::send(format!("{} HIP-3 health check: бирж {}, монет {}, ликвидных (от ${:.0}M): {}, BTC {}",
+                if ok { "✅" } else { "⚠️" }, dexes.len(), closes.0.len().saturating_sub(1), p.min_vol / 1e6, liquid,
+                closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into())));
+        }
+        if minute > *last_minute && (minute % 10 == 0 || !*checked) {
+            log!("hip3: {} dexes, {} coins priced, {} with ${:.0}M+ a day, BTC {}", dexes.len(), closes.0.len(), volume.values().filter(|v| **v >= p.min_vol).count(),
+                p.min_vol / 1e6, closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into()));
+        }
+        if minute > *last_minute {
+            // The minute before closed: its falls.
+            let before = state.last_move.len();
+            let sig = falls(&closes, &volume, &mut state.last_move, minute - 1, &p);
+            let mut changed = state.last_move.len() != before || state.last_move.values().any(|m| *m == minute - 1);
+            state.last_move.retain(|_, m| minute - 1 - *m < COOLDOWN_MIN);
+            for (coin, fall, w) in sig {
+                let Some(mid) = closes.at(&coin, i64::MAX) else { continue };
+                state.signals += 1;
+                state.pending.push(Pending { coin: coin.clone(), at: t, mid, fall, window: w });
+                event(&store, json!({"what": "signal", "coin": coin, "fall": fall, "window": w, "mid": mid, "volume": volume.get(&coin).copied().unwrap_or(0.0),
+                    "btc": closes.change("BTC", minute - 1, w)}));
+                changed = true;
+            }
+            if changed {
+                save(&cfg, &state);
+            }
+            *last_minute = minute;
+        }
+        // The results due.
+        let due: Vec<Pending> = state.pending.iter().filter(|x| t - x.at >= p.hold_s).cloned().collect();
+        if !due.is_empty() {
+            for x in &due {
+                let mid = closes.at(&x.coin, i64::MAX).unwrap_or(0.0);
+                event(&store, json!({"what": "result", "coin": x.coin, "fall": x.fall, "window": x.window, "mid_signal": x.mid, "mid": mid,
+                    "after_min": (t - x.at) / 60.0, "ret_pct": if mid > 0.0 { (mid / x.mid - 1.0) * 100.0 } else { 0.0 }}));
+            }
+            state.pending.retain(|x| t - x.at < p.hold_s);
+            save(&cfg, &state);
+        }
+    }
+}
+
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::runner::off("hip3", "HIP3_ENABLED") {
         return Ok(());
     }
     let p = Params::from_env();
-    let mut state: State = crate::store::load_state(cfg, DOC).await?;
+    let state: State = crate::store::load_state(cfg, DOC).await?;
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",
         p.drop * 100.0, p.btc_max * 100.0, p.min_vol / 1e6, p.hold_s / 60.0, state.pending.len());
     // The live venue with the HIP-3 perps (HIP3_LIVE on unless "0"): without it the signals only.
@@ -182,159 +353,14 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     crate::notify::send(format!("🧪 HIP-3 {}, {wkd_mode}", wp.label()));
     let cfg = cfg.clone();
     let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), unified, cfg.clone(), store.clone()));
+    let h = Hip3 { cfg, store, api, venue, wkd_k, p, wp, state, closes: Closes::default(), lows: HashMap::new(), dexes: Vec::new(), dex_at: 0.0, vol_at: 0.0,
+        volume: HashMap::new(), last_minute: (now() / 60.0).floor() as i64, checked: false, started: now(), wkd_pos_at: 0.0 };
     tokio::spawn(async move {
-        let mut closes = Closes::default();
-        let mut lows: HashMap<String, (i64, f64)> = HashMap::new();
-        let (mut dexes, mut dex_at, mut vol_at): (Vec<String>, f64, f64) = (Vec::new(), 0.0, 0.0);
-        let mut volume: HashMap<String, f64> = HashMap::new();
-        let mut last_minute = (now() / 60.0).floor() as i64;
-        let mut checked = false;
-        let started = now();
-        let mut wkd_pos_at = 0.0;
-        let save = |cfg: &Config, state: &State| {
-            crate::store::save_state(&cfg, DOC, "hip3", state);
-        };
+        let mut h = h;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
             tick.tick().await;
-            let t = now();
-            if t - dex_at >= DEXES_EVERY_S || dexes.is_empty() {
-                match api.dexes().await {
-                    Ok(d) => {
-                        dexes = d;
-                        dex_at = t;
-                    }
-                    Err(e) => log!("hip3: dexes not read: {e:#}"),
-                }
-            }
-            if t - vol_at >= VOLUME_EVERY_S {
-                let mut v = HashMap::new();
-                for d in &dexes {
-                    match api.dex_volumes(d).await {
-                        Ok(x) => v.extend(x),
-                        Err(e) => log!("hip3: {d} volumes not read: {e:#}"),
-                    }
-                }
-                if !v.is_empty() {
-                    volume = v;
-                    vol_at = t;
-                }
-            }
-            let minute = (t / 60.0).floor() as i64;
-            let keep = WINDOWS[1] as usize + 3;
-            if let Ok(m) = api.mids("").await {
-                if let Some(b) = m.get("BTC") {
-                    closes.update("BTC", minute, *b, keep);
-                }
-            }
-            for d in &dexes {
-                match api.mids(d).await {
-                    Ok(m) => {
-                        for (c, px) in m {
-                            closes.update(&c, minute, px, keep);
-                            let lo = lows.entry(c).or_insert((minute, px));
-                            if lo.0 != minute || px < lo.1 {
-                                *lo = (minute, if lo.0 == minute { lo.1.min(px) } else { px });
-                            }
-                        }
-                    }
-                    Err(e) => log!("hip3: {d} mids not read: {e:#}"),
-                }
-            }
-            // The weekend dips' shadow: the signals and their paper results.
-            let (wev, wentries) = state.wkd.step(&wp, &closes, &lows, &volume, minute, t);
-            let mut wchanged = !wev.is_empty();
-            for ev in wev {
-                event(&store, ev);
-            }
-            // Traded (WKD_LIVE): bought on the poll after the signal (px: the signal's mid, or the paper entry), within the trial, the slots and the family's cap.
-            if let Some((v, _)) = &venue {
-                for (coin, px) in wentries {
-                    let Some(trial) = wp.live else { continue };
-                    if !crate::trades::trial_open(trial, state.wkd.opened) {
-                        log!("hip3: weekend {coin} not traded (the trial's {} trades done)", state.wkd.opened);
-                        continue;
-                    }
-                    let risk = crate::trades::risk_usd(wp.risk_usd);
-                    if !v.coins.contains_key(&coin) || state.wkd.live.len() >= wp.max_open || !crate::trades::can_open(&coin, "wkd", 1.0, risk) {
-                        log!("hip3: weekend {coin} not traded (not on a USDC dex, at most open, held or the family's risk cap)");
-                        continue;
-                    }
-                    let mid = closes.at(&coin, i64::MAX).unwrap_or(px);
-                    let size = crate::trades::size_for(risk, wp.stop(), mid);
-                    let book = v.book_now(&coin, true, size).await;
-                    let r = crate::trades::open_market_at(v, &coin, size, wp.stop(), Some(wp.take()), wp.hold_s(), mid).await;
-                    match r {
-                        Ok(tr) => {
-                            event(&store, json!({"what": "wkd_open", "coin": coin, "px": tr.entry_px, "paper_px": px, "mid": mid, "book": book, "size": tr.size, "notional": tr.size * tr.entry_px,
-                                "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": wp.hold_s() / 3600.0}));
-                            crate::trades::register(&coin, "wkd", tr.risk(), tr.size);
-                            state.wkd.live.push(tr);
-                            state.wkd.opened += 1;
-                            if !crate::trades::trial_open(trial, state.wkd.opened) {
-                                crate::notify::send(format!("🏁 HIP-3 выходные: проба окончена ({} сделки), дальше только сигналы", state.wkd.opened));
-                            }
-                        }
-                        Err(e) => event(&store, json!({"what": "wkd_error", "coin": coin, "error": format!("{e:#}")})),
-                    }
-                    wchanged = true;
-                }
-                // Out on time; a position gone (its stop or take filled) ends its trade.
-                if !state.wkd.live.is_empty() {
-                    let check = t - wkd_pos_at >= 30.0;
-                    if check {
-                        wkd_pos_at = t;
-                    }
-                    if let Some(k) = &wkd_k {
-                        wchanged |= k.sweep(&mut state.wkd.live, |t| t, true, check).await;
-                    }
-                }
-            }
-            if wchanged {
-                save(&cfg, &state);
-            }
-            if !checked && (t - started > 120.0) {
-                checked = true;
-                let liquid = volume.values().filter(|v| **v >= p.min_vol).count();
-                let ok = !dexes.is_empty() && !volume.is_empty() && closes.at("BTC", i64::MAX).is_some();
-                crate::notify::send(format!("{} HIP-3 health check: бирж {}, монет {}, ликвидных (от ${:.0}M): {}, BTC {}",
-                    if ok { "✅" } else { "⚠️" }, dexes.len(), closes.0.len().saturating_sub(1), p.min_vol / 1e6, liquid,
-                    closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into())));
-            }
-            if minute > last_minute && (minute % 10 == 0 || !checked) {
-                log!("hip3: {} dexes, {} coins priced, {} with ${:.0}M+ a day, BTC {}", dexes.len(), closes.0.len(), volume.values().filter(|v| **v >= p.min_vol).count(),
-                    p.min_vol / 1e6, closes.at("BTC", i64::MAX).map(|x| format!("{x:.0}")).unwrap_or("-".into()));
-            }
-            if minute > last_minute {
-                // The minute before closed: its falls.
-                let before = state.last_move.len();
-                let sig = falls(&closes, &volume, &mut state.last_move, minute - 1, &p);
-                let mut changed = state.last_move.len() != before || state.last_move.values().any(|m| *m == minute - 1);
-                state.last_move.retain(|_, m| minute - 1 - *m < COOLDOWN_MIN);
-                for (coin, fall, w) in sig {
-                    let Some(mid) = closes.at(&coin, i64::MAX) else { continue };
-                    state.signals += 1;
-                    state.pending.push(Pending { coin: coin.clone(), at: t, mid, fall, window: w });
-                    event(&store, json!({"what": "signal", "coin": coin, "fall": fall, "window": w, "mid": mid, "volume": volume.get(&coin).copied().unwrap_or(0.0),
-                        "btc": closes.change("BTC", minute - 1, w)}));
-                    changed = true;
-                }
-                if changed {
-                    save(&cfg, &state);
-                }
-                last_minute = minute;
-            }
-            // The results due.
-            let due: Vec<Pending> = state.pending.iter().filter(|x| t - x.at >= p.hold_s).cloned().collect();
-            if !due.is_empty() {
-                for x in &due {
-                    let mid = closes.at(&x.coin, i64::MAX).unwrap_or(0.0);
-                    event(&store, json!({"what": "result", "coin": x.coin, "fall": x.fall, "window": x.window, "mid_signal": x.mid, "mid": mid,
-                        "after_min": (t - x.at) / 60.0, "ret_pct": if mid > 0.0 { (mid / x.mid - 1.0) * 100.0 } else { 0.0 }}));
-                }
-                state.pending.retain(|x| t - x.at < p.hold_s);
-                save(&cfg, &state);
-            }
+            h.tick().await;
         }
     });
     Ok(())

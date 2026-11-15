@@ -144,8 +144,7 @@ fn wkd_keeper(v: Venue, unified: bool, cfg: Config, store: Store) -> Keeper {
 
 /// Starts the HIP-3 dip's signals unless `HIP3_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if crate::trades::switch("HIP3_ENABLED").is_none() {
-        log!("hip3: off (HIP3_ENABLED=0)");
+    if crate::runner::off("hip3", "HIP3_ENABLED") {
         return Ok(());
     }
     let p = Params::from_env();

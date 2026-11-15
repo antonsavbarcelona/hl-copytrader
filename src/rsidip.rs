@@ -367,8 +367,7 @@ async fn sweep_live(k: &Keeper, state: &mut State, t: f64) -> bool {
 
 /// Starts the RSI dip unless `RSIDIP_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if trades::switch("RSIDIP_ENABLED").is_none() {
-        log!("rsidip: off (RSIDIP_ENABLED=0)");
+    if crate::runner::off("rsidip", "RSIDIP_ENABLED") {
         return Ok(());
     }
     let p = Params::from_env();

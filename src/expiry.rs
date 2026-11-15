@@ -156,12 +156,10 @@ impl Expiry {
 
 /// Starts the monthly-expiry short unless `EXP_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch("EXP_ENABLED").is_none() {
-        log!("expiry: off (EXP_ENABLED=0)");
+    if crate::runner::off("expiry", "EXP_ENABLED") {
         return Ok(());
     }
-    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
-        log!("expiry: LIVE_KEY / LIVE_ACCOUNT not set, off");
+    let Some((venue, unified)) = crate::runner::venue("expiry").await? else {
         return Ok(());
     };
     let p = Params::from_env();
@@ -175,16 +173,25 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         venue.account, p.from_min / 60, p.from_min % 60, p.to_min / 60, p.to_min % 60, p.stop * 100.0, trades::sizing_label(p.risk_usd, p.stop), state.open.len());
     crate::notify::send(format!("🔻 шорт экспирации НА ДЕНЬГИ: BTC и ETH в последнюю пятницу месяца с {:02}:{:02} до {:02}:{:02} UTC, стоп +{:.0}%, риск {}{}",
         p.from_min / 60, p.from_min % 60, p.to_min / 60, p.to_min % 60, p.stop * 100.0, trades::sizing_label(p.risk_usd, p.stop), trades::trial_label(p.trial, state.opened)));
-    let mut x = Expiry { k: Keeper::new(venue, unified, cfg.clone(), store, KIND, message, HeldIn::No), p, state };
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(EVERY_S as u64));
-        loop {
-            tick.tick().await;
-            x.enter().await;
-            x.check().await;
-        }
-    });
+    let x = Expiry { k: Keeper::new(venue, unified, cfg.clone(), store, KIND, message, HeldIn::No), p, state };
+    crate::runner::spawn(x);
     Ok(())
+}
+
+impl crate::runner::Strategy for Expiry {
+    fn schedule(&self) -> crate::runner::Schedule {
+        // the entry and the check every tick
+        crate::runner::Schedule { tick_s: EVERY_S, step: crate::runner::Due::Every(0.0), check_s: 0.0 }
+    }
+
+    async fn step(&mut self, at: f64) {
+        let _ = at;
+        self.enter().await
+    }
+
+    async fn check(&mut self) {
+        Expiry::check(self).await
+    }
 }
 
 #[cfg(test)]

@@ -359,8 +359,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         log!("breakout: off (BRK_ENABLED=0, BRKS_ENABLED=0)");
         return Ok(());
     }
-    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
-        log!("breakout: LIVE_KEY / LIVE_ACCOUNT not set, off");
+    let Some((venue, unified)) = crate::runner::venue("breakout").await? else {
         return Ok(());
     };
     let mut states = HashMap::new();
@@ -382,24 +381,27 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
             s.stop * 100.0, s.take * 100.0, s.hold_s / H, s.max_open, p.min_vol / 1e6, trades::trial_label(s.trial, states[s.kind].opened)));
     }
     let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(venue.clone(), unified, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
-    let mut l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
-    tokio::spawn(async move {
-        let mut check_at = 0.0;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
-        loop {
-            tick.tick().await;
-            let t = now();
-            let bar = ((t - AFTER_CLOSE_S) / H).floor() * H - H;
-            if bar > l.stepped {
-                l.step(bar).await;
-            }
-            if now() - check_at >= CHECK_EVERY_S {
-                l.check().await;
-                check_at = now();
-            }
-        }
-    });
+    let l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
+    crate::runner::spawn(l);
     Ok(())
+}
+
+impl crate::runner::Strategy for Breakout {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: 10.0, step: crate::runner::Due::Bar { len: H, after: AFTER_CLOSE_S }, check_s: CHECK_EVERY_S }
+    }
+
+    fn stepped(&self) -> f64 {
+        self.stepped
+    }
+
+    async fn step(&mut self, at: f64) {
+        Breakout::step(self, at).await
+    }
+
+    async fn check(&mut self) {
+        Breakout::check(self).await
+    }
 }
 
 #[cfg(test)]

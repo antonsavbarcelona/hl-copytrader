@@ -176,12 +176,10 @@ impl Listing {
 
 /// Starts the listing short unless `LIST_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch("LIST_ENABLED").is_none() {
-        log!("listing: off (LIST_ENABLED=0)");
+    if crate::runner::off("listing", "LIST_ENABLED") {
         return Ok(());
     }
-    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
-        log!("listing: LIVE_KEY / LIVE_ACCOUNT not set, off");
+    let Some((venue, unified)) = crate::runner::venue("listing").await? else {
         return Ok(());
     };
     let p = Params::from_env();
@@ -195,24 +193,24 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("🔻 шорт листингов НА ДЕНЬГИ: через {:.0} дн. после листинга (оборот от ${:.0}M), стоп +{:.0}%, тейк −{:.0}%, держим {:.0} дн., риск {}, до {} позиций{}",
         p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,
         trades::trial_label(p.trial, state.opened)));
-    let mut l = Listing { k: Keeper::new(venue, unified, cfg.clone(), store, "listing", message, HeldIn::Days), p, state };
-    tokio::spawn(async move {
-        let (mut look_at, mut check_at) = (0.0, 0.0);
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            tick.tick().await;
-            let t = now();
-            if t - look_at >= LOOK_EVERY_S {
-                l.look().await;
-                look_at = t;
-            }
-            if t - check_at >= CHECK_EVERY_S {
-                l.check().await;
-                check_at = t;
-            }
-        }
-    });
+    let l = Listing { k: Keeper::new(venue, unified, cfg.clone(), store, "listing", message, HeldIn::Days), p, state };
+    crate::runner::spawn(l);
     Ok(())
+}
+
+impl crate::runner::Strategy for Listing {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: 30.0, step: crate::runner::Due::Every(LOOK_EVERY_S), check_s: CHECK_EVERY_S }
+    }
+
+    async fn step(&mut self, at: f64) {
+        let _ = at;
+        self.look().await
+    }
+
+    async fn check(&mut self) {
+        Listing::check(self).await
+    }
 }
 
 #[cfg(test)]

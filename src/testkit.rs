@@ -469,6 +469,39 @@ impl FakeHl {
     }
 }
 
+/// A test's clock: `api::now()` is `at` on this thread until it is dropped (then the system clock again); `go`
+/// moves it on. Only for what reads `now()`: tokio's timers still run on their own time.
+pub(crate) struct Clock;
+
+impl Clock {
+    pub(crate) fn at(t: f64) -> Clock {
+        crate::api::TEST_NOW.with(|c| c.set(Some(t)));
+        Clock
+    }
+
+    pub(crate) fn go(&self, s: f64) {
+        crate::api::TEST_NOW.with(|c| c.set(Some(c.get().unwrap_or(0.0) + s)));
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        crate::api::TEST_NOW.with(|c| c.set(None));
+    }
+}
+
+#[test]
+fn the_test_clock_moves_and_goes_back_to_the_system_one() {
+    let sys = crate::api::now();
+    {
+        let c = Clock::at(1000.0);
+        assert_eq!(crate::api::now(), 1000.0);
+        c.go(3600.0);
+        assert_eq!(crate::api::now(), 4600.0);
+    }
+    assert!(crate::api::now() >= sys);
+}
+
 /// A run's settings for a test: no database, the states in a fresh temp folder.
 pub(crate) fn cfg() -> Config {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

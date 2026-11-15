@@ -330,8 +330,7 @@ struct Dip {
 
 /// Starts the dip-buy unless `DIP_ENABLED` is "0", with the live account set (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books) -> Result<()> {
-    if crate::trades::switch("DIP_ENABLED").is_none() {
-        log!("dip: off (DIP_ENABLED=0)");
+    if crate::runner::off("dip", "DIP_ENABLED") {
         return Ok(());
     }
     let Some((venue, unified)) = crate::venue::venue_from_env(Some(books.clone())).await? else {

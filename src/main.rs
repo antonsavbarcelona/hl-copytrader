@@ -17,6 +17,7 @@ mod listing;
 mod market;
 mod venue;
 mod notify;
+mod runner;
 mod rsidip;
 mod squeeze;
 mod store;

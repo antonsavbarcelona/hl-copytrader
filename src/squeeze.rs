@@ -357,22 +357,17 @@ impl Squeeze {
 /// Starts the squeeze breakout long unless `SQZ_ENABLED` is "0" (unset or "1": live; set empty: the trial), and the
 /// breakdown short likewise by `SQZS_ENABLED`.
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch("SQZ_ENABLED").is_none() {
-        log!("squeeze: off (SQZ_ENABLED=0)");
-    } else {
+    if !crate::runner::off("squeeze", "SQZ_ENABLED") {
         launch(cfg, store.clone(), Params::from_env()).await?;
     }
-    if trades::switch("SQZS_ENABLED").is_none() {
-        log!("squeeze_short: off (SQZS_ENABLED=0)");
-    } else {
+    if !crate::runner::off("squeeze_short", "SQZS_ENABLED") {
         launch(cfg, store, Params::short_from_env()).await?;
     }
     Ok(())
 }
 
 async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
-    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
-        log!("{}: LIVE_KEY / LIVE_ACCOUNT not set, off", p.kind);
+    let Some((venue, unified)) = crate::runner::venue(p.kind).await? else {
         return Ok(());
     };
     let state: State = crate::store::load_state(cfg, p.kind).await?;
@@ -388,24 +383,27 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
         if short { "шорт пробоя вниз из сжатия" } else { "пробой из сжатия" }, if short { "под" } else { "над" }, p.q * 100.0,
         if p.btc_filter { ", BTC выше 50-дн. средней" } else { "" }, p.min_vol / 1e6, p.atr_k, if short { "выше" } else { "ниже" }, p.hold_s / DAY, p.max_open,
         trades::trial_label(p.trial, state.opened)));
-    let mut l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state };
-    tokio::spawn(async move {
-        let mut check_at = 0.0;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
-        loop {
-            tick.tick().await;
-            let t = now();
-            let bar = ((t - AFTER_CLOSE_S) / BAR).floor() * BAR - BAR;
-            if bar > l.state.stepped {
-                l.step(bar).await;
-            }
-            if t - check_at >= CHECK_EVERY_S {
-                l.check().await;
-                check_at = t;
-            }
-        }
-    });
+    let l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state };
+    crate::runner::spawn(l);
     Ok(())
+}
+
+impl crate::runner::Strategy for Squeeze {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: 20.0, step: crate::runner::Due::Bar { len: BAR, after: AFTER_CLOSE_S }, check_s: CHECK_EVERY_S }
+    }
+
+    fn stepped(&self) -> f64 {
+        self.state.stepped
+    }
+
+    async fn step(&mut self, at: f64) {
+        Squeeze::step(self, at).await
+    }
+
+    async fn check(&mut self) {
+        Squeeze::check(self).await
+    }
 }
 
 #[cfg(test)]

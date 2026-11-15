@@ -248,12 +248,10 @@ impl TrendLong {
 
 /// Starts the trend long unless `TREND_ENABLED` is "0" (unset or "1": live; set empty: the trial).
 pub async fn start(cfg: &Config, store: Store) -> Result<()> {
-    if trades::switch("TREND_ENABLED").is_none() {
-        log!("trend: off (TREND_ENABLED=0)");
+    if crate::runner::off("trend", "TREND_ENABLED") {
         return Ok(());
     }
-    let Some((venue, unified)) = crate::venue::venue_from_env(None).await? else {
-        log!("trend: LIVE_KEY / LIVE_ACCOUNT not set, off");
+    let Some((venue, unified)) = crate::runner::venue("trend").await? else {
         return Ok(());
     };
     let p = Params::from_env();
@@ -266,25 +264,28 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("📈 тренд лонг НА ДЕНЬГИ: пробой {}-дн. максимума (оборот от ${:.0}M), BTC выше {}-дн. средней; выход: закрытие дня на {:.0} ATR ниже лучшего или {:.0} дн.; риск {} на сделку, до {} позиций{}",
         p.days, p.min_vol / 1e6, p.btc_ma, p.atr_k, p.max_days, if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct()) } else { format!("${:.0}", p.risk_usd) },
         p.max_open, trades::trial_label(p.trial, state.opened)));
-    let mut l = TrendLong { k: Keeper::new(venue, unified, cfg.clone(), store, "trend", message, HeldIn::Days), p, state };
-    tokio::spawn(async move {
-        let mut check_at = 0.0;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            tick.tick().await;
-            let t = now();
-            // The last closed day's open: the step once a day, AFTER_CLOSE_S after the UTC midnight.
-            let day = ((t - AFTER_CLOSE_S) / DAY).floor() * DAY - DAY;
-            if day > l.state.stepped {
-                l.step(day).await;
-            }
-            if t - check_at >= CHECK_EVERY_S {
-                l.check().await;
-                check_at = t;
-            }
-        }
-    });
+    let l = TrendLong { k: Keeper::new(venue, unified, cfg.clone(), store, "trend", message, HeldIn::Days), p, state };
+    crate::runner::spawn(l);
     Ok(())
+}
+
+impl crate::runner::Strategy for TrendLong {
+    fn schedule(&self) -> crate::runner::Schedule {
+        // the last closed day's step, AFTER_CLOSE_S after the UTC midnight
+        crate::runner::Schedule { tick_s: 30.0, step: crate::runner::Due::Bar { len: DAY, after: AFTER_CLOSE_S }, check_s: CHECK_EVERY_S }
+    }
+
+    fn stepped(&self) -> f64 {
+        self.state.stepped
+    }
+
+    async fn step(&mut self, at: f64) {
+        TrendLong::step(self, at).await
+    }
+
+    async fn check(&mut self) {
+        TrendLong::check(self).await
+    }
 }
 
 #[cfg(test)]

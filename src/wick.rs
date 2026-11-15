@@ -1516,8 +1516,7 @@ impl Wick {
 
 /// Starts the wick bids unless `WICK_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
-    if trades::switch("WICK_ENABLED").is_none() {
-        log!("wick: off (WICK_ENABLED=0)");
+    if crate::runner::off("wick", "WICK_ENABLED") {
         return Ok(());
     }
     let Some((core, unified)) = crate::venue::venue_from_env(None).await? else {

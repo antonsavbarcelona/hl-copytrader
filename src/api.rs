@@ -13,8 +13,19 @@ use tokio::sync::Mutex;
 
 const INFO: &str = "https://api.hyperliquid.xyz/info";
 
+/// Now (s since the epoch): the system clock; in a test, the test's clock once it is set (`testkit::Clock`).
 pub fn now() -> f64 {
+    #[cfg(test)]
+    if let Some(t) = TEST_NOW.with(|c| c.get()) {
+        return t;
+    }
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's clock (its thread's: a `#[tokio::test]` runs its tasks on that thread).
+    pub(crate) static TEST_NOW: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Exchange clock minus ours, microseconds (see `Api::sync_clock`).

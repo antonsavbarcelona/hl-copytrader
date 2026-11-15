@@ -194,7 +194,13 @@ impl State {
                 }).cloned().collect())
             }
             "allMids" => Value::Object(self.mids.iter().filter(|(c, _)| on_dex(c)).map(|(c, m)| (c.clone(), json!(m.to_string()))).collect()),
-            "perpDexs" => json!([null]),
+            "perpDexs" => {
+                // the main dex (null), then the HIP-3 dexes of the coins ("xyz:A" -> "xyz")
+                let mut d: Vec<String> = self.assets.values().filter_map(|x| x.0.split_once(':').map(|(d, _)| d.to_string())).collect();
+                d.sort();
+                d.dedup();
+                Value::Array(std::iter::once(Value::Null).chain(d.into_iter().map(|n| json!({"name": n}))).collect())
+            }
             "userAbstraction" => json!("default"),
             "orderStatus" => {
                 let oid = q["oid"].as_u64().unwrap_or(0);

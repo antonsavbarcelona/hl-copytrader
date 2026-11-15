@@ -467,3 +467,102 @@ mod wkd_lifecycle {
         assert!(crate::trades::registered("xyz:WKD"));
     }
 }
+
+#[cfg(test)]
+mod poll {
+    //! The loop's poll on the fake with its clock moved (before it goes on the runner): the weekend dip bought live with
+    //! its stop and take and ended by its take; a weekday HIP-3 fall a paper signal and its result.
+    use super::*;
+    use crate::testkit::{Clock, FakeHl, cfg};
+
+    /// Saturday 2026-11-14 12:00 UTC; Wednesday 2026-11-11 15:00 UTC (10:00 New York: the session, no night).
+    const SAT_NOON: f64 = 1_794_657_600.0;
+    const WED_15: f64 = 1_794_409_200.0;
+
+    fn hip3(f: &FakeHl, store: Store, live: bool) -> Hip3 {
+        let venue = live.then(|| (f.venue(), HashMap::new()));
+        let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), false, cfg(), store.clone()));
+        let mut wp = crate::wkd::Params::from_env();
+        wp.live = Some(None);
+        Hip3 { cfg: cfg(), store, api: f.api(), venue, wkd_k, p: Params::from_env(), wp, state: State::default(), closes: Closes::default(),
+            lows: HashMap::new(), dexes: Vec::new(), dex_at: 0.0, vol_at: 0.0, volume: HashMap::new(), last_minute: (now() / 60.0).floor() as i64,
+            checked: false, started: now(), wkd_pos_at: 0.0 }
+    }
+
+    /// `n` polls 10 s apart.
+    async fn polls(h: &mut Hip3, c: &Clock, n: usize) {
+        for _ in 0..n {
+            h.tick().await;
+            c.go(10.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_weekend_dip_is_bought_live_with_its_stop_and_take_and_its_take_ends_it() {
+        crate::trades::uncapped();
+        let f = FakeHl::start(&[("BTC", 5, 40, 100_000.0), ("xyz:HPA", 2, 10, 100.0)]).await;
+        f.set_volume("xyz:HPA", 1e6);
+        let (store, mut rx) = Store::for_test();
+        let c = Clock::at(SAT_NOON);
+        let mut h = hip3(&f, store, true);
+        polls(&mut h, &c, 72).await; // 12 minutes flat: the 15 min reference
+        assert_eq!(h.dexes, vec!["xyz".to_string()]);
+        assert!(crate::store::drain(&mut rx).iter().all(|e| e["what"] != "wkd_signal"));
+        f.set_mid("xyz:HPA", 95.0); // 5% under the highest close of the 15 minutes before
+        h.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let s = ev.iter().find(|e| e["what"] == "wkd_signal").expect("the signal");
+        assert_eq!((s["kind"].as_str(), s["coin"].as_str(), s["night"].as_bool()), (Some("hip3"), Some("xyz:HPA"), Some(false)));
+        assert!((s["fall"].as_f64().unwrap() + 0.05).abs() < 1e-9);
+        assert_eq!(f.position("xyz:HPA"), 0.0, "bought on the poll after it");
+        c.go(10.0);
+        h.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let o = ev.iter().find(|e| e["what"] == "wkd_open").expect("bought");
+        // the stop loses the strategy's $20 (no equity known): 20 / 10% / 95
+        let size = f.position("xyz:HPA");
+        assert!((size - 20.0 / 0.10 / 95.0).abs() < 0.01, "{size}");
+        assert!((o["stop_px"].as_f64().unwrap() - 85.5).abs() < 0.01 && (o["take_px"].as_f64().unwrap() - 99.75).abs() < 0.01, "{o}");
+        assert_eq!(f.open_orders("xyz:HPA").len(), 2, "its stop and take rest");
+        assert!(crate::trades::registered("xyz:HPA") && h.state.wkd.live.len() == 1 && h.state.wkd.opened == 1);
+        // the take fills; the next check (30 s) ends the trade
+        f.set_mid("xyz:HPA", 100.0);
+        c.go(30.0);
+        h.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let x = ev.iter().find(|e| e["what"] == "wkd_exit").expect("ended");
+        assert_eq!((x["why"].as_str(), x["coin"].as_str()), (Some("take"), Some("xyz:HPA")), "{ev:?}");
+        assert!(x["pnl_usd"].as_f64().unwrap() > 0.0);
+        assert!(h.state.wkd.live.is_empty() && !crate::trades::registered("xyz:HPA") && f.position("xyz:HPA") == 0.0);
+        // the coin not again within 2 h
+        f.set_mid("xyz:HPA", 90.0);
+        polls(&mut h, &c, 3).await;
+        assert!(crate::store::drain(&mut rx).iter().all(|e| e["what"] != "wkd_signal"));
+    }
+
+    #[tokio::test]
+    async fn a_weekday_hip3_fall_is_a_paper_signal_with_its_result_30_min_on_and_no_weekend_trade() {
+        let f = FakeHl::start(&[("BTC", 5, 40, 100_000.0), ("xyz:HPB", 2, 10, 100.0)]).await;
+        f.set_volume("xyz:HPB", 20e6);
+        let (store, mut rx) = Store::for_test();
+        let c = Clock::at(WED_15);
+        let mut h = hip3(&f, store, false);
+        polls(&mut h, &c, 60).await; // 10 minutes flat
+        f.set_mid("xyz:HPB", 90.0); // 10% in the minute
+        polls(&mut h, &c, 7).await; // into the next minute: the closed one's falls
+        let ev = crate::store::drain(&mut rx);
+        let s = ev.iter().find(|e| e["what"] == "signal").unwrap_or_else(|| panic!("the signal: {ev:?}"));
+        assert_eq!((s["coin"].as_str(), s["window"].as_i64()), (Some("xyz:HPB"), Some(5)));
+        assert!((s["fall"].as_f64().unwrap() + 0.10).abs() < 1e-9 && s["mid"].as_f64() == Some(90.0));
+        assert!(ev.iter().all(|e| e["what"] != "wkd_signal"), "a weekday session: no weekend dip");
+        assert_eq!((h.state.pending.len(), h.state.signals), (1, 1));
+        // 30 min on: its result at the mid
+        f.set_mid("xyz:HPB", 93.0);
+        c.go(1800.0);
+        h.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let r = ev.iter().find(|e| e["what"] == "result").expect("the result");
+        assert!((r["ret_pct"].as_f64().unwrap() - (93.0 / 90.0 - 1.0) * 100.0).abs() < 1e-6, "{r}");
+        assert!(h.state.pending.is_empty() && f.position("xyz:HPB") == 0.0);
+    }
+}

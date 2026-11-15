@@ -36,7 +36,10 @@ pub(crate) trait Strategy: Send + 'static {
         0.0
     }
     fn step(&mut self, at: f64) -> impl Future<Output = ()> + Send;
-    fn check(&mut self) -> impl Future<Output = ()> + Send;
+    /// The positions' check (none: a strategy that checks them in its step).
+    fn check(&mut self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// The open of the last bar of `len` s closed `after` s or more before `t`.
@@ -58,11 +61,20 @@ impl Every {
 
     /// Due at `t` (and then counted as done).
     pub(crate) fn due(&mut self, t: f64) -> bool {
-        let due = self.at.is_none_or(|at| t - at >= self.s);
+        let due = self.ready(t);
         if due {
-            self.at = Some(t);
+            self.done(t);
         }
         due
+    }
+
+    /// Due at `t`, not counted as done (see `done`: something counted only when it worked).
+    pub(crate) fn ready(&self, t: f64) -> bool {
+        self.at.is_none_or(|at| t - at >= self.s)
+    }
+
+    pub(crate) fn done(&mut self, t: f64) {
+        self.at = Some(t);
     }
 }
 
@@ -148,6 +160,11 @@ mod tests {
         assert!(!e.due(1300.0));
         let mut z = Every::new(0.0);
         assert!(z.due(5.0) && z.due(5.0));
+        // counted only when done
+        let mut w = Every::new(60.0);
+        assert!(w.ready(0.0) && w.ready(10.0));
+        w.done(10.0);
+        assert!(!w.ready(69.0) && w.ready(70.0));
     }
 
     /// A strategy that writes down what it did.

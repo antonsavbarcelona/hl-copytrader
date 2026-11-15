@@ -51,6 +51,7 @@ use serde_json::{Value, json};
 use crate::api::{Api, now};
 use crate::config::Config;
 use crate::dip::Closes;
+use crate::runner::Every;
 use crate::venue::{Placed, Venue};
 use crate::notify::usd;
 use crate::log;
@@ -379,27 +380,34 @@ struct RsiDip {
     backfilled: HashSet<String>,
     /// Coin -> (the hour it was read in, its 1h EMA200).
     h1: HashMap<String, (i64, Option<f64>)>,
-    vol_at: f64,
-    backfill_at: f64,
-    check_at: f64,
+    /// The volumes (read again only once read), the next coin's candles after a start, the live positions' check.
+    vol: Every,
+    backfill: Every,
+    check: Every,
     last_bar: i64,
 }
 
 impl RsiDip {
+    fn new(cfg: Config, store: Store, api: Api, venue: Option<(Venue, bool)>, p: Params, state: State) -> Self {
+        let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, cfg.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
+        RsiDip { cfg, store, api, venue, keeper, p, state, closes: Closes::default(), volume: HashMap::new(), backfilled: HashSet::new(), h1: HashMap::new(),
+            vol: Every::new(VOLUME_EVERY_S), backfill: Every::new(BACKFILL_EVERY_S), check: Every::new(CHECK_EVERY_S), last_bar: (now() / 60.0).floor() as i64 / BAR_MIN }
+    }
+
     /// A poll (every `POLL_S`): the volumes, the mids, the candles; the live positions checked, the paper ones' exits;
     /// on a 5m close the adds and the signals.
     async fn tick(&mut self) {
-        let RsiDip { cfg, store, api, venue, keeper, p, state, closes, volume, backfilled, h1, vol_at, backfill_at, check_at, last_bar } = self;
+        let RsiDip { cfg, store, api, venue, keeper, p, state, closes, volume, backfilled, h1, vol, backfill, check, last_bar } = self;
         let save = |cfg: &Config, state: &State| {
             crate::store::save_state(cfg, DOC, "rsidip", state);
         };
         let t = now();
         let bar = (t / 60.0).floor() as i64 / BAR_MIN;
-        if t - *vol_at >= VOLUME_EVERY_S {
+        if vol.ready(t) {
             match api.meta().await {
                 Ok((_, ctx)) => {
                     *volume = ctx.into_iter().map(|(c, x)| (c, x.day_volume)).collect();
-                    *vol_at = t;
+                    vol.done(t);
                 }
                 Err(e) => log!("rsidip: volumes not read: {e:#}"),
             }
@@ -415,7 +423,7 @@ impl RsiDip {
             closes.update(c, bar, *px, KEEP);
         }
         // The 5m candles after a start: the liquid coins (and BTC) without enough bars.
-        if t - *backfill_at >= BACKFILL_EVERY_S {
+        if backfill.due(t) {
             let short = |c: &String| !backfilled.contains(c) && closes.0.get(c).is_none_or(|q| q.len() < MIN_BARS);
             let mut todo: Vec<(&String, &f64)> = volume.iter().filter(|(c, v)| (**v >= p.min_vol || c.as_str() == "BTC") && short(c)).collect();
             todo.sort_by(|a, b| b.1.total_cmp(a.1));
@@ -426,7 +434,6 @@ impl RsiDip {
                     Err(e) => log!("rsidip: {c} candles not read: {e:#}"),
                 }
             }
-            *backfill_at = t;
         }
         // The 1h EMA200s: a liquid coin not read this hour, the biggest first, one a poll.
         let hour = (t / 3600.0).floor() as i64;
@@ -450,8 +457,7 @@ impl RsiDip {
         let mut changed = false;
         // The live positions on the account: out on time; gone (the stop or the take filled).
         if let Some(k) = &keeper {
-            if t - *check_at >= CHECK_EVERY_S && state.open.iter().any(|x| x.live()) {
-                *check_at = t;
+            if state.open.iter().any(|x| x.live()) && check.due(t) {
                 changed |= sweep_live(k, state, t).await;
             }
         }
@@ -576,6 +582,17 @@ impl RsiDip {
     }
 }
 
+impl crate::runner::Strategy for RsiDip {
+    fn schedule(&self) -> crate::runner::Schedule {
+        // a poll every POLL_S: the live positions checked inside it, before the paper exits, the adds and the signals
+        crate::runner::Schedule { tick_s: POLL_S, step: crate::runner::Due::Every(0.0), check_s: f64::INFINITY }
+    }
+
+    async fn step(&mut self, _at: f64) {
+        self.tick().await
+    }
+}
+
 /// Starts the RSI dip unless `RSIDIP_ENABLED` is "0" (see the module).
 pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::runner::off("rsidip", "RSIDIP_ENABLED") {
@@ -601,17 +618,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
         p.sizing(), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
-    let cfg = cfg.clone();
-    let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, cfg.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
-    let mut r = RsiDip { cfg, store, api, venue, keeper, p, state, closes: Closes::default(), volume: HashMap::new(), backfilled: HashSet::new(), h1: HashMap::new(),
-        vol_at: 0.0, backfill_at: 0.0, check_at: 0.0, last_bar: (now() / 60.0).floor() as i64 / BAR_MIN };
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
-        loop {
-            tick.tick().await;
-            r.tick().await;
-        }
-    });
+    crate::runner::spawn(RsiDip::new(cfg.clone(), store, api, venue, p, state));
     Ok(())
 }
 
@@ -815,12 +822,8 @@ mod poll {
         f.set_volume("BTC", 1e9);
         f.set_mid("BTC", 100.0);
         let (store, rx) = Store::for_test();
-        let c = cfg();
-        let venue = live.then(|| (f.venue(), false));
-        let keeper = venue.as_ref().map(|(v, u)| Keeper::new(v.clone(), *u, c.clone(), store.clone(), "rsidip", message, HeldIn::Hours));
-        let r = RsiDip { cfg: c, store, api: f.api(), venue, keeper, p: Params::from_env(), state: State::default(), closes: Closes::default(),
-            volume: HashMap::new(), backfilled: HashSet::new(), h1: HashMap::new(), vol_at: 0.0, backfill_at: 0.0, check_at: 0.0,
-            last_bar: (bar / 60.0) as i64 / BAR_MIN };
+        let r = RsiDip::new(cfg(), store, f.api(), live.then(|| (f.venue(), false)), Params::from_env(), State::default());
+        assert_eq!(r.last_bar, (bar / 60.0) as i64 / BAR_MIN);
         (f, r, rx)
     }
 

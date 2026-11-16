@@ -127,6 +127,7 @@ use serde_json::{Value, json};
 use crate::api::{Api, now, num};
 use crate::config::Config;
 use crate::dip::Closes;
+use crate::runner::Every;
 use crate::venue::{Placed, Venue};
 use crate::notify::usd;
 use crate::log;
@@ -579,14 +580,14 @@ struct Wick {
     moved: Vec<(String, usize, Bid, f64)>,
     /// The crypto bids' fills seen in the last `CRASH_WINDOW_S` (the breaker's count).
     crash_fills: Vec<f64>,
-    /// The loop's timers (s): the volumes, the oracles, the orders' check, the candles' backfill, every HIP-3 dex's mids,
-    /// the orphans; the minute the levels were last placed for.
-    vol_at: f64,
-    oracle_at: f64,
-    orders_at: f64,
-    backfill_at: f64,
-    h3_at: f64,
-    orphans_at: f64,
+    /// The loop's timers: the volumes (and the coins picked again), the oracles, the orders' check, the candles' backfill,
+    /// every HIP-3 dex's mids, the orphans; the minute the levels were last placed for.
+    vol_every: Every,
+    oracle_every: Every,
+    orders_every: Every,
+    backfill_every: Every,
+    h3_every: Every,
+    orphans_every: Every,
     last_minute: i64,
 }
 
@@ -1684,19 +1685,23 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         crate::notify::send(format!("🎣 акции США в сессию: вторая лимитка (лесенка) на {:.0}% ниже, тейк = отступ, стоп {:.0}%, {:.0} мин",
             p.h3_session_deep_pct * 100.0, p.stop * 100.0, p.hold_s / 60.0));
     }
-    let mut w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
+    let w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
         picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), crash_fills: Vec::new(),
-        vol_at: 0.0, oracle_at: 0.0, orders_at: 0.0, backfill_at: 0.0, h3_at: 0.0, orphans_at: 0.0, last_minute: (now() / 60.0).floor() as i64 };
+        vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S), last_minute: (now() / 60.0).floor() as i64 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
-        loop {
-            tick.tick().await;
-            w.tick().await;
-        }
-    });
+    crate::runner::spawn(w);
     Ok(())
+}
+
+impl crate::runner::Strategy for Wick {
+    fn schedule(&self) -> crate::runner::Schedule {
+        crate::runner::Schedule { tick_s: POLL_S, step: crate::runner::Due::Every(0.0), check_s: f64::INFINITY }
+    }
+
+    async fn step(&mut self, _at: f64) {
+        self.tick().await;
+    }
 }
 
 impl Wick {
@@ -1706,34 +1711,26 @@ impl Wick {
     async fn tick(&mut self) {
         let t = now();
         let minute = (t / 60.0).floor() as i64;
-        let repick = t - self.vol_at >= VOLUME_EVERY_S;
+        let repick = self.vol_every.due(t);
         if repick {
             self.read_ctx(true).await;
-            self.vol_at = t;
-            self.oracle_at = t;
-        } else if t - self.oracle_at >= ORACLE_EVERY_S {
+            self.oracle_every.done(t);
+        } else if self.oracle_every.due(t) {
             self.read_ctx(false).await;
-            self.oracle_at = t;
         }
-        let all = t - self.h3_at >= H3_MIDS_EVERY_S;
+        let all = self.h3_every.due(t);
         self.read_mids(minute, all).await;
-        if all {
-            self.h3_at = t;
-        }
         if repick {
             self.repick(minute);
         }
-        if self.p.by_spread && t - self.backfill_at >= BACKFILL_EVERY_S {
+        if self.p.by_spread && self.backfill_every.due(t) {
             self.backfill().await;
-            self.backfill_at = t;
         }
-        if t - self.orders_at >= ORDERS_EVERY_S {
+        if self.orders_every.due(t) {
             self.check().await;
-            self.orders_at = t;
         }
-        if t - self.orphans_at >= ORPHANS_EVERY_S {
+        if self.orphans_every.due(t) {
             self.watch_orphans().await;
-            self.orphans_at = t;
         }
         // The levels move with the minutes' closes: once a minute (and at once when BTC jumps).
         if minute > self.last_minute || !self.state.bids.is_empty() && self.wanted(minute).len() < self.state.bids.len()
@@ -1969,7 +1966,7 @@ mod crash_tests {
         let w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), crash_fills: Vec::new(), vol_at: 0.0, oracle_at: 0.0, orders_at: 0.0, backfill_at: 0.0, h3_at: 0.0, orphans_at: 0.0,
+            moved: Vec::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         (f, w, rx)
     }
@@ -2084,7 +2081,7 @@ mod tick_tests {
         let mut w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), crash_fills: Vec::new(), vol_at: 0.0, oracle_at: 0.0, orders_at: 0.0, backfill_at: 0.0, h3_at: 0.0, orphans_at: 0.0,
+            moved: Vec::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         w.tick().await;
         (f, w, rx, clock)

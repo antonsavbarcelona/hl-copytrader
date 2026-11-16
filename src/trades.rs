@@ -109,13 +109,35 @@ pub(crate) fn env_f(k: &str, d: f64) -> f64 {
 
 pub(crate) fn set_equity(x: f64) {
     if x > 0.0 {
+        #[cfg(test)]
+        if OWN_EQUITY.with(|e| e.get().is_some()) {
+            OWN_EQUITY.with(|e| e.set(Some(x)));
+            crate::guard::seen(x);
+            return;
+        }
         *EQUITY.lock().unwrap() = x;
         crate::guard::seen(x);
     }
 }
 
 pub(crate) fn equity() -> f64 {
+    #[cfg(test)]
+    if let Some(x) = OWN_EQUITY.with(|e| e.get()) {
+        return x;
+    }
     *EQUITY.lock().unwrap()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own equity (None: the process's, which the other tests set at random).
+    static OWN_EQUITY: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// This test's thread keeps its own equity (0 until set).
+#[cfg(test)]
+pub(crate) fn own_equity() {
+    OWN_EQUITY.with(|e| e.set(Some(0.0)));
 }
 
 /// The family's risk a trade, % of the equity: `FAMILY_RISK_PCT` (0 for the test: each strategy's own $20; the

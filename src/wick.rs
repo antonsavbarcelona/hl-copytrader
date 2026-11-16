@@ -2070,6 +2070,7 @@ mod tick_tests {
     /// ticked once: the volumes read, the coins picked, the account read.
     async fn ticking(crypto: &[&str]) -> (FakeHl, Wick, tokio::sync::mpsc::UnboundedReceiver<Value>, Clock) {
         trades::family_fits(true);
+        trades::own_equity();
         let clock = Clock::at(WED_15 + 1.0);
         let mut coins: Vec<(&str, u32, u32, f64)> = vec![("BTC", 5, 40, 100_000.0), ("xyz:WTH", 2, 10, 50.0)];
         coins.extend(crypto.iter().map(|c| (*c, 2, 10, 100.0)));

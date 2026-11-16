@@ -2053,3 +2053,164 @@ mod crash_tests {
         assert!(a.contains_key("xyz:NVDA") && !a.contains_key("xyz:TSLA"), "{a:?}");
     }
 }
+
+/// The loop's tick on the fake with its clock moved (pinned before the loop goes on the runner): the bids rest from
+/// the minute after the start at their levels, a fill is a trade with its stop and take, its take or its time ends it,
+/// two crypto fills in a minute pull every crypto order at once, a bid follows its anchor down and not up 1%, a
+/// deposit's change resizes the bids.
+#[cfg(test)]
+mod tick_tests {
+    use super::*;
+    use crate::testkit::{Clock, FakeHl, Order, cfg};
+
+    /// A Wednesday 15:00 UTC: the US market open (no shut-hours level).
+    const WED_15: f64 = 1_794_409_200.0;
+
+    /// The wick on the fake (BTC; `crypto` at 100, $50M a day; xyz:WTH at 50, $2M), its clock at `WED_15` + 1 s,
+    /// ticked once: the volumes read, the coins picked, the account read.
+    async fn ticking(crypto: &[&str]) -> (FakeHl, Wick, tokio::sync::mpsc::UnboundedReceiver<Value>, Clock) {
+        trades::family_fits(true);
+        let clock = Clock::at(WED_15 + 1.0);
+        let mut coins: Vec<(&str, u32, u32, f64)> = vec![("BTC", 5, 40, 100_000.0), ("xyz:WTH", 2, 10, 50.0)];
+        coins.extend(crypto.iter().map(|c| (*c, 2, 10, 100.0)));
+        let f = FakeHl::start(&coins).await;
+        f.set_volume("BTC", 1e9);
+        f.set_volume("xyz:WTH", 2e6);
+        for c in crypto {
+            f.set_volume(c, 50e6);
+        }
+        let (store, rx) = Store::for_test();
+        let mut w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
+            p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
+            held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
+            moved: Vec::new(), crash_fills: Vec::new(), vol_at: 0.0, oracle_at: 0.0, orders_at: 0.0, backfill_at: 0.0, h3_at: 0.0, orphans_at: 0.0,
+            last_minute: (now() / 60.0).floor() as i64 };
+        w.tick().await;
+        (f, w, rx, clock)
+    }
+
+    /// The coin's shallow bid on the exchange: its highest resting buy, not reduce-only.
+    fn bid(f: &FakeHl, coin: &str) -> Option<Order> {
+        f.open_orders(coin).into_iter().filter(|o| o.buy && !o.reduce && o.trigger.is_none()).max_by(|a, b| a.px.total_cmp(&b.px))
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a / b - 1.0).abs() < 1e-3
+    }
+
+    fn find<'a>(ev: &'a [Value], what: &str, coin: &str) -> Option<&'a Value> {
+        ev.iter().find(|e| e["what"] == what && e["coin"] == coin && e["kind"] == "wick")
+    }
+
+    #[tokio::test]
+    async fn the_bids_rest_from_the_next_minute_and_a_fill_is_a_trade_with_its_stop_and_take_that_its_take_ends() {
+        let (f, mut w, mut rx, clock) = ticking(&["WTA"]).await;
+        assert!(w.picked.contains(&"WTA".to_string()) && w.h3_picked.contains(&"xyz:WTH".to_string()), "{:?} {:?}", w.picked, w.h3_picked);
+        assert!(bid(&f, "WTA").is_none() && bid(&f, "xyz:WTH").is_none(), "no bid in the start's minute");
+        assert_eq!(trades::equity(), 1000.0, "the account read");
+        clock.go(60.0);
+        w.tick().await;
+        let (a, h) = (bid(&f, "WTA").expect("the crypto bid"), bid(&f, "xyz:WTH").expect("the HIP-3 bid"));
+        assert!(near(a.px, 100.0 * (1.0 - w.p.pct)) && near(h.px, 50.0 * (1.0 - w.p.h3_pct)), "{} {}", a.px, h.px);
+        assert_eq!((w.state.bids["WTA"].oid, w.state.bids["xyz:WTH"].oid), (a.oid, h.oid));
+        // the wick through the bid: filled, then the trade with its stop and take at the next check
+        f.set_mid("WTA", a.px * 0.99);
+        assert!(f.position("WTA") > 0.0);
+        clock.go(15.0);
+        w.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let o = find(&ev, "open", "WTA").unwrap_or_else(|| panic!("{ev:?}"));
+        assert!(near(o["stop_px"].as_f64().unwrap(), a.px * (1.0 - w.p.stop)) && near(o["take_px"].as_f64().unwrap(), a.px * (1.0 + w.p.take)), "{o}");
+        assert_eq!(w.state.open.len(), 1);
+        let exits: Vec<Order> = f.open_orders("WTA").into_iter().filter(|o| o.reduce).collect();
+        assert!(exits.iter().any(|o| o.trigger.is_some_and(|t| near(t, a.px * (1.0 - w.p.stop)))), "the stop: {exits:?}");
+        assert!(exits.iter().any(|o| o.trigger.is_none() && near(o.px, a.px * (1.0 + w.p.take))), "the take: {exits:?}");
+        assert!(trades::registered("WTA"));
+        // the take filled: the trade ends at the next check, its stop off
+        f.set_mid("WTA", a.px * (1.0 + w.p.take) * 1.01);
+        assert_eq!(f.position("WTA"), 0.0);
+        clock.go(15.0);
+        w.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        let c = find(&ev, "close", "WTA").unwrap_or_else(|| panic!("{ev:?}"));
+        assert_eq!(c["why"], "take");
+        assert!(w.state.open.is_empty() && !trades::registered("WTA"));
+        assert!(f.open_orders("WTA").iter().all(|o| !o.reduce), "no exit left: {:?}", f.open_orders("WTA"));
+    }
+
+    #[tokio::test]
+    async fn a_trade_not_taken_is_sold_at_market_at_its_hold_s_end() {
+        let (f, mut w, mut rx, clock) = ticking(&["WTA"]).await;
+        clock.go(60.0);
+        w.tick().await;
+        let a = bid(&f, "WTA").unwrap();
+        f.set_mid("WTA", a.px);
+        clock.go(15.0);
+        w.tick().await;
+        assert_eq!(w.state.open.len(), 1);
+        crate::store::drain(&mut rx);
+        clock.go(w.p.hold_s - 30.0);
+        w.tick().await;
+        assert_eq!(w.state.open.len(), 1, "not yet");
+        clock.go(30.0);
+        w.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        assert_eq!(find(&ev, "close", "WTA").unwrap_or_else(|| panic!("{ev:?}"))["why"], "time");
+        assert_eq!(f.position("WTA"), 0.0);
+        assert!(f.open_orders("WTA").iter().all(|o| !o.reduce), "{:?}", f.open_orders("WTA"));
+    }
+
+    #[tokio::test]
+    async fn two_crypto_fills_in_a_minute_pull_every_crypto_order_at_once_the_hip3_bid_stays() {
+        let (f, mut w, mut rx, clock) = ticking(&["WTA", "WTB"]).await;
+        clock.go(60.0);
+        w.tick().await;
+        let (a, b) = (bid(&f, "WTA").unwrap(), bid(&f, "WTB").unwrap());
+        assert!(bid(&f, "xyz:WTH").is_some());
+        f.set_mid("WTA", a.px);
+        f.set_mid("WTB", b.px);
+        clock.go(15.0); // the same minute: no placing due but for the breaker
+        w.tick().await;
+        let ev = crate::store::drain(&mut rx);
+        assert!(ev.iter().any(|e| e["what"] == "crash_off"), "{ev:?}");
+        for c in ["WTA", "WTB"] {
+            assert!(f.open_orders(c).iter().all(|o| o.reduce), "{c}: every crypto order off: {:?}", f.open_orders(c));
+        }
+        assert!(bid(&f, "xyz:WTH").is_some(), "the HIP-3 bid stays");
+        // none again while the breaker holds
+        clock.go(60.0);
+        w.tick().await;
+        assert!(["WTA", "WTB"].iter().all(|c| bid(&f, c).is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_bid_follows_its_anchor_down_not_up_one_pct_and_a_deposit_s_change_resizes_it() {
+        let (f, mut w, _rx, clock) = ticking(&[]).await;
+        clock.go(60.0);
+        w.tick().await;
+        let h0 = bid(&f, "xyz:WTH").unwrap();
+        // 2% down: the bid follows once that minute closed (the anchor: the minute before's close)
+        f.set_mid("xyz:WTH", 49.0);
+        clock.go(60.0);
+        w.tick().await;
+        assert_eq!(bid(&f, "xyz:WTH").unwrap().px, h0.px, "the anchor still the minute before's");
+        clock.go(60.0);
+        w.tick().await;
+        let h1 = bid(&f, "xyz:WTH").unwrap();
+        assert!(near(h1.px, 49.0 * (1.0 - w.p.h3_pct)) && h1.oid != h0.oid, "{h1:?}");
+        // 1% up: under the up threshold, it stays
+        f.set_mid("xyz:WTH", 49.49);
+        clock.go(120.0);
+        w.tick().await;
+        assert_eq!(bid(&f, "xyz:WTH").unwrap().px, h1.px);
+        // the deposit doubled: the bid placed again at twice the size
+        f.with(|s| s.account_value = Some(2000.0));
+        clock.go(60.0);
+        w.tick().await;
+        assert_eq!(trades::equity(), 2000.0);
+        clock.go(60.0);
+        w.tick().await;
+        let h2 = bid(&f, "xyz:WTH").unwrap();
+        assert!((h2.orig / h1.orig - 2.0).abs() < 0.05 && near(h2.px, 49.49 * (1.0 - w.p.h3_pct)), "{h1:?} -> {h2:?}"); // placed again at the level now
+    }
+}

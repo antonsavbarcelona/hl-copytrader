@@ -75,6 +75,8 @@ pub(crate) struct State {
     pub(crate) modify_bare_reply: bool,
     pub(crate) leverage: HashMap<String, (u32, bool)>,
     pub(crate) now_ms: u64,
+    /// The account's value (clearinghouseState's accountValue; none: $1000).
+    pub(crate) account_value: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -221,7 +223,8 @@ impl State {
                 let ps: Vec<Value> = self.positions.iter().filter(|(c, _)| on_dex(c))
                     .map(|(c, (s, e))| json!({"position": {"coin": c, "szi": s.to_string(), "entryPx": e.to_string(),
                         "positionValue": (s.abs() * self.mids.get(c).copied().unwrap_or(*e)).to_string(), "unrealizedPnl": "0"}})).collect();
-                json!({"assetPositions": ps, "marginSummary": {"accountValue": "1000", "totalMarginUsed": "0"}, "withdrawable": "1000"})
+                let v = self.account_value.unwrap_or(1000.0).to_string();
+                json!({"assetPositions": ps, "marginSummary": {"accountValue": v, "totalMarginUsed": "0"}, "withdrawable": v})
             }
             "userFillsByTime" | "userFills" => Value::Array(self.fills.clone()),
             "l2Book" => {

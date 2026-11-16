@@ -2,7 +2,7 @@
 //! a resting buy `WICK_PCT` (7) under each liquid perp's anchor - the last minute's close, or its
 //! oracle when lower - on `WICK_MAX_COINS` (30) of the coins with a day volume of `WICK_MIN_VOL_USD`
 //! (10M) or more; on the HIP-3 dexes margined in USDC `WICK_H3_PCT` (4) under the last minute's close
-//! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (0.7M; 1M until 2026-10-28)+ (hyna, the crypto copies, left
+//! on `WICK_H3_MAX_COINS` (10; 0: none) with `WICK_H3_MIN_VOL_USD` (0.5M; 0.7M until 2026-11-16, 1M until 2026-10-28)+ (hyna, the crypto copies, left
 //! out). Which coins (every 5 min): the most restless - the biggest standard deviation of the 1-minute
 //! returns over the last 24 h (the main dex's and the bid HIP-3 dexes' mids every 5 s, every other
 //! HIP-3 dex's every 30 s; after a start 24 h of 1-minute candles read, a coin a minute; a coin with
@@ -40,6 +40,11 @@
 //! $0.7M against $1M: 246 fills against 217, the win rate 80.1% against 78.8%, the sum +33% (w/o the 5 best days
 //! +44%), 12 of 12 months up; no other filter beat shuffled luck (a closer bid: twice the fills, the win rate -7..10 pp,
 //! the same sum).
+//! $0.5M (2026-11-16, the user's OK; HL 1m bars 2025-11..2026-10 with the top-10 pick, then the raw tape): the plain 4%
+//! bid on the coins of $0.5-0.7M added 31 trades in 11 months, all filled on the tape ($2.1k of $3k on average), 84%
+//! won, +220 bp, +$1,464 (94% won without ANSEM and BIRD), the drawdown not higher; $0.3-0.5M only +62 bp (65% won):
+//! not taken. Only that bid was tested, so under `WICK_H3_FULL_VOL_USD` (0.7M) a coin gets no shut-hours level, no
+//! deep bid and no ask.
 //!
 //! The audit's trace (2026-10-28; observing only, the trading as above): every bid placed, moved, cancelled, filled is an
 //! event kind `wick_order` (`place` / `cancel` / `fill`: the level, its anchor (the minute before's last mid, the oracle),
@@ -198,6 +203,9 @@ struct Params {
     max_coins: usize,
     h3_pct: f64,
     h3_min_vol: f64,
+    /// The day volume a picked HIP-3 coin needs for more than the plain `h3_pct` bid (its shut-hours level, the deep
+    /// bids, the asks); under it (down to `h3_min_vol`) only the plain bid, as the floor's tape test had it.
+    h3_full_vol: f64,
     h3_max_coins: usize,
     reprice: f64,
     reprice_down: f64,
@@ -270,7 +278,7 @@ impl Params {
     fn from_env() -> Self {
         let v = trades::env_f;
         Params { pct: v("WICK_PCT", 7.0) / 100.0, min_vol: v("WICK_MIN_VOL_USD", 10e6), max_coins: v("WICK_MAX_COINS", 30.0) as usize,
-            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 0.7e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
+            h3_pct: v("WICK_H3_PCT", 4.0) / 100.0, h3_min_vol: v("WICK_H3_MIN_VOL_USD", 0.5e6), h3_full_vol: v("WICK_H3_FULL_VOL_USD", 0.7e6), h3_max_coins: v("WICK_H3_MAX_COINS", 10.0) as usize,
             reprice: v("WICK_REPRICE_PCT", 2.0) / 100.0, reprice_down: v("WICK_REPRICE_DOWN_PCT", 0.5) / 100.0, take: v("WICK_TAKE_PCT", 5.0) / 100.0, h3_take: v("WICK_H3_TAKE_PCT", 4.0) / 100.0, stop: v("WICK_STOP_PCT", 20.0) / 100.0,
             hold_s: v("WICK_HOLD_MIN", 60.0) * 60.0, risk_usd: v("WICK_RISK_USD", 20.0), max_open: v("WICK_MAX_OPEN", 2.0) as usize,
             h3_max_open: v("WICK_H3_MAX_OPEN", 2.0) as usize, trial: trades::switch("WICK_ENABLED").flatten(),
@@ -707,7 +715,13 @@ impl Wick {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
                 // the non-equity names while the US market is shut: their own level, the shut-hours slots
                 let noneq = self.p.noneq_shut_pct > 0.0 && crate::wkd::non_equity(&c) && crate::wkd::us_shut(minute);
-                let shut = if noneq { Some(self.p.noneq_shut_pct) } else { self.p.shut_pct(&c, minute) };
+                let shut = if !self.h3_full(&c) {
+                    None
+                } else if noneq {
+                    Some(self.p.noneq_shut_pct)
+                } else {
+                    self.p.shut_pct(&c, minute)
+                };
                 // the shut-hours trades their own slots (held up to a day, they would keep the 4% bids off)
                 let room = if shut.is_some() { n_shut < self.p.shut_max_open } else { n_h3 < self.p.h3_max_open };
                 if room && free_at(&c, rung_risk(&c, 0, shut.is_some(), self.p.risk_usd)) {
@@ -717,6 +731,11 @@ impl Wick {
             }
         }
         out
+    }
+
+    /// A picked HIP-3 coin with `h3_full_vol` or more a day: every HIP-3 rung, not the plain bid only.
+    fn h3_full(&self, coin: &str) -> bool {
+        self.h3_volume.get(coin).is_some_and(|x| *x >= self.p.h3_full_vol)
     }
 
     /// The ladder's deeper bids now: the picked US stocks while the US market is shut, `deep_pct` under the minute
@@ -735,7 +754,7 @@ impl Wick {
         if (self.p.deep_pct > 0.0 || self.p.h3_session_deep_pct > 0.0) && n_h3 < self.p.deep_max_open && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in &self.h3_picked {
                 let Some(close) = self.closes.at(c, minute - 1) else { continue };
-                if !free(c) {
+                if !free(c) || !self.h3_full(c) {
                     continue;
                 }
                 if self.p.shut_pct(c, minute).is_some() {
@@ -820,7 +839,7 @@ impl Wick {
                 };
                 // the move over the ~24 h the closes keep (HIST: the oldest one at minute - 1440)
                 let crashed = self.p.h3_ask_crash > 0.0 && self.closes.change(c, minute - 1, HIST as i64 - 2).is_some_and(|x| x <= -self.p.h3_ask_crash);
-                if pct > 0.0 && free(c) && !crashed {
+                if pct > 0.0 && free(c) && !crashed && self.h3_full(c) {
                     out.insert(c.clone(), (close * (1.0 + pct), pct, shut && crate::wkd::us_stock(c)));
                 }
             }
@@ -1994,5 +2013,25 @@ mod crash_tests {
         let e = ev.iter().find(|e| e["coin"] == "WCE" && e["kind"] == "wick").unwrap();
         assert_eq!((e["what"].as_str(), e["why"].as_str()), (Some("over"), Some("family cap")), "{ev:?}");
         assert_eq!(f.position("WCE"), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_hip3_coin_between_the_floors_gets_the_plain_4pct_bid_only_no_shut_level_deep_bid_or_ask() {
+        trades::family_fits(true);
+        let (_f, mut w, _rx) = setup(&[("xyz:NVDA", 2, 10, 100.0), ("xyz:TSLA", 2, 10, 100.0)]).await;
+        assert_eq!((w.p.h3_min_vol, w.p.h3_full_vol), (0.5e6, 0.7e6));
+        let minute = 1_794_657_600 / 60; // a Saturday noon UTC: the US market shut
+        assert!(crate::wkd::weekend(minute) && w.p.shut_pct("xyz:TSLA", minute).is_some());
+        for c in ["xyz:NVDA", "xyz:TSLA"] {
+            w.closes.update(c, minute - 1, 100.0, HIST);
+        }
+        w.h3_volume = HashMap::from([("xyz:NVDA".to_string(), 2e6), ("xyz:TSLA".to_string(), 0.6e6)]);
+        w.h3_picked = vec!["xyz:NVDA".into(), "xyz:TSLA".into()];
+        let b = w.wanted(minute);
+        assert_eq!((b["xyz:NVDA"].1, b["xyz:NVDA"].2), (w.p.h3_wkd_pct, true), "over the full floor: its shut-hours level");
+        assert_eq!((b["xyz:TSLA"].1, b["xyz:TSLA"].2), (w.p.h3_pct, false), "between the floors: the plain 4% bid");
+        let (d, a) = (w.wanted_deep(minute), w.wanted_asks(minute));
+        assert!(d.contains_key("xyz:NVDA") && !d.contains_key("xyz:TSLA"), "{d:?}");
+        assert!(a.contains_key("xyz:NVDA") && !a.contains_key("xyz:TSLA"), "{a:?}");
     }
 }

@@ -265,7 +265,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         p.days, p.min_vol / 1e6, p.btc_ma, p.atr_k, p.max_days, if trades::family_risk_pct() > 0.0 { format!("{:.1}% депозита", trades::family_risk_pct()) } else { format!("${:.0}", p.risk_usd) },
         p.max_open, trades::trial_label(p.trial, state.opened)));
     let l = TrendLong { k: Keeper::new(venue, unified, cfg.clone(), store, "trend", message, HeldIn::Days), p, state };
-    crate::runner::spawn(l);
+    crate::runner::spawn("trend", l);
     Ok(())
 }
 

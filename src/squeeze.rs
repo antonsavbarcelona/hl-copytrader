@@ -383,8 +383,9 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
         if short { "шорт пробоя вниз из сжатия" } else { "пробой из сжатия" }, if short { "под" } else { "над" }, p.q * 100.0,
         if p.btc_filter { ", BTC выше 50-дн. средней" } else { "" }, p.min_vol / 1e6, p.atr_k, if short { "выше" } else { "ниже" }, p.hold_s / DAY, p.max_open,
         trades::trial_label(p.trial, state.opened)));
+    let kind = p.kind;
     let l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state };
-    crate::runner::spawn(l);
+    crate::runner::spawn(kind, l);
     Ok(())
 }
 

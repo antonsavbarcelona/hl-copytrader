@@ -1690,7 +1690,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), crash_fills: Vec::new(),
         vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S), last_minute: (now() / 60.0).floor() as i64 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
-    crate::runner::spawn(w);
+    crate::runner::spawn("wick", w);
     Ok(())
 }
 

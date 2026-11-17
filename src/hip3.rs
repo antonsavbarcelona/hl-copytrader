@@ -371,7 +371,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     crate::notify::send(format!("🧪 HIP-3 {}, {wkd_mode}", wp.label()));
     let cfg = cfg.clone();
     let wkd_k = venue.as_ref().map(|(v, _)| wkd_keeper(v.clone(), unified, cfg.clone(), store.clone()));
-    crate::runner::spawn(Hip3::new(cfg, store, api, venue, wkd_k, p, wp, state));
+    crate::runner::spawn("hip3", Hip3::new(cfg, store, api, venue, wkd_k, p, wp, state));
     Ok(())
 }
 

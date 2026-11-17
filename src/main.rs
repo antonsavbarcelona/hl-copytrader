@@ -14,6 +14,7 @@ mod exchange;
 mod expiry;
 mod ext;
 mod guard;
+mod health;
 mod hip3;
 mod keeper;
 mod listing;
@@ -98,6 +99,10 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     squeeze::start(&cfg, store.clone()).await?;
     breakout::start(&cfg, store.clone()).await?;
     ext::start(&cfg, store).await?;
+    // every loop's pulse and every position's stop, watched (never in the way of the trading)
+    if let Err(e) = health::start(&cfg).await {
+        log!("health: not watching: {e:#}");
+    }
     tokio::spawn(ws::run_books(names, books));
     shutdown_signal().await;
     log!("stopped");

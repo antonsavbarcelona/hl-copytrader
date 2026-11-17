@@ -378,7 +378,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api, books: crate::ws::Books
         api, last_minute: (now() / 60.0).floor() as i64, vol: Every::new(VOLUME_EVERY_S), read: Every::new(60.0),
         day: Every::since(86_400.0, now()), day_entries: 0, started: now(), checked: false };
     d.day_entries = d.state.entries;
-    crate::runner::spawn(d);
+    crate::runner::spawn("dip", d);
     Ok(())
 }
 

@@ -339,7 +339,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("📡 внешние сделки {}: вход по рынку со стопом и тейком сигнала (без них: стоп {:.0}%, тейк {:.0}%, выход через {:.0} ч), до {} позиций",
         if p.live { "НА ДЕНЬГИ" } else { "НА БУМАГЕ (без сделок)" }, p.stop * 100.0, p.take * 100.0, p.hold_s / H, p.max_open));
     let x = Ext { k: Keeper::new(venue, unified, cfg.clone(), store, KIND, message, HeldIn::Hours), p, state };
-    crate::runner::spawn(x);
+    crate::runner::spawn("ext", x);
     Ok(())
 }
 

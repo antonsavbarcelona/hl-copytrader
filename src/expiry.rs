@@ -174,7 +174,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     crate::notify::send(format!("🔻 шорт экспирации НА ДЕНЬГИ: BTC и ETH в последнюю пятницу месяца с {:02}:{:02} до {:02}:{:02} UTC, стоп +{:.0}%, риск {}{}",
         p.from_min / 60, p.from_min % 60, p.to_min / 60, p.to_min % 60, p.stop * 100.0, trades::sizing_label(p.risk_usd, p.stop), trades::trial_label(p.trial, state.opened)));
     let x = Expiry { k: Keeper::new(venue, unified, cfg.clone(), store, KIND, message, HeldIn::No), p, state };
-    crate::runner::spawn(x);
+    crate::runner::spawn("expiry", x);
     Ok(())
 }
 

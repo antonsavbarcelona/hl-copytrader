@@ -2,7 +2,9 @@
 //! `tick_s` that steps the strategy when its step is due (a bar closed, or every so often) and checks its positions
 //! every `check_s`. The strategies only say what a step and a check do (`Strategy`).
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::sync::Mutex;
 
 use anyhow::Result;
 
@@ -105,18 +107,54 @@ pub(crate) async fn tick<S: Strategy>(s: &mut S, step: &mut Every, check: &mut E
     }
 }
 
-/// The strategy run in the background, ticking on its schedule.
-pub(crate) fn spawn<S: Strategy>(mut s: S) {
+/// The strategy `name` run in the background, ticking on its schedule; each tick done is its pulse (`beat`).
+pub(crate) fn spawn<S: Strategy>(name: &'static str, mut s: S) {
+    let sc = s.schedule();
+    born(name, sc.tick_s);
     tokio::spawn(async move {
-        let sc = s.schedule();
         let mut step = Every::new(match sc.step { Due::Every(e) => e, Due::Bar { .. } => 0.0 });
         let mut check = Every::new(sc.check_s);
         let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(sc.tick_s));
         loop {
             iv.tick().await;
+            let t0 = now();
             tick(&mut s, &mut step, &mut check).await;
+            beat(name, t0);
         }
     });
+}
+
+/// A loop's pulse (for `health`): its tick (s), when it started, when its last tick was done (0: none yet), its ticks
+/// done, its slowest tick (s).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct Pulse {
+    pub(crate) tick_s: f64,
+    pub(crate) since: f64,
+    pub(crate) done: f64,
+    pub(crate) ticks: u64,
+    pub(crate) slowest_s: f64,
+}
+
+static PULSES: Mutex<BTreeMap<&'static str, Pulse>> = Mutex::new(BTreeMap::new());
+
+/// The loop `name` started now, ticking every `tick_s`.
+pub(crate) fn born(name: &'static str, tick_s: f64) {
+    PULSES.lock().unwrap().insert(name, Pulse { tick_s, since: now(), done: 0.0, ticks: 0, slowest_s: 0.0 });
+}
+
+/// The loop `name`'s tick begun at `t0` done now.
+pub(crate) fn beat(name: &'static str, t0: f64) {
+    let t = now();
+    if let Some(p) = PULSES.lock().unwrap().get_mut(name) {
+        p.done = t;
+        p.ticks += 1;
+        p.slowest_s = p.slowest_s.max(t - t0);
+    }
+}
+
+/// Every loop's pulse.
+pub(crate) fn pulses() -> Vec<(&'static str, Pulse)> {
+    PULSES.lock().unwrap().iter().map(|(n, p)| (*n, *p)).collect()
 }
 
 /// Off when its switch `var` is "0" (logged so).
@@ -173,6 +211,34 @@ mod tests {
         // from a start: first due a wait after it
         let s = Every::since(86_400.0, 100.0);
         assert!(!s.ready(100.0) && !s.ready(86_499.0) && s.ready(86_500.0));
+    }
+
+    #[tokio::test]
+    async fn a_loop_s_pulse_its_start_then_each_tick_done_and_its_slowest() {
+        let c = Clock::at(5000.0);
+        born("pulse-test", 5.0);
+        assert_eq!(pulses().into_iter().find(|x| x.0 == "pulse-test").unwrap().1, Pulse { tick_s: 5.0, since: 5000.0, done: 0.0, ticks: 0, slowest_s: 0.0 });
+        c.go(3.0);
+        beat("pulse-test", 4999.0); // a 4 s tick
+        c.go(5.0);
+        beat("pulse-test", 5007.0); // 1 s
+        beat("never-born", 0.0); // a loop not started: nothing
+        let p = pulses().into_iter().find(|x| x.0 == "pulse-test").unwrap().1;
+        assert_eq!((p.done, p.ticks, p.slowest_s), (5008.0, 2, 4.0));
+        assert!(pulses().iter().all(|x| x.0 != "never-born"));
+    }
+
+    #[tokio::test]
+    async fn a_spawned_loop_ticks_and_beats() {
+        let sc = Schedule { tick_s: 0.01, step: Due::Every(0.0), check_s: 0.0 };
+        spawn("spawn-test", Rec { sc, stepped: 0.0, did: vec![] });
+        for _ in 0..200 {
+            if pulses().iter().any(|x| x.0 == "spawn-test" && x.1.ticks >= 2) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no beat: {:?}", pulses());
     }
 
     /// A strategy that writes down what it did.

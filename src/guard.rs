@@ -252,11 +252,14 @@ pub(crate) async fn start(cfg: &Config, store: Store, api: Api) -> anyhow::Resul
     log!("guard: peak net ${:.0}, flows ${:.0}, risk {}", s.hwm, s.flows, if s.cut { "cut" } else { "full" });
     with(|g| g.s = s);
     let cfg = cfg.clone();
+    crate::runner::born("guard", CHECK_S);
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(CHECK_S));
         loop {
             iv.tick().await;
+            let t0 = now();
             check(&cfg, &store, &api, &me).await;
+            crate::runner::beat("guard", t0);
         }
     });
     Ok(())

@@ -618,7 +618,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
         p.hold_s / 3600.0, p.adds, p.add_step * 100.0, p.buys(),
         p.sizing(), p.max_open, state.open.len(), state.closed, usd(state.pnl_usd),
         if venue.is_some() { trades::trial_label(p.trial, state.opened).replace("сделки", "позиции") } else { String::new() }));
-    crate::runner::spawn(RsiDip::new(cfg.clone(), store, api, venue, p, state));
+    crate::runner::spawn("rsidip", RsiDip::new(cfg.clone(), store, api, venue, p, state));
     Ok(())
 }
 

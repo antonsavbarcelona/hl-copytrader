@@ -382,7 +382,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
     }
     let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(venue.clone(), unified, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
     let l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
-    crate::runner::spawn(l);
+    crate::runner::spawn("breakout", l);
     Ok(())
 }
 

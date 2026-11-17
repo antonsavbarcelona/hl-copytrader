@@ -194,7 +194,7 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
         p.delay_days, p.min_vol / 1e6, p.stop * 100.0, p.take * 100.0, p.hold_s / DAY, trades::sizing_label(p.risk_usd, p.stop), p.max_open,
         trades::trial_label(p.trial, state.opened)));
     let l = Listing { k: Keeper::new(venue, unified, cfg.clone(), store, "listing", message, HeldIn::Days), p, state };
-    crate::runner::spawn(l);
+    crate::runner::spawn("listing", l);
     Ok(())
 }
 

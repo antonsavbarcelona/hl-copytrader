@@ -28,15 +28,21 @@ const BARE_AFTER_S: f64 = 120.0;
 const AGAIN_S: f64 = 3600.0;
 const DOC: &str = "health";
 
-/// The silence after which a loop ticking every `tick_s` is told.
-pub(crate) fn quiet_after(tick_s: f64) -> f64 {
-    QUIET_MIN_S.max(QUIET_TICKS * tick_s)
+/// The loops whose step is long by design, with the silence they get: the breakout's step reads every coin's candles
+/// 2.5 s apart (its first, 900 a coin, took 476 s on 2026-11-17's deploy; each hour's about as long).
+const SLOW: [(&str, f64); 1] = [("breakout", 1800.0)];
+
+/// The silence after which the loop `name` ticking every `tick_s` is told.
+pub(crate) fn quiet_after(name: &str, tick_s: f64) -> f64 {
+    let slow = SLOW.iter().find(|x| x.0 == name).map_or(0.0, |x| x.1);
+    QUIET_MIN_S.max(QUIET_TICKS * tick_s).max(slow)
 }
 
-/// How long the loop has been silent at `t` (since its last tick done, or its start before any), when past `quiet_after`.
-pub(crate) fn silent(p: &Pulse, t: f64) -> Option<f64> {
+/// How long the loop `name` has been silent at `t` (since its last tick done, or its start before any), when past its
+/// `quiet_after`.
+pub(crate) fn silent(name: &str, p: &Pulse, t: f64) -> Option<f64> {
     let s = t - if p.ticks > 0 { p.done } else { p.since };
-    (s > quiet_after(p.tick_s)).then_some(s)
+    (s > quiet_after(name, p.tick_s)).then_some(s)
 }
 
 /// What was told: a silent loop -> when; a position without a stop -> (first seen so, when told: 0 not yet).
@@ -51,7 +57,7 @@ impl Watch {
     fn loops(&mut self, pulses: &[(&'static str, Pulse)], t: f64) -> Vec<String> {
         let mut out = Vec::new();
         for (n, p) in pulses {
-            match silent(p, t) {
+            match silent(n, p, t) {
                 Some(s) => {
                     if self.silent.get(n).is_none_or(|x| t - x >= AGAIN_S) {
                         out.push(format!("⚠️ {n}: стратегия молчит {:.0} мин (шаг раз в {:.0} с): зависла или упала. Стопы открытых позиций на бирже, но новых сигналов она не ловит.",
@@ -126,7 +132,7 @@ fn snapshot(pulses: &[(&'static str, Pulse)], t: f64, pos: &HashMap<String, f64>
     ps.sort_by(|a, b| a["coin"].as_str().cmp(&b["coin"].as_str()));
     json!({"at": t,
         "loops": pulses.iter().map(|(n, p)| json!({"name": n, "tick_s": p.tick_s, "since": p.since, "done": p.done, "ticks": p.ticks,
-            "slowest_s": p.slowest_s, "silent_s": silent(p, t)})).collect::<Vec<_>>(),
+            "slowest_s": p.slowest_s, "silent_s": silent(n, p, t)})).collect::<Vec<_>>(),
         "positions": ps, "account_error": err})
 }
 
@@ -186,13 +192,17 @@ mod tests {
 
     #[test]
     fn a_loop_is_silent_past_10_min_or_10_of_its_ticks() {
-        assert_eq!((quiet_after(5.0), quiet_after(60.0), quiet_after(300.0)), (600.0, 600.0, 3000.0));
+        assert_eq!((quiet_after("wick", 5.0), quiet_after("guard", 60.0), quiet_after("x", 300.0)), (600.0, 600.0, 3000.0));
         // its last tick done 10 min ago: not yet; a second more: silent
-        assert_eq!(silent(&pulse(5.0, 0.0, 1000.0, 3), 1600.0), None);
-        assert_eq!(silent(&pulse(5.0, 0.0, 1000.0, 3), 1601.0), Some(601.0));
+        assert_eq!(silent("wick", &pulse(5.0, 0.0, 1000.0, 3), 1600.0), None);
+        assert_eq!(silent("wick", &pulse(5.0, 0.0, 1000.0, 3), 1601.0), Some(601.0));
         // never ticked: from its start (a step stuck from the first)
-        assert_eq!(silent(&pulse(5.0, 1000.0, 0.0, 0), 1500.0), None);
-        assert_eq!(silent(&pulse(5.0, 1000.0, 0.0, 0), 1700.0), Some(700.0));
+        assert_eq!(silent("wick", &pulse(5.0, 1000.0, 0.0, 0), 1500.0), None);
+        assert_eq!(silent("wick", &pulse(5.0, 1000.0, 0.0, 0), 1700.0), Some(700.0));
+        // the breakout's first step reads every coin's candles (476 s live): 30 min
+        assert_eq!(quiet_after("breakout", 10.0), 1800.0);
+        assert_eq!(silent("breakout", &pulse(10.0, 1000.0, 0.0, 0), 1000.0 + 476.0 + 600.0), None);
+        assert_eq!(silent("breakout", &pulse(10.0, 1000.0, 0.0, 0), 2801.0), Some(1801.0));
     }
 
     #[test]

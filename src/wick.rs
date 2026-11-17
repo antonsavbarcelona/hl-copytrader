@@ -152,8 +152,9 @@ const MAJORS: [&str; 5] = ["ETH", "SOL", "XRP", "BNB", "DOGE"];
 /// (`trades::family_risk_pct`, 2%). V404 (the V75 portfolio, 2025-05 .. 2026-10, HIP-3 cross 10x, the 40% cap): all at 2%
 /// x6.3, the drawdown 14.3%; this one at 5% x13.4 at the same 14.3% (h2 x2.40 -> x4.80, its drawdown 6.3 -> 10.1%); all at
 /// 3% x15.2 with 21%. Its 2 slots at 5% + the 6 shut / ladder slots at 2%: 22% at most, not 40%. With the family's sizing
-/// off (the $ test): its $ x2.5.
-const H3_MAIN_RISK_PCT: f64 = 5.0;
+/// off (the $ test): its $ x2.5. Back to the family's 2% (the user's call 2026-11-17): its live trades at 5% only 6 (-$20, a
+/// stop $320-470 a trade), the family's 2% until ~30-40 live trades show the backtest's ~+1.5% a trade.
+const H3_MAIN_RISK_PCT: f64 = 2.0;
 
 /// A rung's risk $ a trade: `H3_MAIN_RISK_PCT` for the main HIP-3 bid, else the family's.
 fn rung_risk(coin: &str, rung: usize, shut: bool, base_usd: f64) -> f64 {
@@ -1806,15 +1807,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_main_hip3_bid_takes_5_pct() {
-        // the family at 2% of $1000: $20; the main HIP-3 bid (rung 0, US session) 5%: $50
-        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 2.0, 1000.0), 50.0);
+    fn the_main_hip3_bid_takes_the_family_s_2_pct() {
+        // the family at 2% of $1000: $20; the main HIP-3 bid (rung 0, US session) 2% too (5% until 2026-11-17)
+        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 2.0, 1000.0), 20.0);
         assert_eq!(rung_risk_at("xyz:SOXL", 0, true, 20.0, 2.0, 1000.0), 20.0);   // a shut-hours bid
         assert_eq!(rung_risk_at("xyz:SOXL", 1, false, 20.0, 2.0, 1000.0), 20.0);  // the ladder
         assert_eq!(rung_risk_at("xyz:SOXL", ASK, false, 20.0, 2.0, 1000.0), 20.0);
         assert_eq!(rung_risk_at("ZEC", 0, false, 20.0, 2.0, 1000.0), 20.0);       // a crypto bid
-        // the family's sizing off (the $ test): the $ x2.5
-        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 0.0, 1000.0), 50.0);
+        // the family's sizing off (the $ test): its own $
+        assert_eq!(rung_risk_at("xyz:SOXL", 0, false, 20.0, 0.0, 1000.0), 20.0);
     }
 
     #[test]

@@ -50,6 +50,23 @@ pub fn send(text: impl Into<String>) {
     }
 }
 
+/// Sends `text` now, on a runtime of its own (the bot's may be stuck): the watchdog's last word. Waits at most 10 s.
+pub fn send_now(text: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let (Ok(token), Ok(chat)) = (std::env::var("TELEGRAM_BOT_TOKEN"), std::env::var("TELEGRAM_CHAT_ID")) else { return };
+    let (token, chat) = (token.trim().to_string(), chat.trim().to_string());
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+    rt.block_on(async move {
+        let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() else { return };
+        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+        if let Err(e) = http.post(&url).json(&json!({"chat_id": chat, "text": text, "disable_web_page_preview": true})).send().await {
+            log!("telegram: not sent: {e}");
+        }
+    });
+}
+
 /// A $ amount signed for the chat: +$1.50 / -$2.00.
 pub fn usd(x: f64) -> String {
     if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }

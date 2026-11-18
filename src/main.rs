@@ -105,6 +105,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     ext::start(&cfg, store).await?;
     // every loop's pulse and every position's stop, watched (never in the way of the trading)
+    // the whole bot still (or one loop stuck): the process ends, Railway starts it again
+    health::watchdog();
     if let Err(e) = health::start(&cfg).await {
         log!("health: not watching: {e:#}");
     }

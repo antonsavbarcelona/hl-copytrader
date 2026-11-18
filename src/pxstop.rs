@@ -142,6 +142,11 @@ impl Watch {
 
     /// The stop `s` out at market (its mid `mid` through the trigger): only while its order still rests (not triggered).
     async fn exit(&mut self, v: &Venue, s: &Stop, mid: f64, store: &Store) -> bool {
+        // a coin the venue does not hold (listed since its read): the exchange's own stop stays, nothing ordered
+        if !v.coins.contains_key(&s.coin) {
+            log!("pxstop: {} not on the venue: its stop {} left to the exchange", s.coin, s.oid);
+            return false;
+        }
         match v.order_state(s.oid).await {
             Ok((st, _)) if st == "open" => {}
             Ok(_) => {
@@ -180,19 +185,21 @@ impl Watch {
 
 /// The watch on the live account, every `POLL_S` (never in the way of the trading: its errors only logged).
 pub(crate) async fn start(store: Store) -> Result<()> {
-    let Some((venue, _)) = crate::runner::venue("pxstop").await? else {
+    let Some((base, _)) = crate::runner::venue("pxstop").await? else {
         return Ok(());
     };
     crate::runner::born("pxstop", POLL_S);
     tokio::spawn(async move {
         let mut w = Watch::default();
         let mut dexes: (f64, Vec<String>) = (f64::MIN, Vec::new());
+        let mut venue = base.clone();
         let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
         loop {
             iv.tick().await;
             let t0 = now();
             if t0 - dexes.0 >= 3600.0 {
-                dexes = (t0, crate::venue::usdc_dexes(&venue.ex).await);
+                dexes = (t0, crate::venue::usdc_dexes(&base.ex).await);
+                venue = crate::runner::with_hip3("pxstop", &base).await;
             }
             w.round(&venue, &dexes.1, &store).await;
             crate::runner::beat("pxstop", t0);
@@ -300,5 +307,21 @@ mod tests {
         c.go(31.0);
         w.round(&v, &[], &store).await;
         assert!(w.stops.is_empty());
+    }
+
+    /// 2026-11-18: the live venue held the main dex's coins only; an order on a HIP-3 coin would have panicked the loop.
+    /// A coin the venue does not hold: its stop left to the exchange, nothing ordered, no panic.
+    #[tokio::test]
+    async fn a_stop_on_a_coin_the_venue_does_not_hold_is_left_to_the_exchange() {
+        let _c = Clock::at(2_100_000.0);
+        let hl = FakeHl::start(&[("xyz:WTD", 1, 10, 50.0)]).await;
+        let full = hl.venue();
+        let (store, mut rx) = Store::for_test();
+        let main_only = Venue::for_test(full.ex.clone(), &full.account, HashMap::new(), HashMap::new());
+        let mut w = Watch::default();
+        let s = Stop { coin: "xyz:WTD".into(), oid: 77, sell: true, sz: 1.0, trigger: 49.0 };
+        assert!(!w.exit(&main_only, &s, 40.0, &store).await);
+        assert!(hl.with(|s| s.actions.is_empty()), "nothing sent");
+        assert!(crate::store::drain(&mut rx).is_empty());
     }
 }

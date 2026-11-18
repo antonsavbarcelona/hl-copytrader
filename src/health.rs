@@ -3,13 +3,15 @@
 //! - each loop's pulse (`runner::pulses`: every strategy on the runner, the guard): a loop silent past `quiet_after`
 //!   (dead: a panic ends its task without a word; or stuck in a step) is told to the chat;
 //! - the account's positions (every USDC dex) against its resting orders: a position with no resting stop (a reduce-only
-//!   trigger order) for `BARE_AFTER_S` is told to the chat (a fill gets its stop within a check, 15 s for the wick);
+//!   trigger order) for `BARE_AFTER_S` gets one (`guard_stop`: `GUARD_STOP` from its entry, short of its liquidation) and
+//!   is told to the chat (a fill gets its stop within a check, 15 s for the wick; 2026-11-18 xyz:SOXL: the wick's bid
+//!   filled while the bot stood frozen, the new run knew nothing of it, the long sat bare, -7.5% at the worst);
 //! - each told again every `AGAIN_S` while so, and once when it is fine again;
 //! - the whole of it saved as the doc `health` (read by `tools/health.py`, with the events and the exchange).
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::api::now;
@@ -24,6 +26,10 @@ const QUIET_MIN_S: f64 = 600.0;
 const QUIET_TICKS: f64 = 10.0;
 /// A position without a resting stop this long is told.
 const BARE_AFTER_S: f64 = 120.0;
+/// A bare position's stop: this far from its entry, or `trades::LIQ_STOP_SHARE` of the way to its liquidation when that
+/// is nearer (the families' widest, the dips' / the HIP-3 bids' 20%). Tried again this often while still bare.
+const GUARD_STOP: f64 = 0.20;
+const GUARD_AGAIN_S: f64 = 300.0;
 /// Told again this often while so.
 const AGAIN_S: f64 = 3600.0;
 const DOC: &str = "health";
@@ -45,11 +51,47 @@ pub(crate) fn silent(name: &str, p: &Pulse, t: f64) -> Option<f64> {
     (s > quiet_after(name, p.tick_s)).then_some(s)
 }
 
+/// The whole bot still this long (no loop's tick done: the runtime stuck) -> the process ends, Railway starts it again
+/// (`restartPolicyType = "ALWAYS"`). 2026-11-18 11:57 UTC: a lock taken twice stood every loop still for 2 h 36 min, the
+/// process alive (no restart), the bids resting at 11:50's prices, one filled bare at the US open.
+const FROZEN_S: f64 = 180.0;
+/// One loop silent this many times its `quiet_after` -> the same (a step stuck; a loop dead by a panic).
+const STUCK_TIMES: f64 = 2.0;
+const WATCHDOG_EVERY_S: u64 = 15;
+
+/// Why the process must end at `t`: every loop still `FROZEN_S`, or one silent `STUCK_TIMES` its `quiet_after`.
+pub(crate) fn frozen(pulses: &[(&'static str, Pulse)], t: f64) -> Option<String> {
+    let last = pulses.iter().map(|(_, p)| if p.ticks > 0 { p.done } else { p.since }).fold(f64::MIN, f64::max);
+    if !pulses.is_empty() && t - last > FROZEN_S {
+        return Some(format!("все циклы стоят {:.0} с", t - last));
+    }
+    pulses.iter().find_map(|(n, p)| {
+        let s = t - if p.ticks > 0 { p.done } else { p.since };
+        (s > STUCK_TIMES * quiet_after(n, p.tick_s)).then(|| format!("{n} молчит {:.0} мин", s / 60.0))
+    })
+}
+
+/// The watchdog: its own thread (not the runtime's: a stuck runtime stands it still too), every `WATCHDOG_EVERY_S`;
+/// `frozen` -> told (on a runtime of its own) and the process ends with 1.
+pub(crate) fn watchdog() {
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(WATCHDOG_EVERY_S));
+        if let Some(why) = frozen(&crate::runner::pulses(), now()) {
+            let m = format!("♻️ бот завис ({why}): перезапуск. Заявки стоят по старым ценам до старта.");
+            log!("health: {m}");
+            crate::notify::send_now(&m);
+            std::process::exit(1);
+        }
+    });
+}
+
 /// What was told: a silent loop -> when; a position without a stop -> (first seen so, when told: 0 not yet).
 #[derive(Default)]
 struct Watch {
     silent: HashMap<&'static str, f64>,
     bare: HashMap<String, (f64, f64)>,
+    /// A bare position's stop last tried (coin -> when).
+    guarded: HashMap<String, f64>,
 }
 
 impl Watch {
@@ -101,6 +143,45 @@ impl Watch {
     }
 }
 
+impl Watch {
+    /// The positions bare `BARE_AFTER_S` (by the rounds before) whose stop is due at `t` (none tried, or `GUARD_AGAIN_S` ago).
+    fn guard_due(&mut self, pos: &HashMap<String, f64>, stops: &HashSet<String>, t: f64) -> Vec<String> {
+        self.guarded.retain(|c, _| pos.contains_key(c) && !stops.contains(c));
+        let mut v: Vec<String> = pos.keys().filter(|c| !stops.contains(*c))
+            .filter(|c| self.bare.get(*c).is_some_and(|x| t - x.0 >= BARE_AFTER_S))
+            .filter(|c| self.guarded.get(*c).is_none_or(|x| t - x >= GUARD_AGAIN_S)).cloned().collect();
+        v.sort();
+        for c in &v {
+            self.guarded.insert(c.clone(), t);
+        }
+        v
+    }
+}
+
+/// A bare position's stop trigger: `GUARD_STOP` from `entry` on the losing side, or `LIQ_STOP_SHARE` of the way to `liq`
+/// when that is nearer (`liq` 0: none known).
+pub(crate) fn guard_trigger(entry: f64, size: f64, liq: f64) -> f64 {
+    let to_liq = if liq > 0.0 { crate::trades::LIQ_STOP_SHARE * (entry - liq).abs() / entry } else { f64::MAX };
+    let d = GUARD_STOP.min(to_liq);
+    entry * if size > 0.0 { 1.0 - d } else { 1.0 + d }
+}
+
+/// The bare position `coin` (signed `size`) gets its stop (`guard_trigger` from its entry and liquidation, read from its
+/// dex): the chat's line.
+async fn guard_stop(v: &Venue, coin: &str, size: f64) -> Result<String> {
+    let dex = coin.split_once(':').map_or("", |x| x.0);
+    let st = v.ex.info(json!({"type": "clearinghouseState", "user": v.account, "dex": dex})).await?;
+    let p = st["assetPositions"].as_array().into_iter().flatten().map(|p| &p["position"]).find(|p| p["coin"] == coin)
+        .with_context(|| format!("{coin}: its position not read"))?;
+    let num = |x: &Value| x.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let entry = num(&p["entryPx"]);
+    anyhow::ensure!(entry > 0.0, "{coin}: no entry price");
+    let trigger = guard_trigger(entry, size, num(&p["liquidationPx"]));
+    v.stop(coin, size.signum(), size.abs(), trigger).await?;
+    Ok(format!("🛡 {coin}: {} {} стоял без стопа {:.0} мин — бот поставил стоп {:.6} ({:+.1}% от входа {entry}). Позиция не из живой сделки стратегии: тейка и выхода по времени нет, проверь.",
+        if size > 0.0 { "лонг" } else { "шорт" }, size.abs(), BARE_AFTER_S / 60.0, trigger, (trigger / entry - 1.0) * 100.0))
+}
+
 /// The account's positions on the main dex and `dexes` (coin -> signed size, none zero) and the coins with a resting
 /// stop (a reduce-only trigger order).
 pub(crate) async fn account(v: &Venue, unified: bool, dexes: &[String]) -> Result<(HashMap<String, f64>, HashSet<String>)> {
@@ -143,7 +224,19 @@ impl Watch {
         let pulses = crate::runner::pulses();
         let mut msgs = self.loops(&pulses, t);
         let (pos, stops, err) = match account(v, unified, dexes).await {
-            Ok((p, s)) => {
+            Ok((p, mut s)) => {
+                for c in self.guard_due(&p, &s, t) {
+                    if !v.coins.contains_key(&c) {
+                        continue;
+                    }
+                    match guard_stop(v, &c, p[&c]).await {
+                        Ok(m) => {
+                            msgs.push(m);
+                            s.insert(c);
+                        }
+                        Err(e) => msgs.push(format!("🚨 {c}: стоп поставить не вышло: {e:#}")),
+                    }
+                }
                 msgs.extend(self.positions(&p, &s, t));
                 (p, s, None)
             }
@@ -165,15 +258,20 @@ impl Watch {
 
 /// The watch on the live account, every `EVERY_S` (none without the account's keys).
 pub(crate) async fn start(cfg: &Config) -> Result<()> {
-    let Some((venue, unified)) = crate::runner::venue("health").await? else {
+    let Some((base, unified)) = crate::runner::venue("health").await? else {
         return Ok(());
     };
     let cfg = cfg.clone();
     tokio::spawn(async move {
         let mut w = Watch::default();
+        let mut venue = (f64::MIN, base.clone());
         let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(EVERY_S));
         loop {
             iv.tick().await;
+            if now() - venue.0 >= 3600.0 {
+                venue = (now(), crate::runner::with_hip3("health", &base).await);
+            }
+            let venue = &venue.1;
             let dexes = crate::venue::usdc_dexes(&venue.ex).await;
             w.round(&cfg, &venue, unified, &dexes).await;
         }
@@ -266,10 +364,18 @@ mod tests {
         assert!(w.round(&c, &v, false, &dexes).await.iter().all(|m| !m.contains("xyz:WTH")), "not yet");
         clock.go(130.0);
         let m = w.round(&c, &v, false, &dexes).await;
-        assert!(m.iter().any(|m| m.starts_with("🚨 xyz:WTH: шорт 3 без стопа")), "{m:?}");
+        // bare 2 min: the bot's own stop, 20% over the short's entry (no liquidation known), told; not "bare"
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].starts_with("🛡 xyz:WTH: шорт 3 стоял без стопа 2 мин — бот поставил стоп 60"), "{m:?}");
+        let o = f.with(|s| s.orders.values().filter(|o| o.coin == "xyz:WTH" && o.status == "open").map(|o| o.oid).count());
+        assert_eq!(o, 2, "the take and the new stop");
         let d = saved(&c, DOC).await.unwrap();
         assert_eq!(d["at"], json!(1_000_130.0));
-        assert_eq!(d["positions"], json!([{"coin": "WTA", "size": 2.0, "stop": true}, {"coin": "xyz:WTH", "size": -3.0, "stop": false}]));
+        assert_eq!(d["positions"], json!([{"coin": "WTA", "size": 2.0, "stop": true}, {"coin": "xyz:WTH", "size": -3.0, "stop": true}]));
+        // the next round: the stop rests, nothing more
+        clock.go(60.0);
+        let m = w.round(&c, &v, false, &dexes).await;
+        assert!(m.iter().all(|m| !m.contains("xyz:WTH")), "{m:?}");
         assert!(d["account_error"].is_null() && d["loops"].is_array());
         // the account not read: said in the doc, nothing told of the positions
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -286,6 +392,52 @@ mod tests {
         let c2 = cfg();
         assert!(w.round(&c2, &gone, false, &dexes).await.iter().all(|m| !m.contains("стоп")));
         assert!(saved(&c2, DOC).await.unwrap()["account_error"].is_string());
+    }
+
+    #[test]
+    fn a_bare_position_s_stop_sits_20_pct_off_or_short_of_its_liquidation() {
+        assert!((guard_trigger(100.0, 2.0, 0.0) - 80.0).abs() < 1e-9);
+        assert!((guard_trigger(100.0, -2.0, 0.0) - 120.0).abs() < 1e-9);
+        // 2026-11-18 xyz:SOXL: 50.452 at 5x isolated, liquidation 42.487: 90% of the way, -14.2%
+        let t = guard_trigger(50.452, 8.02, 42.4875);
+        assert!((t - (50.452 - 0.9 * (50.452 - 42.4875))).abs() < 1e-9 && t > 42.4875);
+        // a short's liquidation over it
+        assert!((guard_trigger(100.0, -1.0, 110.0) - 109.0).abs() < 1e-9);
+        // a far liquidation (cross): 20%
+        assert!((guard_trigger(100.0, 1.0, 30.0) - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_bare_position_s_stop_is_due_after_2_min_then_every_5_while_bare() {
+        let mut w = Watch::default();
+        let pos: HashMap<String, f64> = [("LIT".to_string(), 1.0), ("ARB".to_string(), -2.0)].into();
+        let stops: HashSet<String> = ["ARB".to_string()].into();
+        w.positions(&pos, &stops, 1000.0);
+        assert!(w.guard_due(&pos, &stops, 1119.0).is_empty());
+        assert_eq!(w.guard_due(&pos, &stops, 1120.0), vec!["LIT".to_string()]);
+        assert!(w.guard_due(&pos, &stops, 1300.0).is_empty(), "tried just now");
+        assert_eq!(w.guard_due(&pos, &stops, 1420.0), vec!["LIT".to_string()], "still bare 5 min on");
+        // its stop rests: forgotten
+        let both: HashSet<String> = ["ARB".to_string(), "LIT".to_string()].into();
+        assert!(w.guard_due(&pos, &both, 1500.0).is_empty());
+        assert!(w.guarded.is_empty());
+    }
+
+    #[test]
+    fn the_bot_is_frozen_when_every_loop_stands_3_min_or_one_twice_its_silence() {
+        let ok = pulse(5.0, 0.0, 1000.0, 9);
+        assert_eq!(frozen(&[], 99_999.0), None);
+        assert_eq!(frozen(&[("wick", ok), ("dip", ok)], 1180.0), None);
+        assert_eq!(frozen(&[("wick", ok), ("dip", ok)], 1181.0).as_deref(), Some("все циклы стоят 181 с"));
+        // one alive: the other stuck 20 min (2 x its 10)
+        let fresh = pulse(5.0, 0.0, 2200.0, 9);
+        assert_eq!(frozen(&[("wick", ok), ("dip", fresh)], 2200.0), None);
+        assert_eq!(frozen(&[("wick", ok), ("dip", fresh)], 2201.0).as_deref(), Some("wick молчит 20 мин"));
+        // the breakout's first long step (30 min its silence): an hour
+        let b = pulse(10.0, 0.0, 0.0, 0);
+        assert_eq!(frozen(&[("breakout", b), ("dip", pulse(5.0, 0.0, 3600.0, 9))], 3600.0), None);
+        // just born, not ticked yet: from its start
+        assert_eq!(frozen(&[("wick", pulse(5.0, 5000.0, 0.0, 0))], 5100.0), None);
     }
 
     #[test]

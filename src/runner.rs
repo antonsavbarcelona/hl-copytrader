@@ -175,6 +175,19 @@ pub(crate) async fn venue(kind: &str) -> Result<Option<(Venue, bool)>> {
     Ok(v)
 }
 
+/// `v` with the HIP-3 dexes' coins too (`Venue::with_hip3`); `v` alone, logged, when they are not read. A watch over the
+/// whole account needs them: an order on a coin the venue does not hold panics (2026-11-18: pxstop's venue held the main
+/// dex's only; its first HIP-3 exit would have ended its loop).
+pub(crate) async fn with_hip3(kind: &str, v: &Venue) -> Venue {
+    match v.with_hip3().await {
+        Ok((h, _)) => h,
+        Err(e) => {
+            log!("{kind}: the HIP-3 coins not read (the main dex's only): {e:#}");
+            v.clone()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

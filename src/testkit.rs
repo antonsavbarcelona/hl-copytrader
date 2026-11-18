@@ -44,6 +44,8 @@ pub(crate) struct State {
     pub(crate) mids: HashMap<String, f64>,
     /// coin -> its mark when set apart from the mid (a HIP-3 oracle trailing the trades): the triggers go by it
     pub(crate) marks: HashMap<String, f64>,
+    /// coin -> its category (perpAnnotation; "stocks" when not set)
+    pub(crate) categories: HashMap<String, String>,
     /// (coin, interval) -> its candles as the API sends them ({"t": open ms, "o", "h", "l", "c", "v"})
     pub(crate) candles: HashMap<(String, String), Vec<Value>>,
     /// coin -> its day's notional volume (metaAndAssetCtxs' dayNtlVlm)
@@ -182,6 +184,8 @@ impl State {
                 u.sort_by_key(|x| x.0);
                 json!({"universe": u.into_iter().map(|x| x.1).collect::<Vec<_>>(), "collateralToken": 0})
             }
+            // a coin's category: "stocks" unless set (`categories`)
+            "perpAnnotation" => json!({"category": self.categories.get(q["coin"].as_str().unwrap_or("")).map_or("stocks", String::as_str), "description": ""}),
             "metaAndAssetCtxs" => {
                 let mut u: Vec<(u32, String, u32, u32)> = self.assets.iter().filter(|(_, x)| on_dex(&x.0)).map(|(a, x)| (*a, x.0.clone(), x.1, x.2)).collect();
                 u.sort_by_key(|x| x.0);

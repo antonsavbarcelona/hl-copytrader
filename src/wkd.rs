@@ -45,6 +45,70 @@ const EXCLUDED: &[&str] = &["GOLD", "SILVER", "CL", "OIL", "USOIL", "WTI", "BREN
 /// Korea ETFs KORU / EWY follow Seoul, open then: 10 night dips +61 bp vs +198 the rest).
 const NON_US: &[&str] = &["ANTH", "CXMT", "DRAM", "EWJ", "EWT", "GIGADEV", "HYUNDAI", "JP225", "KIOXIA", "KORU", "EWY", "KR200", "MINIMAX", "OAI", "SHEIN",
     "SKHX", "SKHY", "SMALL2000", "SMSN", "SOFTBANK", "SP500", "SPCX", "UNITREE", "US500", "USA100", "USA500", "USTECH", "XYZ100", "ZHIPU"];
+/// Left out of the nights besides `NON_US` (2026-11-18, the user's call): the Indian, Hong Kong / Chinese and pre-IPO names
+/// listed after the research (their markets open, or none, while the US one is shut). Only the nights of this strategy:
+/// the wick's shut bids keep them (`us_stock` unchanged). The research's ~200 night dips of such names (`NON_US`, HL 1m
+/// 2025-12 .. 2026-10): ~-65 bp a trade vs +180..+210 the US stocks; these 8 names' own last two weeks (5m): 5 of 5 up,
+/// too few to weigh against the class.
+const NIGHT_OUT: &[&str] = &["NIFTY", "RELIANCE", "JIO", "TCNT", "XIAOMI", "CAMBRICON", "OURA", "ANT"];
+/// The exchange's own categories (`perpAnnotation`) left out (2026-11-18, the user's call): io:PRL ("PEARL", crypto) was
+/// bought as a US stock at night (-$280); the name lists missed it, listed after them. Read every `CATEGORY_EVERY_S`; a
+/// coin not read keeps the name lists' verdict. The wick's shut bids keep these names (their own research).
+const OFF_CATEGORIES: [&str; 4] = ["crypto", "rates", "commodities", "fx"];
+const CATEGORY_EVERY_S: f64 = 6.0 * 3600.0;
+static CATEGORIES: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// A coin's category as the exchange tells it.
+pub(crate) fn set_category(coin: &str, category: &str) {
+    CATEGORIES.lock().unwrap().get_or_insert_with(HashMap::new).insert(coin.to_string(), category.to_string());
+}
+
+/// The exchange calls the coin crypto, a rate, a commodity or FX.
+fn off_category(coin: &str) -> bool {
+    CATEGORIES.lock().unwrap().as_ref().and_then(|m| m.get(coin)).is_some_and(|c| OFF_CATEGORIES.contains(&c.as_str()))
+}
+
+/// The weekend / night dips' own pick: `tradable` (weekend) or `us_stock` and not `NIGHT_OUT` (night), and not of an
+/// `OFF_CATEGORIES` category.
+fn dip_tradable(coin: &str, wkend: bool) -> bool {
+    let named = if wkend { tradable(coin) } else { us_stock(coin) && coin.split_once(':').is_some_and(|(_, n)| !NIGHT_OUT.contains(&n)) };
+    named && !off_category(coin)
+}
+
+/// The categories of the USDC dexes' coins read from the exchange every `CATEGORY_EVERY_S` (in the background, paced).
+pub(crate) fn read_categories(api: crate::api::Api) {
+    tokio::spawn(async move {
+        loop {
+            let n = categories_once(&api).await;
+            let off: Vec<String> = CATEGORIES.lock().unwrap().as_ref().map(|m| {
+                let mut v: Vec<String> = m.iter().filter(|(c, k)| OFF_CATEGORIES.contains(&k.as_str()) && tradable(c)).map(|(c, k)| format!("{c} ({k})")).collect();
+                v.sort();
+                v
+            }).unwrap_or_default();
+            crate::log!("wkd: {n} coins' categories read; left out by theirs (not on the name lists): {}", if off.is_empty() { "none".to_string() } else { off.join(", ") });
+            tokio::time::sleep(std::time::Duration::from_secs_f64(CATEGORY_EVERY_S)).await;
+        }
+    });
+}
+
+/// One read of every USDC dex's coins' categories: how many read.
+async fn categories_once(api: &crate::api::Api) -> usize {
+    let mut n = 0;
+    for d in DEXES {
+        let Ok(meta) = api.info(json!({"type": "meta", "dex": d}), 20).await else { continue };
+        for u in meta["universe"].as_array().into_iter().flatten() {
+            let Some(c) = u["name"].as_str() else { continue };
+            if let Ok(a) = api.info(json!({"type": "perpAnnotation", "coin": c}), 20).await
+                && let Some(cat) = a["category"].as_str()
+            {
+                set_category(c, cat);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 const REF_MIN: i64 = 15;
 /// The live buy goes out on the first poll this long after the signal (10 s polls: 10 .. 20 s after the mid fell through),
 /// not at the paper's entry a minute on. The raw tape 2025-12 .. 2026-10 (night/tape_an.py, the first taker buy print, 155
@@ -207,7 +271,7 @@ impl Book {
         let (wkend, night) = (weekend(minute), us_night(minute));
         if wkend || night {
             for (c, &(m, lo)) in lows {
-                if m != minute || !(if wkend { tradable(c) } else { us_stock(c) }) || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || self.last.get(c).is_some_and(|x| minute - x < GAP_MIN) {
+                if m != minute || !dip_tradable(c, wkend) || volume.get(c).copied().unwrap_or(0.0) < p.min_vol || self.last.get(c).is_some_and(|x| minute - x < GAP_MIN) {
                     continue;
                 }
                 let Some(q) = closes.0.get(c) else { continue };
@@ -374,6 +438,43 @@ mod tests {
         assert_eq!(ev.len(), 1, "{ev:?}");
         assert_eq!(ev[0]["coin"], "xyz:NVDA");
         assert!(if crate::notify::PAPER_TO_CHAT { message(&ev[0]).unwrap().contains("ночь США") } else { message(&ev[0]).is_none() });
+    }
+
+    #[test]
+    fn the_exchange_s_crypto_and_the_late_listed_asian_names_are_left_out() {
+        let p = Params { drop: 0.04, min_vol: 1e5, take: 0.05, stop: 0.10, hold_s: 86400.0, risk_usd: 20.0, max_open: 3, live: None };
+        set_category("io:TPRL", "crypto");
+        set_category("xyz:TNVD", "stocks");
+        let signals = |minute: i64, coins: &[&str]| {
+            let mut c = Closes::default();
+            for m in minute - 20..minute {
+                for x in coins {
+                    c.update(x, m, 100.0, 40);
+                }
+            }
+            let vol: HashMap<String, f64> = coins.iter().map(|x| (x.to_string(), 2e5)).collect();
+            let lows: HashMap<String, (i64, f64)> = coins.iter().map(|x| (x.to_string(), (minute, 95.5))).collect();
+            let (ev, _) = Book::default().step(&p, &c, &lows, &vol, minute, 0.0);
+            let mut got: Vec<String> = ev.iter().map(|e| e["coin"].as_str().unwrap().to_string()).collect();
+            got.sort();
+            got
+        };
+        // a US night: the crypto one (by the exchange) and the late-listed Indian / HK names out; a stock in, one unread in
+        let night = 29_887_320;
+        assert_eq!(signals(night, &["io:TPRL", "xyz:TNVD", "xyz:JIO", "io:TCNT", "xyz:OURA", "xyz:TUNREAD"]), vec!["xyz:TNVD", "xyz:TUNREAD"]);
+        // the weekend: the Asian names trade (their markets shut too), the crypto one not
+        let sat = days_from_civil(2026, 11, 7) * 1440 + 12 * 60;
+        assert_eq!(signals(sat, &["io:TPRL", "xyz:TNVD", "xyz:JIO", "io:TCNT"]), vec!["io:TCNT", "xyz:JIO", "xyz:TNVD"]);
+        // the wick's pick unchanged: a late-listed Asian name is still a "US stock" for its shut bids
+        assert!(us_stock("xyz:JIO") && !dip_tradable("xyz:JIO", false) && dip_tradable("xyz:JIO", true));
+    }
+
+    #[tokio::test]
+    async fn the_categories_are_read_from_the_exchange() {
+        let hl = crate::testkit::FakeHl::start(&[("xyz:CATA", 2, 10, 10.0), ("xyz:CATB", 2, 10, 10.0)]).await;
+        hl.with(|s| s.categories.insert("xyz:CATB".into(), "crypto".into()));
+        assert_eq!(categories_once(&hl.api()).await, 2);
+        assert!(!off_category("xyz:CATA") && off_category("xyz:CATB"));
     }
 }
 

@@ -336,6 +336,8 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     if crate::runner::off("hip3", "HIP3_ENABLED") {
         return Ok(());
     }
+    // the exchange's categories for the weekend / night dips' pick (crypto, rates, commodities, FX left out)
+    crate::wkd::read_categories(api.clone());
     let p = Params::from_env();
     let state: State = crate::store::load_state(cfg, DOC).await?;
     log!("hip3: signals only; a fall of {:.0}% in 5 or 15 min (BTC under {:.0}%, ${:.0}M+ a day), the result {:.0} min on; {} pending",

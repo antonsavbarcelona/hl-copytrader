@@ -80,15 +80,21 @@ pub(crate) fn read_categories(api: crate::api::Api) {
     tokio::spawn(async move {
         loop {
             let n = categories_once(&api).await;
-            let off: Vec<String> = CATEGORIES.lock().unwrap().as_ref().map(|m| {
-                let mut v: Vec<String> = m.iter().filter(|(c, k)| OFF_CATEGORIES.contains(&k.as_str()) && tradable(c)).map(|(c, k)| format!("{c} ({k})")).collect();
-                v.sort();
-                v
-            }).unwrap_or_default();
+            let off = left_out_by_category();
             crate::log!("wkd: {n} coins' categories read; left out by theirs (not on the name lists): {}", if off.is_empty() { "none".to_string() } else { off.join(", ") });
             tokio::time::sleep(std::time::Duration::from_secs_f64(CATEGORY_EVERY_S)).await;
         }
     });
+}
+
+/// The coins left out by their category alone (not on the name lists), "coin (category)", sorted. The map is copied out
+/// first: `tradable` takes the same lock (held across it, 2026-11-18 11:57 UTC: the std mutex locked twice on one thread,
+/// every loop that read a category stuck behind it, the whole bot still for 2 h+).
+fn left_out_by_category() -> Vec<String> {
+    let m = CATEGORIES.lock().unwrap().clone().unwrap_or_default();
+    let mut v: Vec<String> = m.iter().filter(|(c, k)| OFF_CATEGORIES.contains(&k.as_str()) && named_tradable(c)).map(|(c, k)| format!("{c} ({k})")).collect();
+    v.sort();
+    v
 }
 
 /// One read of every USDC dex's coins' categories: how many read.
@@ -236,7 +242,12 @@ pub(crate) fn us_sunday_night(minute: i64) -> bool {
 /// A stock or an index of a USDC dex (US, Asian, pre-IPO): not on `EXCLUDED`, nor of an `OFF_CATEGORIES` category by the
 /// exchange (the wick's picks too: such a coin a non-equity name, `non_equity`).
 fn tradable(coin: &str) -> bool {
-    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n)) && !off_category(coin)
+    named_tradable(coin) && !off_category(coin)
+}
+
+/// A USDC dex's coin not on `EXCLUDED` (the name lists alone, no category).
+fn named_tradable(coin: &str) -> bool {
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n))
 }
 
 /// A tradable US stock (for the nights).
@@ -481,6 +492,20 @@ mod tests {
         hl.with(|s| s.categories.insert("xyz:CATB".into(), "crypto".into()));
         assert_eq!(categories_once(&hl.api()).await, 2);
         assert!(!off_category("xyz:CATA") && off_category("xyz:CATB"));
+    }
+
+    /// 2026-11-18: the read's log line took the categories' lock and asked `tradable`, which takes it again: the bot froze.
+    /// The list is made on its own thread; it must come back (a relock never does).
+    #[test]
+    fn the_left_out_list_does_not_lock_the_categories_twice() {
+        set_category("xyz:LOCKA", "crypto");
+        set_category("xyz:LOCKB", "stocks");
+        set_category("xyz:TOTAL2", "crypto");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(left_out_by_category()).unwrap());
+        let v = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the left-out list hung: the lock taken twice");
+        assert!(v.contains(&"xyz:LOCKA (crypto)".to_string()));
+        assert!(!v.iter().any(|s| s.starts_with("xyz:LOCKB") || s.starts_with("xyz:TOTAL2")));
     }
 }
 

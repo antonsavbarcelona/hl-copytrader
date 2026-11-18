@@ -53,7 +53,7 @@ const NON_US: &[&str] = &["ANTH", "CXMT", "DRAM", "EWJ", "EWT", "GIGADEV", "HYUN
 const NIGHT_OUT: &[&str] = &["NIFTY", "RELIANCE", "JIO", "TCNT", "XIAOMI", "CAMBRICON", "OURA", "ANT"];
 /// The exchange's own categories (`perpAnnotation`) left out (2026-11-18, the user's call): io:PRL ("PEARL", crypto) was
 /// bought as a US stock at night (-$280); the name lists missed it, listed after them. Read every `CATEGORY_EVERY_S`; a
-/// coin not read keeps the name lists' verdict. The wick's shut bids keep these names (their own research).
+/// coin not read keeps the name lists' verdict. The wick bids such a coin as a non-equity name (`non_equity`).
 const OFF_CATEGORIES: [&str; 4] = ["crypto", "rates", "commodities", "fx"];
 const CATEGORY_EVERY_S: f64 = 6.0 * 3600.0;
 static CATEGORIES: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
@@ -233,9 +233,10 @@ pub(crate) fn us_sunday_night(minute: i64) -> bool {
     !weekend(minute) && (wd == 6 || (wd == 0 && m < 240))
 }
 
-/// A stock or an index of a USDC dex (US, Asian, pre-IPO).
+/// A stock or an index of a USDC dex (US, Asian, pre-IPO): not on `EXCLUDED`, nor of an `OFF_CATEGORIES` category by the
+/// exchange (the wick's picks too: such a coin a non-equity name, `non_equity`).
 fn tradable(coin: &str) -> bool {
-    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n))
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && !EXCLUDED.contains(&n)) && !off_category(coin)
 }
 
 /// A tradable US stock (for the nights).
@@ -252,9 +253,11 @@ pub(crate) fn asian_stock(coin: &str) -> bool {
     coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && ASIAN.contains(&n))
 }
 
-/// A non-equity name of a USDC dex: the commodities, FX, the rates and the crypto-linked ones.
+/// A non-equity name of a USDC dex: the commodities, FX, the rates and the crypto-linked ones (`EXCLUDED`, or so by the
+/// exchange's category: 2026-11-18, the user's call, io:PRL's wick shut bids as the non-equity names' (HL 1m 2026-04 ..
+/// 10, the 8 HIP-3 crypto tokens: 3% / take 3% / stop 20% / 4 h +103 bp a trade vs as a US stock +69)).
 pub(crate) fn non_equity(coin: &str) -> bool {
-    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && EXCLUDED.contains(&n))
+    coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && (EXCLUDED.contains(&n) || off_category(coin)))
 }
 
 /// The US market shut: the UTC weekend, the US weeknights, Sunday night in New York.
@@ -467,6 +470,9 @@ mod tests {
         assert_eq!(signals(sat, &["io:TPRL", "xyz:TNVD", "xyz:JIO", "io:TCNT"]), vec!["io:TCNT", "xyz:JIO", "xyz:TNVD"]);
         // the wick's pick unchanged: a late-listed Asian name is still a "US stock" for its shut bids
         assert!(us_stock("xyz:JIO") && !dip_tradable("xyz:JIO", false) && dip_tradable("xyz:JIO", true));
+        // a crypto one by the exchange: no stock for the wick either, a non-equity name (its shut bids as TOTAL2's)
+        assert!(!us_stock("io:TPRL") && !tradable("io:TPRL") && non_equity("io:TPRL"));
+        assert!(us_stock("xyz:TNVD") && !non_equity("xyz:TNVD") && !non_equity("xyz:TUNREAD"));
     }
 
     #[tokio::test]

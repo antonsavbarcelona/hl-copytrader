@@ -8,6 +8,11 @@
 //! (the account's ledger, USDC only): a withdrawal is no loss, a deposit no gain. The equity comes from the strategies'
 //! reads (`trades::set_equity`); a reading counts for the peak only with the one after it as high (a read's glitch or a
 //! deposit seen before the ledger: no false peak), and the risk changes only after two checks in a row agree.
+//!
+//! A flow moves the peak in proportion (2026-11-18, the user's call): $5,002 of $9,049 out at 5.8% under the peak took
+//! the peak down by the dollars, $9,607 -> $4,605, and the same $558 under it read 12.1%: the risk cut. Now the peak goes
+//! with the equity's share moved (x (E + flow) / E, E the equity a reading at least `FLOW_PRE_S` before the flow saw);
+//! without such a reading, by the dollars as before.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,6 +30,13 @@ const BACK_DD: f64 = 0.095;
 const CUT_X: f64 = 0.5;
 const CHECK_S: f64 = 60.0;
 const DOC: &str = "guard";
+/// The equity before a flow: a reading at least this long before its ledger time (the equity sees a flow first at times).
+const FLOW_PRE_S: f64 = 30.0;
+/// The readings kept for the equity before a flow.
+const HIST_S: f64 = 7200.0;
+/// The 2026-11-18 withdrawal taken off by the dollars (the saved hwm, flows): its peak moved in proportion once, the
+/// equity before it $9,049.41 ($4,047.41 after + $5,002 out).
+const FIX_2026_11_18: (f64, f64, f64) = (9607.36008537, -5002.0, 9049.41);
 
 /// What the guard keeps over a restart.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -49,6 +61,8 @@ pub(crate) struct Guard {
     recent: Vec<(f64, f64)>,
     /// The latest equity.
     last_eq: f64,
+    /// The readings of the last `HIST_S` (s, $): the equity before a flow.
+    hist: Vec<(f64, f64)>,
     /// Checks in a row that want the other side.
     streak: u32,
 }
@@ -77,13 +91,37 @@ impl Guard {
                 self.readings.remove(0);
             }
             self.last_eq = eq;
+            self.hist.push((t, eq));
+            self.hist.retain(|(at, _)| t - at <= HIST_S);
         }
+    }
+
+    /// The peak moved by a flow `x` at `t` in proportion to the equity it moved (`hwm` set so the peak is `P x (E + x) / E`
+    /// with the flow in); without an equity read `FLOW_PRE_S` before it, by the dollars.
+    fn scale_peak(&mut self, t: f64, x: f64) {
+        let e = self.hist.iter().filter(|(at, _)| *at <= t - FLOW_PRE_S).map(|x| x.1).next_back();
+        let p = self.peak();
+        if let Some(e) = e.filter(|e| *e > 0.0 && e + x > 0.0 && p > 0.0) {
+            self.s.hwm = p * (e + x) / e - (self.s.flows + x);
+        }
+    }
+
+    /// The 2026-11-18 withdrawal's peak moved in proportion, once (`FIX_2026_11_18`): the saved state as it left it.
+    fn fix_2026_11_18(&mut self) -> bool {
+        let (hwm, flows, e) = FIX_2026_11_18;
+        if (self.s.hwm - hwm).abs() > 0.01 || (self.s.flows - flows).abs() > 0.01 {
+            return false;
+        }
+        let before = hwm;
+        self.s.hwm = before * (e + flows) / e - flows;
+        true
     }
 
     /// The flows (ms, $) read from the ledger up to `upto_ms`.
     fn flowed(&mut self, flows: &[(f64, f64)], upto_ms: f64) {
         for &(ms, x) in flows {
             if ms > self.s.ledger_ms {
+                self.scale_peak(ms / 1000.0, x);
                 self.s.flows += x;
                 self.recent.push((ms / 1000.0, x));
             }
@@ -249,8 +287,13 @@ pub(crate) async fn start(cfg: &Config, store: Store, api: Api) -> anyhow::Resul
     if s.ledger_ms <= 0.0 {
         s.ledger_ms = now() * 1000.0; // the guard begins now: the flows before it are in the equity already
     }
-    log!("guard: peak net ${:.0}, flows ${:.0}, risk {}", s.hwm, s.flows, if s.cut { "cut" } else { "full" });
-    with(|g| g.s = s);
+    with(|g| {
+        g.s = s;
+        if g.fix_2026_11_18() {
+            log!("guard: the 2026-11-18 withdrawal's peak moved in proportion: peak ${:.0}", g.peak());
+        }
+        log!("guard: peak net ${:.0}, flows ${:.0}, risk {}", g.s.hwm, g.s.flows, if g.s.cut { "cut" } else { "full" });
+    });
     let cfg = cfg.clone();
     crate::runner::born("guard", CHECK_S);
     tokio::spawn(async move {
@@ -348,6 +391,44 @@ mod tests {
             {"time": 7, "delta": {"type": "accountClassTransfer", "usdc": "10", "toPerp": true}},
             {"time": 8, "delta": {"type": "internalTransfer", "user": "0xfe19", "destination": "0xbbb", "usdc": "40"}}]);
         assert_eq!(ledger_flows(&v, me), vec![(1.0, 200.5), (2.0, -230.0), (5.0, 1000.0), (6.0, -301.0), (8.0, -40.0)]);
+    }
+
+    #[test]
+    fn a_flow_moves_the_peak_in_proportion_to_the_equity_it_moved() {
+        // a peak of 10,000, the equity 9,000 (10% under): 4,500 out -> the peak 5,000, still 10% under
+        let mut x = g(10_000.0, 0.0);
+        x.seen(100.0, 9_000.0);
+        x.seen(200.0, 4_500.0);
+        x.flowed(&[(150_000.0, -4500.0)], 300_000.0);
+        assert!((x.peak() - 5_000.0).abs() < 1e-6, "{}", x.peak());
+        assert!((x.dd() - 0.10).abs() < 1e-9);
+        // a deposit of 4,500 back: the peak 10,000 again
+        x.seen(400.0, 9_000.0);
+        x.flowed(&[(350_000.0, 4500.0)], 500_000.0);
+        assert!((x.peak() - 10_000.0).abs() < 1e-6, "{}", x.peak());
+        // a reading too near the flow (< FLOW_PRE_S before it): by the dollars
+        let mut y = g(10_000.0, 0.0);
+        y.seen(140.0, 9_000.0);
+        y.flowed(&[(150_000.0, -4500.0)], 300_000.0);
+        assert!((y.peak() - 5_500.0).abs() < 1e-6);
+        // old readings leave the history
+        y.seen(140.0 + HIST_S + 1.0, 4_500.0);
+        assert_eq!(y.hist.len(), 1);
+    }
+
+    #[test]
+    fn the_2026_11_18_withdrawal_is_moved_once() {
+        let mut x = g(FIX_2026_11_18.0, FIX_2026_11_18.1);
+        assert!(x.fix_2026_11_18());
+        // the peak 9,607 x 4,047.41 / 9,049.41 = 4,297: the equity 4,047 is 5.8% under, the risk back
+        assert!((x.peak() - 4_297.0).abs() < 1.0, "{}", x.peak());
+        x.s.cut = true;
+        x.seen(1.0, 4_047.41);
+        assert!((x.dd() - 0.058).abs() < 0.001);
+        assert_eq!((x.decide(), x.decide()), (None, Some(false)));
+        // once: the state it left no longer matches
+        assert!(!x.fix_2026_11_18());
+        assert!(!g(10_000.0, 0.0).fix_2026_11_18());
     }
 
     #[test]

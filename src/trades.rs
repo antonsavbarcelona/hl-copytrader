@@ -303,6 +303,10 @@ pub(crate) fn family_holds(coin: &str) -> bool {
 /// Whether our resting stop / take `oid` has done its work (filled, or triggered): on a shared coin the account's
 /// position is not ours alone, so a trade's end is read from its own orders. Not read: false (the next check).
 pub(crate) async fn order_done(v: &Venue, oid: u64) -> bool {
+    // closed by the price here (`pxstop`: the mark trailed the trades), its order cancelled: done
+    if crate::pxstop::closed(oid).is_some() {
+        return true;
+    }
     match v.order_state(oid).await {
         Ok((st, filled)) => st == "filled" || st == "triggered" || (filled > 0.0 && st != "open"),
         Err(e) => {

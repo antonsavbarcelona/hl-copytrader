@@ -21,6 +21,7 @@ mod listing;
 mod market;
 mod venue;
 mod notify;
+mod pxstop;
 mod runner;
 mod rsidip;
 mod squeeze;
@@ -98,6 +99,10 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     squeeze::start(&cfg, store.clone()).await?;
     breakout::start(&cfg, store.clone()).await?;
+    // the stops by the price: a stop the exchange's mark trails, out at market by the mid
+    if let Err(e) = pxstop::start(store.clone()).await {
+        log!("pxstop: not watching: {e:#}");
+    }
     ext::start(&cfg, store).await?;
     // every loop's pulse and every position's stop, watched (never in the way of the trading)
     if let Err(e) = health::start(&cfg).await {

@@ -42,6 +42,8 @@ pub(crate) struct State {
     /// asset id -> (coin, size decimals, max leverage)
     pub(crate) assets: HashMap<u32, (String, u32, u32)>,
     pub(crate) mids: HashMap<String, f64>,
+    /// coin -> its mark when set apart from the mid (a HIP-3 oracle trailing the trades): the triggers go by it
+    pub(crate) marks: HashMap<String, f64>,
     /// (coin, interval) -> its candles as the API sends them ({"t": open ms, "o", "h", "l", "c", "v"})
     pub(crate) candles: HashMap<(String, String), Vec<Value>>,
     /// coin -> its day's notional volume (metaAndAssetCtxs' dayNtlVlm)
@@ -134,7 +136,8 @@ impl State {
             let o = self.orders[&oid].clone();
             let Some(&mid) = self.mids.get(&o.coin) else { continue };
             if let Some(trig) = o.trigger {
-                let hit = if o.buy { mid >= trig } else { mid <= trig };
+                let mark = self.marks.get(&o.coin).copied().unwrap_or(mid);
+                let hit = if o.buy { mark >= trig } else { mark <= trig };
                 if hit {
                     let sz = if o.reduce { self.reducible(&o.coin, o.buy, o.left) } else { o.left };
                     if sz > 0.0 {
@@ -437,6 +440,13 @@ impl FakeHl {
     pub(crate) fn set_mid(&self, coin: &str, px: f64) {
         let mut s = self.st.lock().unwrap();
         s.mids.insert(coin.to_string(), px);
+        s.sweep();
+    }
+
+    /// The mark held apart from the mid (the triggers go by it); the triggers it crosses fill at the mid.
+    pub(crate) fn set_mark(&self, coin: &str, px: f64) {
+        let mut s = self.st.lock().unwrap();
+        s.marks.insert(coin.to_string(), px);
         s.sweep();
     }
 

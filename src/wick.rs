@@ -436,6 +436,17 @@ fn level_past(ask: bool, old: f64, new: f64) -> bool {
 }
 
 /// Whether a resting bid at `old` should move to `new`.
+/// A HIP-3 bid's level held to the trade's: `lvl` (from the minute's last mid, `anchor`) scaled down to the minute's
+/// last trade `close` when that is lower, never up. The research's level is the 1m candle's close (the last trade);
+/// the mid in a fast minute can sit far over it (2026-11-19 16:50 xyz:ANT: the mid 112.27, the trade's close 110.47:
+/// the bid moved up 105.53 -> 107.78, filled 33 s on, -8.8% at the exit; held to 106.05 it would have stayed at 105.53).
+fn trade_level(lvl: f64, anchor: f64, close: Option<f64>) -> f64 {
+    match close {
+        Some(c) if c > 0.0 && anchor > 0.0 && c < anchor => lvl * c / anchor,
+        _ => lvl,
+    }
+}
+
 fn drifted(old: f64, new: f64, up: f64, down: f64) -> bool {
     old <= 0.0 || new >= old * (1.0 + up) || new <= old * (1.0 - down)
 }
@@ -528,21 +539,31 @@ fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
     x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
 }
 
+/// A price for the chat: 6 significant digits, no float tail (107.77919999999999 -> 107.779).
+fn px(x: f64) -> String {
+    if x == 0.0 || !x.is_finite() {
+        return format!("{x}");
+    }
+    let prec = (5 - x.abs().log10().floor() as i32).max(0) as usize;
+    let t = format!("{x:.prec$}");
+    if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
+}
+
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
     let coin = ev["coin"].as_str().unwrap_or("?");
     Some(match ev["what"].as_str()? {
         "open" if ev["ask"] == true => format!("🎣 ВЫНОС {coin}: лимитка на продажу {:.0}% выше исполнилась по {} (шорт), на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
-            f("pct") * 100.0, f("px"), f("notional").abs(), f("take_px"), f("stop_px"), f("hold_min")),
+            f("pct") * 100.0, px(f("px")), f("notional").abs(), px(f("take_px")), px(f("stop_px")), f("hold_min")),
         "open" => format!("🎣 ПРОКОЛ {coin}: лимитка {:.0}% ниже{} исполнилась по {}, на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
-            f("pct") * 100.0, if ev["major"] == true { " (крупная монета)" } else if ev["deep"] == true { " (лесенка)" } else { "" }, f("px"), f("notional"), f("take_px"), f("stop_px"), f("hold_min")),
+            f("pct") * 100.0, if ev["major"] == true { " (крупная монета)" } else if ev["deep"] == true { " (лесенка)" } else { "" }, px(f("px")), f("notional"), px(f("take_px")), px(f("stop_px")), f("hold_min")),
         "close" => format!("{} прокол {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" }, f("entry_px"), f("px"), f("ret_pct"), usd(f("pnl_usd"))),
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" }, px(f("entry_px")), px(f("px")), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "crash_off" => format!("🛑 ОБВАЛ: {:.0} крипто-лимитки исполнились за {:.0} с — все крипто-лимитки сняты на {:.0} мин (HIP-3 остаются; открытые сделки со своими стопами)",
             f("fills"), f("window_s"), f("off_min")),
         "over" => format!("✂️ лишняя лимитка {coin} закрыта по рынку ({}): вход {}, выход {}, {}",
-            if ev["why"] == "slots" { "слоты заняты" } else { "лимит риска семьи" }, f("px"), f("out_px"), usd(f("pnl_usd"))),
+            if ev["why"] == "slots" { "слоты заняты" } else { "лимит риска семьи" }, px(f("px")), px(f("out_px")), usd(f("pnl_usd"))),
         _ => return None,
     })
 }
@@ -579,6 +600,9 @@ struct Wick {
     /// Bids moved in one request whose oid changed (`Venue::modify`): (coin, rung, the old bid, when), the old
     /// order's status read on for a fill in part just before the move (the cancel's settlement, deferred).
     moved: Vec<(String, usize, Bid, f64)>,
+    /// A HIP-3 coin's last trade in a minute (its 1m candle's close), read when a bid is placed or moved up
+    /// (`trade_capped`): (coin, minute) -> the close.
+    trade_close: HashMap<(String, i64), f64>,
     /// The crypto bids' fills seen in the last `CRASH_WINDOW_S` (the breaker's count).
     crash_fills: Vec<f64>,
     /// The loop's timers: the volumes (and the coins picked again), the oracles, the orders' check, the candles' backfill,
@@ -984,6 +1008,25 @@ impl Wick {
 
     /// The prices of the main dex and of the HIP-3 dexes bid on (the anchors: every poll); with
     /// `all`, every HIP-3 dex (the deviations of the coins not bid on).
+    /// `lvl` held to the HIP-3 coin's last trade of the minute before (`trade_level`; its 1m candle read once a minute,
+    /// kept for the rungs; unread: `lvl` as it is).
+    async fn trade_capped(&mut self, c: &str, minute: i64, lvl: f64) -> f64 {
+        let Some(anchor) = self.closes.at(c, minute - 1) else { return lvl };
+        let key = (c.to_string(), minute - 1);
+        if !self.trade_close.contains_key(&key) {
+            self.trade_close.retain(|k, _| k.1 >= minute - 1);
+            match self.api.minute_closes(c, ((minute - 1) * 60) as f64).await {
+                Ok(v) => {
+                    if let Some(x) = v.iter().find(|x| x.0 == minute - 1) {
+                        self.trade_close.insert(key.clone(), x.1);
+                    }
+                }
+                Err(e) => log!("wick: {c} candle not read (the bid by the mid): {e:#}"),
+            }
+        }
+        trade_level(lvl, anchor, self.trade_close.get(&key).copied())
+    }
+
     async fn read_mids(&mut self, minute: i64, all: bool) {
         let mut dexes: HashSet<String> = HashSet::from([String::new()]);
         dexes.extend(self.h3_picked.iter().map(|c| dex_of(c).to_string()));
@@ -1266,6 +1309,13 @@ impl Wick {
             }
         }
         for (c, (lvl, pct, shut)) in want {
+            // a HIP-3 bid about to be placed or moved: held to the minute's last trade (`trade_level`)
+            let (up, down) = if rung == ASK { (self.p.reprice_down, self.p.reprice) } else { (self.p.reprice, self.p.reprice_down) };
+            let lvl = if rung != ASK && c.contains(':') && self.book(rung).get(&c).is_none_or(|b| b.shut != shut || drifted(b.px, lvl, up, down)) {
+                self.trade_capped(&c, minute, lvl).await
+            } else {
+                lvl
+            };
             // no requests to spare (`venue::RATE_RESERVE`): nothing placed or moved; a bid its level left
             // behind (the level past it: the MRNA case) only cancelled; one the level moved away from stays
             let spend = crate::venue::wick_may_spend();
@@ -1274,7 +1324,6 @@ impl Wick {
             if let Some(b) = self.book(rung).get(&c).cloned() {
                 // the level's kind changed (the US market shut or open again): moved whichever way
                 // an ask the mirror: moved up as soon as its level rises, down when it falls far
-                let (up, down) = if rung == ASK { (self.p.reprice_down, self.p.reprice) } else { (self.p.reprice, self.p.reprice_down) };
                 let resize = resized(b.size, size);
                 if b.shut == shut && !drifted(b.px, lvl, up, down) && !resize {
                     continue;
@@ -1326,7 +1375,7 @@ impl Wick {
                 Err(e) => ("error", None, Some(format!("{e:#}"))),
             };
             self.trace(json!({"what": "place", "coin": c, "oid": oid, "result": result, "error": err, "px": lvl, "size": size, "old_px": old,
-                "pct": pct, "shut": shut, "deep": deep, "rung": rung, "anchor_close": self.closes.at(&c, minute - 1),
+                "pct": pct, "shut": shut, "deep": deep, "rung": rung, "anchor_close": self.closes.at(&c, minute - 1), "trade_close": self.trade_close.get(&(c.clone(), minute - 1)),
                 "oracle": (!c.contains(':')).then(|| self.oracle.get(&c).copied()).flatten(), "mid": self.closes.at(&c, i64::MAX),
                 "mids_age_s": t_sent - self.mids_at, "ctx_age_s": t_sent - self.ctx_at, "minute": minute, "t_calc": t_calc, "t_sent": t_sent, "t_ack": t_ack}));
             match placed {
@@ -1688,7 +1737,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), crash_fills: Vec::new(),
+        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(),
         vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S), last_minute: (now() / 60.0).floor() as i64 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     crate::runner::spawn("wick", w);
@@ -1967,7 +2016,7 @@ mod crash_tests {
         let w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         (f, w, rx)
     }
@@ -2082,7 +2131,7 @@ mod tick_tests {
         let mut w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         w.tick().await;
         (f, w, rx, clock)
@@ -2211,5 +2260,55 @@ mod tick_tests {
         w.tick().await;
         let h2 = bid(&f, "xyz:WTH").unwrap();
         assert!((h2.orig / h1.orig - 2.0).abs() < 0.05 && near(h2.px, 49.49 * (1.0 - w.p.h3_pct)), "{h1:?} -> {h2:?}"); // placed again at the level now
+    }
+    /// 2026-11-19 xyz:ANT: the minute's last mid 112.27, its last trade 110.47; the bid moved up 2% by the mid, filled.
+    /// A HIP-3 bid placed or moved goes by the lower of the two (the research's level is the candle's close).
+    #[tokio::test]
+    async fn a_hip3_bid_moves_by_the_minute_s_last_trade_when_the_mid_sits_over_it() {
+        let (f, mut w, _rx, clock) = ticking(&[]).await;
+        clock.go(60.0);
+        w.tick().await;
+        let h0 = bid(&f, "xyz:WTH").unwrap();
+        assert!(near(h0.px, 50.0 * (1.0 - w.p.h3_pct)), "no candle: by the mid {h0:?}");
+        // the mid 6% up, the minute's trades closed only 1% up: under the up threshold, it stays
+        f.set_mid("xyz:WTH", 53.0);
+        clock.go(60.0);
+        w.tick().await;
+        let m = (now() / 60.0).floor() as i64;
+        f.set_candles("xyz:WTH", "1m", &[((m * 60) as f64, 50.0, 53.5, 49.8, 50.5, 1000.0)]);
+        clock.go(60.0);
+        w.tick().await;
+        assert_eq!(bid(&f, "xyz:WTH").unwrap().px, h0.px, "held to the trade's 50.5: +1%");
+        assert_eq!(w.trade_close.get(&("xyz:WTH".to_string(), m)), Some(&50.5));
+        // the next minute's trades close 52: moved up to 52's level, not the mid's 53
+        let m = m + 1;
+        f.set_candles("xyz:WTH", "1m", &[((m * 60) as f64, 50.5, 53.5, 50.4, 52.0, 1000.0)]);
+        clock.go(60.0);
+        w.tick().await;
+        let h1 = bid(&f, "xyz:WTH").unwrap();
+        assert!(near(h1.px, 52.0 * (1.0 - w.p.h3_pct)), "{h1:?}");
+        // the trade over the mid: the mid's level (never up past it)
+        let m = m + 1;
+        f.set_mid("xyz:WTH", 51.0);
+        f.set_candles("xyz:WTH", "1m", &[((m * 60) as f64, 52.0, 53.0, 51.0, 52.5, 1000.0)]);
+        clock.go(60.0);
+        w.tick().await;
+        clock.go(60.0);
+        w.tick().await;
+        assert!(near(bid(&f, "xyz:WTH").unwrap().px, 51.0 * (1.0 - w.p.h3_pct)));
+    }
+
+    #[test]
+    fn a_price_for_the_chat_has_6_digits_and_no_float_tail() {
+        assert_eq!(px(107.77919999999999), "107.779");
+        assert_eq!((px(86.22336), px(0.0027235), px(64250.5), px(2.0), px(0.0)), ("86.2234".into(), "0.0027235".into(), "64250.5".into(), "2".into(), "0".into()));
+    }
+
+    #[test]
+    fn the_trade_s_level_only_lowers_the_mid_s() {
+        assert!((trade_level(107.7792, 112.27, Some(110.47)) - 110.47 * 0.96).abs() < 1e-9);
+        assert_eq!(trade_level(96.0, 100.0, Some(101.0)), 96.0);
+        assert_eq!(trade_level(96.0, 100.0, None), 96.0);
+        assert_eq!(trade_level(96.0, 100.0, Some(0.0)), 96.0);
     }
 }

@@ -78,7 +78,22 @@ impl Trade {
 /// family's open trades (coin -> strategies), shared by the strategies' tasks.
 static EQUITY: std::sync::Mutex<f64> = std::sync::Mutex::new(0.0);
 /// Coin -> its trades: (strategy, the trade's risk in $: its stop's loss, its side +1 / -1).
-static OPEN: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<(String, f64, f64)>>>> = std::sync::Mutex::new(None);
+type Reg = Option<std::collections::HashMap<String, Vec<(String, f64, f64)>>>;
+#[cfg(not(test))]
+static OPEN: std::sync::Mutex<Reg> = std::sync::Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    // a test's own registry: the tests' trades on the same fake coins (xyz:WTH) took each other's places at random
+    static OPEN_T: std::cell::RefCell<Reg> = const { std::cell::RefCell::new(None) };
+}
+
+/// The registry, held only inside `f` (nothing in `f` reads it again).
+fn reg<R>(f: impl FnOnce(&mut Reg) -> R) -> R {
+    #[cfg(not(test))]
+    return f(&mut OPEN.lock().unwrap());
+    #[cfg(test)]
+    return OPEN_T.with(|r| f(&mut r.borrow_mut()));
+}
 
 /// A strategy's switch `var`, all on by default (2026-10-31, the user's call: the config lives in the code, not in
 /// the env): unset or "1" on; set empty the trial: on for its first `TRIAL_TRADES` (3) live trades, then the signals
@@ -172,15 +187,16 @@ pub(crate) fn risk_usd(usd: f64) -> f64 {
 
 /// A strategy's trades held now (coin, risk $, side): the registry's entries of `kind` set to them.
 pub(crate) fn sync(kind: &str, trades: impl Iterator<Item = (String, f64, f64)>) {
-    let mut g = OPEN.lock().unwrap();
-    let m = g.get_or_insert_with(Default::default);
-    for v in m.values_mut() {
-        v.retain(|k| k.0 != kind);
-    }
-    m.retain(|_, v| !v.is_empty());
-    for (c, r, d) in trades {
-        m.entry(c).or_default().push((kind.to_string(), r, d.signum()));
-    }
+    reg(|g| {
+        let m = g.get_or_insert_with(Default::default);
+        for v in m.values_mut() {
+            v.retain(|k| k.0 != kind);
+        }
+        m.retain(|_, v| !v.is_empty());
+        for (c, r, d) in trades {
+            m.entry(c).or_default().push((kind.to_string(), r, d.signum()));
+        }
+    })
 }
 
 /// The crypto wick ladder's third rung (2026-11-01, V234): outside the per-coin limit - the coin its 7% and 10% rungs hold
@@ -215,7 +231,7 @@ pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
     let cap = env_f("FAMILY_MAX_OPEN", 0.0) as usize;
     let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
     let eq = equity();
-    let g = OPEN.lock().unwrap();
+    let g = reg(|g| g.clone());
     let (n, open_risk, fits) = g.as_ref().map_or((0, 0.0, true), |m| {
         (m.values().map(Vec::len).sum::<usize>(), m.values().flatten().map(|x| x.1).sum::<f64>(),
          coin_fits(m.get(coin).map_or(&[][..], Vec::as_slice), kind, dir, per_coin()))
@@ -267,41 +283,44 @@ pub(crate) fn risk_fits(risk: f64) -> bool {
     }
     let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
     let eq = equity();
-    let open_risk: f64 = OPEN.lock().unwrap().as_ref().map_or(0.0, |m| m.values().flatten().map(|x| x.1).sum());
+    let open_risk: f64 = reg(|g| g.as_ref().map_or(0.0, |m| m.values().flatten().map(|x| x.1).sum()));
     risk_cap <= 0.0 || eq <= 0.0 || open_risk + risk <= risk_cap * eq + 1e-9
 }
 
 pub(crate) fn register(coin: &str, kind: &str, risk: f64, dir: f64) {
-    let mut g = OPEN.lock().unwrap();
-    let v = g.get_or_insert_with(Default::default).entry(coin.to_string()).or_default();
-    v.retain(|k| k.0 != kind);
-    v.push((kind.to_string(), risk, dir.signum()));
+    reg(|g| {
+        let v = g.get_or_insert_with(Default::default).entry(coin.to_string()).or_default();
+        v.retain(|k| k.0 != kind);
+        v.push((kind.to_string(), risk, dir.signum()));
+    })
 }
 
 /// Whether any strategy's trade (or a top-up) holds `coin`.
 pub(crate) fn registered(coin: &str) -> bool {
-    OPEN.lock().unwrap().as_ref().is_some_and(|m| m.get(coin).is_some_and(|v| !v.is_empty()))
+    reg(|g| g.as_ref().is_some_and(|m| m.get(coin).is_some_and(|v| !v.is_empty())))
 }
 
 pub(crate) fn unregister(coin: &str, kind: &str) {
-    if let Some(m) = OPEN.lock().unwrap().as_mut() {
-        if let Some(v) = m.get_mut(coin) {
+    reg(|g| {
+        if let Some(m) = g.as_mut()
+            && let Some(v) = m.get_mut(coin)
+        {
             v.retain(|k| k.0 != kind);
             if v.is_empty() {
                 m.remove(coin);
             }
         }
-    }
+    })
 }
 
 /// Whether a strategy other than `kind` holds `coin` too (the account's position there is theirs and ours).
 pub(crate) fn shared(coin: &str, kind: &str) -> bool {
-    OPEN.lock().unwrap().as_ref().and_then(|m| m.get(coin)).is_some_and(|v| v.iter().any(|k| k.0 != kind))
+    reg(|g| g.as_ref().and_then(|m| m.get(coin)).is_some_and(|v| v.iter().any(|k| k.0 != kind)))
 }
 
 /// Whether the family holds `coin` (a position there is the family's, not a stray one).
 pub(crate) fn family_holds(coin: &str) -> bool {
-    OPEN.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(coin))
+    reg(|g| g.as_ref().is_some_and(|m| m.contains_key(coin)))
 }
 
 /// Whether our resting stop / take `oid` has done its work (filled, or triggered): on a shared coin the account's

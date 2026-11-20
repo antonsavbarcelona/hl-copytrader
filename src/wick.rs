@@ -539,15 +539,7 @@ fn is_hot(hour: Option<f64>, day: Option<f64>, x: f64) -> bool {
     x > 0.0 && matches!((hour, day), (Some(h), Some(d)) if d > 0.0 && h > x * d)
 }
 
-/// A price for the chat: 6 significant digits, no float tail (107.77919999999999 -> 107.779).
-fn px(x: f64) -> String {
-    if x == 0.0 || !x.is_finite() {
-        return format!("{x}");
-    }
-    let prec = (5 - x.abs().log10().floor() as i32).max(0) as usize;
-    let t = format!("{x:.prec$}");
-    if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
-}
+use crate::notify::px;
 
 fn message(ev: &Value) -> Option<String> {
     let f = |k: &str| ev[k].as_f64().unwrap_or(0.0);
@@ -2302,6 +2294,30 @@ mod tick_tests {
     fn a_price_for_the_chat_has_6_digits_and_no_float_tail() {
         assert_eq!(px(107.77919999999999), "107.779");
         assert_eq!((px(86.22336), px(0.0027235), px(64250.5), px(2.0), px(0.0)), ("86.2234".into(), "0.0027235".into(), "64250.5".into(), "2".into(), "0".into()));
+    }
+
+    /// 2026-11-20 xyz:SNDK: halted, reopened split by 8 in an empty book; the bids bought it. A paused coin's bid comes off.
+    #[tokio::test]
+    async fn a_paused_coin_s_bid_comes_off_and_none_is_placed_for_a_day() {
+        let (f, mut w, _rx, clock) = ticking(&[]).await;
+        clock.go(60.0);
+        w.tick().await;
+        assert!(bid(&f, "xyz:WTH").is_some());
+        // its mid jumps across a gap (a split's reopening): paused, the bid off
+        f.set_mid("xyz:WTH", 6.25);
+        clock.go(60.0);
+        w.tick().await;
+        assert!(crate::halt::paused("xyz:WTH"));
+        clock.go(60.0);
+        w.tick().await;
+        assert!(bid(&f, "xyz:WTH").is_none(), "{:?}", bid(&f, "xyz:WTH"));
+        // a day on: bid again at the new price
+        clock.go(crate::halt::PAUSE_S);
+        w.tick().await;
+        clock.go(60.0);
+        w.tick().await;
+        let b = bid(&f, "xyz:WTH").unwrap();
+        assert!(near(b.px, 6.25 * (1.0 - w.p.h3_pct)), "{b:?}");
     }
 
     #[test]

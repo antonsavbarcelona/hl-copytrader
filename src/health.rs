@@ -249,6 +249,7 @@ impl Watch {
             log!("health: {m}");
             crate::notify::send(m.clone());
         }
+        crate::halt::save(cfg).await;
         if let Err(e) = crate::store::save_doc(cfg, DOC, &snapshot(&pulses, t, &pos, &stops, err)).await {
             log!("health: not saved: {e:#}");
         }

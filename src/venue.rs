@@ -206,6 +206,7 @@ impl Venue {
                 break;
             }
         }
+        crate::halt::note_error(coin, &last.to_string());
         bail!("{coin} order not filled: {last}");
     }
 
@@ -406,6 +407,7 @@ fn placed(coin: &str, st: &Value, buy: bool) -> Result<Placed> {
         let got = num(&f["totalSz"]);
         return Ok(Placed::Filled(if buy { got } else { -got }, num(&f["avgPx"]), f["oid"].as_u64().unwrap_or(0)));
     }
+    crate::halt::note_error(coin, &st.to_string());
     bail!("{coin} order not placed: {st}")
 }
 

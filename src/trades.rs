@@ -208,6 +208,10 @@ fn coin_fits(held: &[(String, f64, f64)], kind: &str, dir: f64, per_coin: usize)
 /// stops at once lose 40% at most, far from a liquidation; was 20; 0: no cap) of the equity (the deposit's
 /// simultaneous risk; each strategy keeps its own slots besides).
 pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
+    // a coin halted or jumped across a gap: no new trade a day (`halt`)
+    if crate::halt::paused(coin) {
+        return false;
+    }
     let cap = env_f("FAMILY_MAX_OPEN", 0.0) as usize;
     let risk_cap = env_f("FAMILY_RISK_CAP_PCT", 40.0) / 100.0;
     let eq = equity();

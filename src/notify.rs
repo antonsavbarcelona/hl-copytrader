@@ -67,6 +67,16 @@ pub fn send_now(text: &str) {
     });
 }
 
+/// A price for the chat: 6 significant digits, no float tail (107.77919999999999 -> 107.779).
+pub fn px(x: f64) -> String {
+    if x == 0.0 || !x.is_finite() {
+        return format!("{x}");
+    }
+    let prec = (5 - x.abs().log10().floor() as i32).max(0) as usize;
+    let t = format!("{x:.prec$}");
+    if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t }
+}
+
 /// A $ amount signed for the chat: +$1.50 / -$2.00.
 pub fn usd(x: f64) -> String {
     if x >= 0.0 { format!("+${x:.2}") } else { format!("-${:.2}", -x) }

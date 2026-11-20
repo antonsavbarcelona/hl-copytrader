@@ -71,7 +71,12 @@ pub(crate) fn parse_contexts(v: &Value) -> Vec<Ctx> {
 pub(crate) async fn mids(src: &impl Info, dex: &str) -> Result<std::collections::HashMap<String, f64>> {
     let body = if dex.is_empty() { json!({"type": "allMids"}) } else { json!({"type": "allMids", "dex": dex}) };
     let v = src.ask(body, 2).await?;
-    Ok(v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect())
+    let m: std::collections::HashMap<String, f64> = v.as_object().into_iter().flatten().map(|(k, x)| (k.clone(), num(x))).filter(|(_, m)| *m > 0.0).collect();
+    // a HIP-3 mid jumping across a gap: the coin paused (`halt`)
+    for (c, x) in &m {
+        crate::halt::mid_seen(c, *x);
+    }
+    Ok(m)
 }
 
 /// An interval's length (s): "1m", "5m", "15m", "1h", "4h", "1d", ...

@@ -14,6 +14,7 @@ mod exchange;
 mod expiry;
 mod ext;
 mod guard;
+mod halt;
 mod health;
 mod hip3;
 mod keeper;
@@ -81,6 +82,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let store = store::open(&cfg).await?;
     // the start in the events too: a deploy is checked by its version there
     store.event(serde_json::json!({"kind": "bot", "what": "start", "version": commit_full(), "at": api::now()}));
+    // the halts' pauses before any strategy opens a trade
+    halt::load(&cfg).await;
     // the drawdown guard's state before any strategy sizes a trade
     guard::start(&cfg, store.clone(), api.clone()).await?;
     clusters::start(&cfg, api.clone()).await?;

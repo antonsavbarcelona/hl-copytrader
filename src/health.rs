@@ -33,6 +33,8 @@ const GUARD_AGAIN_S: f64 = 300.0;
 /// Told again this often while so.
 const AGAIN_S: f64 = 3600.0;
 const DOC: &str = "health";
+/// The shorts' sub-account's (`sub`).
+const SUB_DOC: &str = "health_short";
 
 /// The loops whose step is long by design, with the silence they get: the breakout's step reads every coin's candles
 /// 2.5 s apart (its first, 900 a coin, took 476 s on 2026-11-17's deploy; each hour's about as long).
@@ -88,6 +90,8 @@ pub(crate) fn watchdog() {
 /// What was told: a silent loop -> when; a position without a stop -> (first seen so, when told: 0 not yet).
 #[derive(Default)]
 struct Watch {
+    /// The shorts' sub-account's watch (`sub`): its positions only (the loops are the live one's), its own doc.
+    sub: bool,
     silent: HashMap<&'static str, f64>,
     bare: HashMap<String, (f64, f64)>,
     /// A bare position's stop last tried (coin -> when).
@@ -222,7 +226,7 @@ impl Watch {
     async fn round(&mut self, cfg: &Config, v: &Venue, unified: bool, dexes: &[String]) -> Vec<String> {
         let t = now();
         let pulses = crate::runner::pulses();
-        let mut msgs = self.loops(&pulses, t);
+        let mut msgs = if self.sub { Vec::new() } else { self.loops(&pulses, t) };
         let (pos, stops, err) = match account(v, unified, dexes).await {
             Ok((p, mut s)) => {
                 for c in self.guard_due(&p, &s, t) {
@@ -245,12 +249,19 @@ impl Watch {
                 (HashMap::new(), HashSet::new(), Some(format!("{e:#}")))
             }
         };
+        if self.sub {
+            for m in &mut msgs {
+                *m = format!("шорт-аккаунт: {m}");
+            }
+        }
         for m in &msgs {
             log!("health: {m}");
             crate::notify::send(m.clone());
         }
-        crate::halt::save(cfg).await;
-        if let Err(e) = crate::store::save_doc(cfg, DOC, &snapshot(&pulses, t, &pos, &stops, err)).await {
+        if !self.sub {
+            crate::halt::save(cfg).await;
+        }
+        if let Err(e) = crate::store::save_doc(cfg, if self.sub { SUB_DOC } else { DOC }, &snapshot(&pulses, t, &pos, &stops, err)).await {
             log!("health: not saved: {e:#}");
         }
         msgs
@@ -263,6 +274,7 @@ pub(crate) async fn start(cfg: &Config) -> Result<()> {
         return Ok(());
     };
     let cfg = cfg.clone();
+    let (sub, cfg2) = (crate::sub::venue(&base)?, cfg.clone());
     tokio::spawn(async move {
         let mut w = Watch::default();
         let mut venue = (f64::MIN, base.clone());
@@ -275,6 +287,15 @@ pub(crate) async fn start(cfg: &Config) -> Result<()> {
             let venue = &venue.1;
             let dexes = crate::venue::usdc_dexes(&venue.ex).await;
             w.round(&cfg, &venue, unified, &dexes).await;
+        }
+    });
+    // the shorts' sub-account: its positions against its stops (the main dex: its coins), told as its own
+    tokio::spawn(async move {
+        let mut w = Watch { sub: true, ..Watch::default() };
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(EVERY_S));
+        loop {
+            iv.tick().await;
+            w.round(&cfg2, &sub, false, &[]).await;
         }
     });
     Ok(())

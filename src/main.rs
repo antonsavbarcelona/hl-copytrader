@@ -27,6 +27,7 @@ mod runner;
 mod rsidip;
 mod squeeze;
 mod store;
+mod sub;
 mod trades;
 mod trend;
 mod walls;

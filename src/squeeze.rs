@@ -23,6 +23,11 @@
 //! HL halves: +12 / +328 / +12 / +4% at the same drawdown) and the Binance drawdown at 2% 48% -> 37%: a hedge of the longs.
 //! On HL alone flat so far (731 trades 2025-26, -0.02 R).
 //!
+//! The short trades on the shorts' sub-account (`sub`, 2026-11-21, the user's call): a long another strategy holds on
+//! the coin no longer bars it. Before an entry the sub-account gets its margin and its loss to the resting stop (and the
+//! open shorts' losses to theirs) over what is free there; after each 4h step what is free over those and one trade's
+//! risk (`trades::risk_usd`, the user's "always 2% risk there") goes back to the live account.
+//!
 //! The states: the store's docs `squeeze` and `squeeze_short`.
 
 use anyhow::Result;
@@ -239,6 +244,8 @@ struct Squeeze {
     k: Keeper,
     p: Params,
     state: State,
+    /// On the shorts' sub-account: the money's mover (None: `MAIN_KEY` unset, nothing moves).
+    sub: Option<Option<crate::sub::Mover>>,
 }
 
 impl Squeeze {
@@ -251,6 +258,20 @@ impl Squeeze {
                 log!("squeeze: {coin} candles not read: {e:#}");
                 None
             }
+        }
+    }
+
+    /// The open trades' losses to their resting stops (twice the close stop's distance): kept free on the sub-account.
+    fn held_loss(&self) -> f64 {
+        self.state.open.iter().map(|p| 2.0 * p.risk).sum()
+    }
+
+    /// On the sub-account: what is free there over the open trades' losses and one trade's risk back to the live account.
+    async fn sweep_sub(&self) {
+        let Some(m) = &self.sub else { return };
+        let keep = self.held_loss() + trades::risk_usd(self.p.risk_usd) * self.p.share;
+        if let Err(e) = crate::sub::sweep(&self.k.venue, m.as_ref(), keep).await {
+            self.k.event(json!({"what": "error", "coin": "", "error": format!("{e:#}")}));
         }
     }
 
@@ -325,6 +346,15 @@ impl Squeeze {
                     continue;
                 }
                 let size = trades::size_for(risk, dist, px) * self.p.side;
+                if let Some(m) = &self.sub {
+                    // its margin and its loss to the resting stop, the open ones' to theirs, free there first
+                    let notional = size.abs() * px;
+                    let need = notional / self.k.venue.leverage_of(&coin) + notional * (2.0 * dist).min(0.8) + self.held_loss();
+                    if let Err(e) = crate::sub::fund(&self.k.venue, m.as_ref(), need).await {
+                        self.k.event(json!({"what": "error", "coin": coin, "error": format!("{e:#}")}));
+                        continue;
+                    }
+                }
                 match trades::open_market(&self.k.venue, &coin, size, (2.0 * dist).min(0.8), None, self.p.hold_s).await {
                     Ok(tr) => {
                         let close_stop = tr.entry_px - self.p.side * self.p.atr_k * a;
@@ -341,6 +371,7 @@ impl Squeeze {
         } else {
             log!("squeeze: contexts not read: no entries");
         }
+        self.sweep_sub().await;
         self.state.stepped = bar;
         self.k.save(self.p.kind, &self.state);
     }
@@ -349,6 +380,7 @@ impl Squeeze {
     async fn check(&mut self) {
         if self.k.sweep(&mut self.state.open, |p| &p.tr, false, true).await {
             self.k.save(self.p.kind, &self.state);
+            self.sweep_sub().await;
         }
     }
 
@@ -370,6 +402,16 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
     let Some((venue, unified)) = crate::runner::venue(p.kind).await? else {
         return Ok(());
     };
+    // the short on the shorts' sub-account (`sub`): its own positions; the money moved by the account's own key
+    let (venue, unified, sub) = if crate::sub::on_sub(p.kind) {
+        let mover = crate::sub::Mover::from_env(venue.ex.base(), &venue.account)?;
+        if mover.is_none() {
+            log!("{}: MAIN_KEY not set: nothing moves to the short account, a short goes on what is there", p.kind);
+        }
+        (crate::sub::venue(&venue)?, false, Some(mover))
+    } else {
+        (venue, unified, None)
+    };
     let state: State = crate::store::load_state(cfg, p.kind).await?;
     for pos in &state.open {
         trades::register(&pos.tr.coin, p.kind, pos.risk, pos.tr.size);
@@ -384,7 +426,8 @@ async fn launch(cfg: &Config, store: Store, p: Params) -> Result<()> {
         if p.btc_filter { ", BTC выше 50-дн. средней" } else { "" }, p.min_vol / 1e6, p.atr_k, if short { "выше" } else { "ниже" }, p.hold_s / DAY, p.max_open,
         trades::trial_label(p.trial, state.opened)));
     let kind = p.kind;
-    let l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state };
+    let l = Squeeze { k: Keeper::new(venue, unified, cfg.clone(), store, p.kind, message, HeldIn::Days), p, state, sub };
+    l.sweep_sub().await;
     crate::runner::spawn(kind, l);
     Ok(())
 }
@@ -464,7 +507,7 @@ mod lifecycle {
     async fn setup(coin: &str, p: Params) -> (FakeHl, Squeeze, tokio::sync::mpsc::UnboundedReceiver<Value>) {
         let f = FakeHl::start(&[(coin, 2, 10, 100.0)]).await;
         let (store, rx) = Store::for_test();
-        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default() };
+        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default(), sub: None };
         (f, s, rx)
     }
 
@@ -514,6 +557,45 @@ mod lifecycle {
         assert_eq!(s.state.stepped, bar);
     }
 
+    /// The short's breakdown on the shorts' sub-account (2026-11-21): the coin long on the live account (the RSI dip) does
+    /// not bar it; the margin and the loss to the stop sent there first, the order for the sub-account, the surplus back.
+    #[tokio::test]
+    async fn the_short_opens_on_the_sub_account_past_a_long_on_the_coin() {
+        let f = FakeHl::start(&[("SQE", 2, 10, 97.0)]).await;
+        f.set_volume("SQE", 50e6);
+        f.with(|x| x.account_value = Some(0.0));
+        let (store, mut rx) = Store::for_test();
+        let p = Params::short_from_env();
+        let v = crate::sub::venue(&f.venue()).unwrap();
+        let mut s = Squeeze { k: Keeper::new(v, false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default(),
+            sub: Some(Some(crate::sub::Mover::for_test(&f.base, crate::testkit::ACCOUNT))) };
+        trades::register("SQE", "rsidip", 5.0, 1.0);
+        assert!(!trades::can_open("SQE", "squeeze", -1.0, 1.0), "the live account: a short against the long, never");
+        // 545 wide closes, 300 tight ones at 100, then a close at 97 under the band: the breakdown
+        let bar = ((now() - AFTER_CLOSE_S) / BAR).floor() * BAR - BAR;
+        let mut c: Vec<f64> = (0..545).map(|i| if i % 2 == 0 { 90.0 } else { 110.0 }).collect();
+        c.extend((0..300).map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 }));
+        c.push(97.0);
+        let t0 = bar - (c.len() - 1) as f64 * BAR;
+        f.set_candles("SQE", "4h", &c.iter().enumerate().map(|(i, x)| (t0 + i as f64 * BAR, *x, x * 1.001, x * 0.999, *x, 1.0)).collect::<Vec<_>>());
+        s.step(bar).await;
+        let ev = crate::store::drain(&mut rx);
+        assert!(ev.iter().any(|e| e["what"] == "open" && e["coin"] == "SQE"), "{ev:?}");
+        assert!(f.position("SQE") < 0.0 && s.state.open.len() == 1);
+        let bodies = f.with(|x| x.bodies.clone());
+        let send = bodies.iter().position(|b| b["action"]["type"] == "sendAsset" && b["action"]["fromSubAccount"] == "").expect("funded");
+        let order = bodies.iter().position(|b| b["action"]["type"] == "order").unwrap();
+        assert!(send < order, "the money first");
+        assert!(bodies.iter().filter(|b| b["action"]["type"] == "order").all(|b| b["vaultAddress"] == crate::sub::SHORT_ACCOUNT));
+        // what it needs sent: the margin at 10x and the loss to the stop twice the 2 ATR away, 5% over
+        let tr = &s.state.open[0].tr;
+        let n = (tr.size * tr.entry_px).abs();
+        let sent: f64 = bodies[send]["action"]["amount"].as_str().unwrap().parse().unwrap();
+        assert!(sent >= n / 10.0 + n * (tr.stop_px / tr.entry_px - 1.0) - 1.0 && sent < 1.2 * (n / 10.0 + n * (tr.stop_px / tr.entry_px - 1.0)) + 6.0, "{sent} for {n}");
+        // the step's end: nothing over the open loss and one trade's risk to send back (the fake's withdrawable is its value)
+        trades::unregister("SQE", "rsidip");
+    }
+
     #[tokio::test]
     async fn its_time_up_it_ends_at_the_step_and_a_close_inside_keeps_it() {
         let (f, mut s, mut rx) = setup("SQD", Params::from_env()).await;
@@ -543,7 +625,7 @@ mod candles {
         let f = FakeHl::start(&[("SCA", 2, 10, 100.0)]).await;
         let (store, _) = Store::for_test();
         let p = Params::from_env();
-        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default() };
+        let s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default(), sub: None };
         let b = (now() / BAR).floor() * BAR;
         f.set_candles("SCA", "4h", &[(b - BAR, 1.0, 2.0, 0.5, 1.5, 1.0), (b, 1.5, 3.0, 1.0, 2.5, 1.0)]);
         assert_eq!(s.bars("SCA", 5).await.unwrap(), vec![(b - BAR, 2.0, 0.5, 1.5)]);

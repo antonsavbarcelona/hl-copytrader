@@ -189,6 +189,7 @@ pub(crate) async fn start(store: Store) -> Result<()> {
         return Ok(());
     };
     crate::runner::born("pxstop", POLL_S);
+    let (sub, store2) = (crate::sub::venue(&base)?, store.clone());
     tokio::spawn(async move {
         let mut w = Watch::default();
         let mut dexes: (f64, Vec<String>) = (f64::MIN, Vec::new());
@@ -203,6 +204,18 @@ pub(crate) async fn start(store: Store) -> Result<()> {
             }
             w.round(&venue, &dexes.1, &store).await;
             crate::runner::beat("pxstop", t0);
+        }
+    });
+    // the shorts' sub-account (`sub`): its stops watched the same way (its main-dex coins), on its own loop
+    crate::runner::born("pxstop_short", POLL_S);
+    tokio::spawn(async move {
+        let mut w = Watch::default();
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs_f64(POLL_S));
+        loop {
+            iv.tick().await;
+            let t0 = now();
+            w.round(&sub, &[], &store2).await;
+            crate::runner::beat("pxstop_short", t0);
         }
     });
     Ok(())

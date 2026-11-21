@@ -127,20 +127,21 @@ pub(crate) fn set_equity(x: f64) {
         #[cfg(test)]
         if OWN_EQUITY.with(|e| e.get().is_some()) {
             OWN_EQUITY.with(|e| e.set(Some(x)));
-            crate::guard::seen(x);
+            crate::guard::seen(x + crate::sub::equity());
             return;
         }
         *EQUITY.lock().unwrap() = x;
-        crate::guard::seen(x);
+        crate::guard::seen(x + crate::sub::equity());
     }
 }
 
+/// The family's equity: the live account's and the shorts' sub-account's (`sub`).
 pub(crate) fn equity() -> f64 {
     #[cfg(test)]
     if let Some(x) = OWN_EQUITY.with(|e| e.get()) {
-        return x;
+        return x + crate::sub::equity();
     }
-    *EQUITY.lock().unwrap()
+    *EQUITY.lock().unwrap() + crate::sub::equity()
 }
 
 #[cfg(test)]
@@ -234,7 +235,8 @@ pub(crate) fn can_open(coin: &str, kind: &str, dir: f64, risk: f64) -> bool {
     let g = reg(|g| g.clone());
     let (n, open_risk, fits) = g.as_ref().map_or((0, 0.0, true), |m| {
         (m.values().map(Vec::len).sum::<usize>(), m.values().flatten().map(|x| x.1).sum::<f64>(),
-         coin_fits(m.get(coin).map_or(&[][..], Vec::as_slice), kind, dir, per_coin()))
+         // a coin's place: the same account's trades only (a short on the sub-account takes no long's place: `sub`)
+         coin_fits(&m.get(coin).into_iter().flatten().filter(|k| crate::sub::on_sub(&k.0) == crate::sub::on_sub(kind)).cloned().collect::<Vec<_>>(), kind, dir, per_coin()))
     });
     // the crash cap (crate::clusters): in a crash a dip buyer opens no more than the cap in one cluster of coins
     let crowded = crate::clusters::capped_kind(kind) && crate::clusters::cap() > 0 && crate::clusters::crash() && {

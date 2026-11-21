@@ -81,6 +81,10 @@ pub(crate) struct State {
     pub(crate) now_ms: u64,
     /// The account's value (clearinghouseState's accountValue; none: $1000).
     pub(crate) account_value: Option<f64>,
+    /// every /exchange body, as sent (the vault address, the signature)
+    pub(crate) bodies: Vec<Value>,
+    /// the sends (`sendAsset`) refused
+    pub(crate) refuse_sends: bool,
 }
 
 #[derive(Clone)]
@@ -246,7 +250,17 @@ impl State {
     fn exchange(&mut self, body: &Value) -> Value {
         let a = &body["action"];
         self.actions.push(a.clone());
+        self.bodies.push(body.clone());
         match a["type"].as_str().unwrap_or("") {
+            // the fake's account is the sub-account: a send to it (none from a sub-account) adds to its value, one from it takes off
+            "sendAsset" => {
+                if self.refuse_sends {
+                    return json!({"status": "err", "response": "Must deposit before performing actions. (the fake's fault)"});
+                }
+                let x = n(&a["amount"]) * if a["fromSubAccount"].as_str().unwrap_or("").is_empty() { 1.0 } else { -1.0 };
+                self.account_value = Some(self.account_value.unwrap_or(1000.0) + x);
+                json!({"status": "ok", "response": {"type": "default"}})
+            }
             "updateLeverage" => {
                 let coin = self.coin_of(a["asset"].as_u64().unwrap_or(0) as u32);
                 let cross = a["isCross"].as_bool().unwrap_or(true);

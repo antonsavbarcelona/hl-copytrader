@@ -77,6 +77,18 @@ spot = info({'type': 'spotClearinghouseState', 'user': ACCOUNT})
 u = next((b for b in spot['balances'] if b['coin'] == 'USDC'), None)
 if u: print(f"  USDC {float(u['total']):.0f}, под ордерами {float(u['hold']):.0f}, свободно {float(u['total']) - float(u['hold']):.0f}")
 
+# --- the shorts' sub-account "short" (src/sub.rs): the squeeze short's positions and its money
+SUB = '0x123644e79020f028a0cd11886598fd6a403be4f4'
+st = info({'type': 'clearinghouseState', 'user': SUB})
+so = info({'type': 'frontendOpenOrders', 'user': SUB})
+sp = [p['position'] for p in st['assetPositions'] if float(p['position']['szi']) != 0]
+print(f"\n== шорт-аккаунт: ${float(st['marginSummary']['accountValue']):.0f}, свободно ${float(st['withdrawable']):.0f}")
+for p in sp:
+    co = p['coin']; stop = [o['triggerPx'] for o in so if o['coin'] == co and o['reduceOnly'] and o['isTrigger']]
+    if not stop: bad.append(f'шорт-аккаунт: {co} без стопа')
+    print(f"  {co:12} {float(p['szi']):>+12g} вход {p['entryPx']:<9} pnl {float(p['unrealizedPnl']):+8.2f}  стоп {stop or '-'}{'' if stop else '  <-- БЕЗ СТОПА'}")
+if not sp: print('  позиций нет')
+
 # --- each strategy's events
 since = dt.datetime.fromtimestamp(NOW - HOURS * 3600, dt.UTC)
 print(f'\n== события стратегий за {HOURS:.0f} ч (последнее, входы/выходы, ошибки)')

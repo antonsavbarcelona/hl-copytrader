@@ -53,6 +53,11 @@ impl Venue {
 }
 
 impl Venue {
+    /// The same key acting for the sub-account `addr` (`sub`): its own positions, margin and leverage settings.
+    pub(crate) fn for_sub(&self, addr: &str) -> Result<Venue> {
+        Ok(Venue { ex: self.ex.for_sub(addr)?, account: addr.to_lowercase(), lev_set: Default::default(), isolated: Default::default(), ..self.clone() })
+    }
+
     pub(crate) async fn mid(&self, coin: &str) -> Result<f64> {
         if self.ex.mainnet() {
             if let Some(m) = self.books.as_ref().and_then(|b| b.read().unwrap().get(coin).and_then(crate::ws::Book::mid)) {
@@ -151,7 +156,8 @@ impl Venue {
     /// more (2026-11-02, the user's call: the bids may hold most of the margin, the market entries come first).
     pub(crate) async fn market(&self, coin: &str, size: f64, reduce: bool) -> Result<(f64, f64, u64)> {
         match self.market_once(coin, size, reduce).await {
-            Err(e) if !reduce && no_margin(&format!("{e:#}")) => {
+            // the resting orders are the live account's: a sub-account's entry frees none of them
+            Err(e) if !reduce && !self.ex.is_sub() && no_margin(&format!("{e:#}")) => {
                 let need = 1.5 * size.abs() * self.mid(coin).await.unwrap_or(0.0) / self.leverage_of(coin);
                 let freed = self.release(need).await;
                 log!("live: {coin} no margin for the market entry: {freed:.2} of the resting orders' margin taken off (need {need:.2}), once more");

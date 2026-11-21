@@ -110,11 +110,30 @@ fn keccak(data: &[u8]) -> [u8; 32] {
 }
 
 /// The action's hash that is signed (`action_hash`, no vault, no expiry).
+#[cfg(test)]
 pub fn action_hash(action: &Action, nonce: u64) -> Result<[u8; 32]> {
+    action_hash_for(action, nonce, None)
+}
+
+/// The action's hash for a sub-account's (or vault's) `vault` address (the SDK's `action_hash` with `vault_address`):
+/// the address's 20 bytes after a 1 where the account's own has a 0.
+pub fn action_hash_for(action: &Action, nonce: u64, vault: Option<&[u8; 20]>) -> Result<[u8; 32]> {
     let mut data = rmp_serde::to_vec_named(action)?;
     data.extend_from_slice(&nonce.to_be_bytes());
-    data.push(0);
+    match vault {
+        None => data.push(0),
+        Some(v) => {
+            data.push(1);
+            data.extend_from_slice(v);
+        }
+    }
     Ok(keccak(&data))
+}
+
+/// A 0x address's 20 bytes.
+pub fn address_bytes(addr: &str) -> Result<[u8; 20]> {
+    let b = hex::decode(addr.trim().trim_start_matches("0x")).context("address is not hex")?;
+    b.try_into().map_err(|_| anyhow::anyhow!("address is not 20 bytes"))
 }
 
 /// The EIP-712 digest of `Agent { source, connectionId }` in the "Exchange" domain.
@@ -135,11 +154,61 @@ fn hex_int(b: &[u8]) -> String {
 }
 
 /// `{r, s, v}` over the action, as `sign_l1_action` makes it.
+#[cfg(test)]
 pub fn sign(key: &SigningKey, action: &Action, nonce: u64, mainnet: bool) -> Result<Value> {
-    let digest = agent_digest(action_hash(action, nonce)?, mainnet);
+    sign_for(key, action, nonce, mainnet, None)
+}
+
+/// `sign` for a sub-account's `vault` address (the master's key or its API wallet signs for it).
+pub fn sign_for(key: &SigningKey, action: &Action, nonce: u64, mainnet: bool, vault: Option<&[u8; 20]>) -> Result<Value> {
+    let digest = agent_digest(action_hash_for(action, nonce, vault)?, mainnet);
     let (sig, rec) = key.sign_prehash_recoverable(&digest)?;
     let (r, s) = sig.split_bytes();
     Ok(json!({"r": hex_int(&r), "s": hex_int(&s), "v": 27 + rec.to_byte() as u64}))
+}
+
+/// A `sendAsset` (a USDC move between the account's dexes / its sub-accounts / another account): its fields as signed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendAsset {
+    pub destination: String,
+    pub source_dex: String,
+    pub destination_dex: String,
+    pub token: String,
+    pub amount: String,
+    pub from_sub_account: String,
+    pub nonce: u64,
+}
+
+impl SendAsset {
+    /// The action as sent (the SDK's `send_asset` after `sign_user_signed_action` adds the chains).
+    pub fn action(&self, mainnet: bool) -> Value {
+        json!({"type": "sendAsset", "destination": self.destination, "sourceDex": self.source_dex, "destinationDex": self.destination_dex,
+            "token": self.token, "amount": self.amount, "fromSubAccount": self.from_sub_account, "nonce": self.nonce,
+            "signatureChainId": "0x66eee", "hyperliquidChain": if mainnet { "Mainnet" } else { "Testnet" }})
+    }
+
+    /// The EIP-712 digest a user-signed `HyperliquidTransaction:SendAsset` signs (the domain "HyperliquidSignTransaction",
+    /// the signature chain 0x66eee); only the account's own key may sign it (an API wallet may not move money).
+    pub fn digest(&self, mainnet: bool) -> [u8; 32] {
+        let domain_type = keccak(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+        let mut chain = [0u8; 32];
+        chain[24..].copy_from_slice(&0x66eeeu64.to_be_bytes());
+        let domain = keccak(&[domain_type, keccak(b"HyperliquidSignTransaction"), keccak(b"1"), chain, [0u8; 32]].concat());
+        let t = keccak(b"HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)");
+        let mut nonce = [0u8; 32];
+        nonce[24..].copy_from_slice(&self.nonce.to_be_bytes());
+        let h = |x: &str| keccak(x.as_bytes());
+        let body = keccak(&[t, h(if mainnet { "Mainnet" } else { "Testnet" }), h(&self.destination), h(&self.source_dex), h(&self.destination_dex),
+            h(&self.token), h(&self.amount), h(&self.from_sub_account), nonce].concat());
+        keccak(&[&[0x19u8, 0x01][..], &domain, &body].concat())
+    }
+
+    /// `{r, s, v}` by `key` (the SDK's `sign_send_asset_action`).
+    pub fn sign(&self, key: &SigningKey, mainnet: bool) -> Result<Value> {
+        let (sig, rec) = key.sign_prehash_recoverable(&self.digest(mainnet))?;
+        let (r, s) = sig.split_bytes();
+        Ok(json!({"r": hex_int(&r), "s": hex_int(&s), "v": 27 + rec.to_byte() as u64}))
+    }
 }
 
 /// The address a key signs as (lowercase 0x hex): the tests check the signing against the SDK's.
@@ -159,6 +228,8 @@ pub struct Exchange {
     key: SigningKey,
     mainnet: bool,
     last_nonce: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The sub-account the actions are for (None: the key's own account): `for_sub`.
+    vault: Option<([u8; 20], String)>,
 }
 
 impl Exchange {
@@ -166,7 +237,23 @@ impl Exchange {
         let bytes = hex::decode(key_hex.trim().trim_start_matches("0x")).context("key is not hex")?;
         let key = SigningKey::from_slice(&bytes).context("not a private key")?;
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build()?;
-        Ok(Self { http, base: base.trim_end_matches('/').to_string(), key, mainnet: base.contains("api.hyperliquid.xyz"), last_nonce: Default::default() })
+        Ok(Self { http, base: base.trim_end_matches('/').to_string(), key, mainnet: base.contains("api.hyperliquid.xyz"), last_nonce: Default::default(), vault: None })
+    }
+
+    /// The server's base URL.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Whether the actions are for a sub-account (`for_sub`).
+    pub fn is_sub(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    /// The same key's actions for the sub-account `addr` (the nonces shared: one key, one nonce sequence).
+    pub fn for_sub(&self, addr: &str) -> Result<Self> {
+        let b = address_bytes(addr)?;
+        Ok(Self { vault: Some((b, format!("0x{}", hex::encode(b)))), ..self.clone() })
     }
 
     pub fn mainnet(&self) -> bool {
@@ -199,6 +286,23 @@ impl Exchange {
         bail!("{last}")
     }
 
+    /// The USDC move `t`, signed by this exchange's key (the account's own: see `SendAsset::digest`); the reply's
+    /// `response` (an error if it is not "ok"). Its nonce is the next of the key's.
+    pub async fn send_asset(&self, mut t: SendAsset) -> Result<Value> {
+        use std::sync::atomic::Ordering;
+        let now = (crate::api::now() * 1000.0) as u64;
+        t.nonce = self.last_nonce.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| Some(now.max(l + 1))).map(|l| now.max(l + 1)).unwrap_or(now);
+        let body = json!({"action": t.action(self.mainnet), "nonce": t.nonce, "signature": t.sign(&self.key, self.mainnet)?});
+        let r = self.http.post(format!("{}/exchange", self.base)).json(&body).send().await?;
+        let status = r.status();
+        let text = r.text().await?;
+        let v: Value = serde_json::from_str(&text).with_context(|| format!("exchange {status}: {text}"))?;
+        if v["status"] != "ok" {
+            bail!("exchange: {v}");
+        }
+        Ok(v["response"].clone())
+    }
+
     /// Signs and sends `action`; the reply's `response` (an error if it is not "ok").
     pub async fn act(&self, action: &Action) -> Result<Value> {
         use std::sync::atomic::Ordering;
@@ -212,8 +316,8 @@ impl Exchange {
             Action::UpdateLeverage { .. } => 1,
         } as i64;
         let _ = HEADROOM.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |h| Some(if h == i64::MAX { h } else { h - n }));
-        let signature = sign(&self.key, action, nonce, self.mainnet)?;
-        let body = json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": null, "expiresAfter": null});
+        let signature = sign_for(&self.key, action, nonce, self.mainnet, self.vault.as_ref().map(|v| &v.0))?;
+        let body = json!({"action": action, "nonce": nonce, "signature": signature, "vaultAddress": self.vault.as_ref().map(|v| v.1.clone()), "expiresAfter": null});
         let r = self.http.post(format!("{}/exchange", self.base)).json(&body).send().await?;
         let status = r.status();
         let text = r.text().await?;
@@ -283,6 +387,22 @@ mod tests {
             assert_eq!(hex::encode(action_hash(action, nonce).unwrap()), hash);
             assert_eq!(sign(&key, action, nonce, mainnet).unwrap(), json!({"r": r, "s": s, "v": v}));
         }
+        // for a sub-account (the SDK's sign_l1_action with vault_address 0x11..11)
+        let vault = address_bytes("0x1111111111111111111111111111111111111111").unwrap();
+        assert_eq!(hex::encode(action_hash_for(&order, nonce, Some(&vault)).unwrap()), "cfc0ebb37efbfdae73a2d0d2ee8d448cbe05f15dab2169c973e7bd7378ebf1e7");
+        assert_eq!(sign_for(&key, &order, nonce, true, Some(&vault)).unwrap(), json!({"r": "0xa84b099e06b4dc04cd7e72074eb11d857c0d72bb42e295b0ccebe00f22371d38",
+            "s": "0x1060bb36de0f4e0f14f3e799e4771e359dea2f4fe91347d06e509b862dfbb639", "v": 27}));
+        assert!(address_bytes("0x11").is_err());
+        // a user-signed sendAsset (the SDK's sign_send_asset_action): the main's spot to a sub-account's perps, and back
+        let to = SendAsset { destination: "0x1111111111111111111111111111111111111111".into(), source_dex: "spot".into(), destination_dex: String::new(),
+            token: "USDC:0x6d1e7cde53ba9467b783cb7c530ce054".into(), amount: "12.5".into(), from_sub_account: String::new(), nonce };
+        assert_eq!(to.sign(&key, true).unwrap(), json!({"r": "0xd61bb51ab9ba8c34c37ae4255b24fb205f7779f750a81fb1135d457dd86d2d7",
+            "s": "0x5a81aa848b86108d6402f53d8c648b0e3da7e7e959c34f651ec2d28b1fb91581", "v": 27}));
+        let back = SendAsset { destination: "0x2222222222222222222222222222222222222222".into(), source_dex: String::new(), destination_dex: "spot".into(),
+            amount: "3".into(), from_sub_account: "0x1111111111111111111111111111111111111111".into(), ..to.clone() };
+        assert_eq!(back.sign(&key, true).unwrap(), json!({"r": "0x1b13f6a66fef299557be6631e491cbdb88296e34bc2a56f47d058df2c4d90c5c",
+            "s": "0x71bfae786eaebf3e20c9d6e42df61113282d4dccc4078b40e83058a406bdb478", "v": 28}));
+        assert_eq!(to.action(true)["hyperliquidChain"], "Mainnet");
     }
 }
 

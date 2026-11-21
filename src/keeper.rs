@@ -81,7 +81,7 @@ impl Keeper {
         for d in dexes {
             let got = if d.is_empty() {
                 crate::venue::equity_of(&self.venue.ex, &self.venue.account, self.unified).await.map(|(eq, p)| {
-                    trades::set_equity(eq);
+                    if self.venue.ex.is_sub() { crate::sub::set_equity(eq) } else { trades::set_equity(eq) }
                     p
                 })
             } else {

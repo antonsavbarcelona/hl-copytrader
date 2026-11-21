@@ -220,9 +220,11 @@ pub(crate) fn ledger_flows(entries: &Value, me: &str) -> Vec<(f64, f64)> {
                     continue;
                 }
                 let amount = if d["amount"].is_null() { num(&d["usdc"]) } else { num(&d["amount"]) };
+                // the shorts' sub-account is the family's too: a move to or from it is no flow
+                let ours = |a: &str| a == me || a == crate::sub::SHORT_ACCOUNT;
                 let from = d["user"].as_str().unwrap_or("").to_lowercase();
                 let to = d["destination"].as_str().unwrap_or("").to_lowercase();
-                match (from == me, to == me) {
+                match (ours(&from), ours(&to)) {
                     (true, false) => -amount,
                     (false, true) => amount,
                     _ => continue,
@@ -389,7 +391,10 @@ mod tests {
             {"time": 5, "delta": {"type": "deposit", "usdc": "1000"}},
             {"time": 6, "delta": {"type": "withdraw", "usdc": "300", "fee": "1"}},
             {"time": 7, "delta": {"type": "accountClassTransfer", "usdc": "10", "toPerp": true}},
-            {"time": 8, "delta": {"type": "internalTransfer", "user": "0xfe19", "destination": "0xbbb", "usdc": "40"}}]);
+            {"time": 8, "delta": {"type": "internalTransfer", "user": "0xfe19", "destination": "0xbbb", "usdc": "40"}},
+            // to and from the shorts' sub-account: the family's own
+            {"time": 9, "delta": {"type": "send", "user": "0xfe19", "destination": crate::sub::SHORT_ACCOUNT, "sourceDex": "spot", "destinationDex": "", "token": "USDC", "amount": "60"}},
+            {"time": 10, "delta": {"type": "send", "user": crate::sub::SHORT_ACCOUNT, "destination": "0xfe19", "sourceDex": "", "destinationDex": "spot", "token": "USDC", "amount": "55"}}]);
         assert_eq!(ledger_flows(&v, me), vec![(1.0, 200.5), (2.0, -230.0), (5.0, 1000.0), (6.0, -301.0), (8.0, -40.0)]);
     }
 

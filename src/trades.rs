@@ -297,6 +297,11 @@ pub(crate) fn register(coin: &str, kind: &str, risk: f64, dir: f64) {
     })
 }
 
+/// The open trades' risks ($ to their stops) summed over the kinds `pick` takes.
+pub(crate) fn open_risk_of(pick: impl Fn(&str) -> bool) -> f64 {
+    reg(|g| g.as_ref().map_or(0.0, |m| m.values().flatten().filter(|k| pick(&k.0)).map(|k| k.1).sum()))
+}
+
 /// Whether any strategy's trade (or a top-up) holds `coin`.
 pub(crate) fn registered(coin: &str) -> bool {
     reg(|g| g.as_ref().is_some_and(|m| m.get(coin).is_some_and(|v| !v.is_empty())))

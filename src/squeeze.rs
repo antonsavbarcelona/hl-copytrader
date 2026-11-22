@@ -261,9 +261,10 @@ impl Squeeze {
         }
     }
 
-    /// The open trades' losses to their resting stops (twice the close stop's distance): kept free on the sub-account.
+    /// The open trades' losses to their resting stops (twice the close stop's distance), every short's on the
+    /// sub-account (the breakout short's too): kept free there.
     fn held_loss(&self) -> f64 {
-        self.state.open.iter().map(|p| 2.0 * p.risk).sum()
+        crate::sub::held()
     }
 
     /// On the sub-account: what is free there over the open trades' losses and one trade's risk back to the live account.

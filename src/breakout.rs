@@ -24,6 +24,10 @@
 //!
 //! The candles: loaded once (900 a coin, paced), then the last few each hour; the requests spaced (`BRK_REQ_GAP_S`) so the
 //! scan stays well inside the IP's weight budget. The states: the store's docs `breakout` and `breakout_short`.
+//!
+//! The short trades on the shorts' sub-account (`sub`, 2026-11-22, the user's call: every short there): a long another
+//! strategy holds on the coin no longer bars it. Before an entry the sub-account gets its margin and twice its loss to
+//! the stop (and the open shorts' there, `sub::held`), the surplus back after each step and each exit.
 
 use std::collections::HashMap;
 
@@ -217,6 +221,9 @@ struct Breakout {
     bars: HashMap<String, Vec<Bar>>,
     /// The last candle stepped (its open time s).
     stepped: f64,
+    /// The sides on the shorts' sub-account (`sub`: the short, its keeper's venue the sub-account's) and their money's
+    /// mover (None: `MAIN_KEY` unset, nothing moves).
+    subs: HashMap<&'static str, Option<crate::sub::Mover>>,
 }
 
 impl Breakout {
@@ -226,6 +233,16 @@ impl Breakout {
 
     fn save(&self, kind: &'static str) {
         self.keepers[kind].save(kind, &self.states.get(kind).cloned().unwrap_or_default());
+    }
+
+    /// On the sub-account: what is free there over every short's loss to its stop (`sub::held`) and one trade's risk
+    /// back to the live account.
+    async fn sweep_sub(&self, kind: &'static str) {
+        let (Some(m), Some(side)) = (self.subs.get(kind), self.p.sides.iter().find(|s| s.kind == kind)) else { return };
+        let keep = crate::sub::held() + trades::risk_usd(side.risk_usd) * side.share;
+        if let Err(e) = crate::sub::sweep(&self.keepers[kind].venue, m.as_ref(), keep).await {
+            self.event(kind, json!({"what": "error", "coin": "", "error": format!("{e:#}")}));
+        }
     }
 
     /// A coin's closed 1h candles from `start` (s).
@@ -322,7 +339,17 @@ impl Breakout {
                     continue;
                 }
                 let size = trades::size_for(risk, side.stop, close) * side.dir;
-                match trades::open_market_at(&self.venue, &coin, size, side.stop, Some(side.take), side.hold_s, close).await {
+                let venue = &self.keepers[side.kind].venue;
+                if let Some(m) = self.subs.get(side.kind) {
+                    // its margin and its loss to the stop (twice), the open shorts' there, free on the sub-account first
+                    let notional = size.abs() * close;
+                    let need = notional / venue.leverage_of(&coin) + notional * 2.0 * side.stop + crate::sub::held();
+                    if let Err(e) = crate::sub::fund(venue, m.as_ref(), need).await {
+                        self.event(side.kind, json!({"what": "error", "coin": coin, "error": format!("{e:#}")}));
+                        continue;
+                    }
+                }
+                match trades::open_market_at(venue, &coin, size, side.stop, Some(side.take), side.hold_s, close).await {
                     Ok(tr) => {
                         self.event(side.kind, json!({"what": "open", "coin": coin, "px": tr.entry_px, "close": close, "size": tr.size, "notional": (tr.size * tr.entry_px).abs(),
                             "cnt": cnt, "stop_px": tr.stop_px, "take_px": tr.take_px, "hold_h": side.hold_s / H, "vol": v}));
@@ -336,6 +363,7 @@ impl Breakout {
                     Err(e) => self.event(side.kind, json!({"what": "error", "coin": coin, "error": format!("{e:#}")})),
                 }
             }
+            self.sweep_sub(side.kind).await;
         }
         self.stepped = bar;
     }
@@ -347,6 +375,7 @@ impl Breakout {
             let open = &mut self.states.get_mut(kind).unwrap().open;
             if self.keepers[kind].sweep(open, |p| &p.tr, true, true).await {
                 self.save(kind);
+                self.sweep_sub(kind).await;
             }
         }
     }
@@ -380,8 +409,26 @@ pub async fn start(cfg: &Config, store: Store) -> Result<()> {
             if short { "ШОРТ ПРОБОЯ ВНИЗ" } else { "ЛОНГ ПРОБОЯ ВВЕРХ" }, if short { "ниже" } else { "выше" }, if short { "лоя" } else { "хая" }, s.min_cnt,
             s.stop * 100.0, s.take * 100.0, s.hold_s / H, s.max_open, p.min_vol / 1e6, trades::trial_label(s.trial, states[s.kind].opened)));
     }
-    let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(venue.clone(), unified, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
-    let l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
+    // the short on the shorts' sub-account (`sub`): its own positions, the money moved by the account's own key; the
+    // candles and the contexts read on the live venue
+    let mut keepers = HashMap::new();
+    let mut subs = HashMap::new();
+    for s in &p.sides {
+        if crate::sub::on_sub(s.kind) {
+            let mover = crate::sub::Mover::from_env(venue.ex.base(), &venue.account)?;
+            if mover.is_none() {
+                log!("{}: MAIN_KEY not set: nothing moves to the short account, a short goes on what is there", s.kind);
+            }
+            keepers.insert(s.kind, Keeper::new(crate::sub::venue(&venue)?, false, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours));
+            subs.insert(s.kind, mover);
+        } else {
+            keepers.insert(s.kind, Keeper::new(venue.clone(), unified, cfg.clone(), store.clone(), s.kind, message, HeldIn::Hours));
+        }
+    }
+    let l = Breakout { venue, keepers, p, states, bars: HashMap::new(), stepped: 0.0, subs };
+    for kind in l.subs.keys() {
+        l.sweep_sub(kind).await;
+    }
     crate::runner::spawn("breakout", l);
     Ok(())
 }
@@ -503,7 +550,7 @@ mod lifecycle {
         let states = p.sides.iter().map(|s| (s.kind, State::default())).collect();
         let c = cfg();
         let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(f.venue(), false, c.clone(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
-        let b = Breakout { venue: f.venue(), keepers, p, states, bars: HashMap::new(), stepped: 0.0 };
+        let b = Breakout { venue: f.venue(), keepers, p, states, bars: HashMap::new(), stepped: 0.0, subs: HashMap::new() };
         (f, b, rx)
     }
 
@@ -610,6 +657,68 @@ mod lifecycle {
         assert_eq!(b.states["breakout"].open.len(), 1);
         assert_eq!(b.stepped, bar);
     }
+
+    /// The short's breakdown on the shorts' sub-account (2026-11-22): the coin long on the live account (the RSI dip)
+    /// does not bar it; its margin and twice its loss to the stop sent there first, the orders for the sub-account.
+    #[tokio::test]
+    async fn the_short_opens_on_the_sub_account_past_a_long_on_the_coin() {
+        let (f, mut b, mut rx) = setup("BKG").await;
+        let others = ["BKH", "BKI", "BKJ"];
+        f.with(|s| {
+            for (k, c) in others.iter().enumerate() {
+                s.assets.insert(k as u32 + 1, (c.to_string(), 2, 10));
+                s.mids.insert(c.to_string(), 98.4);
+            }
+            s.account_value = Some(0.0);
+        });
+        let sub = crate::sub::venue(&f.venue()).unwrap();
+        b.venue = f.venue();
+        b.keepers = b.p.sides.iter().map(|s| (s.kind, Keeper::new(if s.dir < 0.0 { sub.clone() } else { f.venue() }, false, cfg(), b.keepers[s.kind].store.clone(), s.kind, message, HeldIn::Hours))).collect();
+        b.subs.insert("breakout_short", Some(crate::sub::Mover::for_test(&f.base, crate::testkit::ACCOUNT)));
+        b.p.gap_s = 0.0;
+        let bar = (now() / H).floor() * H - H;
+        // a quiet week after a loud month, then a close under the week's low on `break_at`
+        let mk = |break_at: f64| -> Vec<(f64, f64, f64, f64, f64, f64)> {
+            (0..900usize).map(|i| {
+                let t = bar - (899 - i) as f64 * H;
+                let wide = i < 600;
+                let c = 100.0 * (1.0 + if i % 2 == 0 { 1.0 } else { -1.0 } * if wide { 0.05 } else { 0.0025 });
+                let mut x = (t, c, c * if wide { 1.10 } else { 1.005 }, c * if wide { 0.90 } else { 0.995 }, c, 1e5);
+                if (t - break_at).abs() < 1.0 { x = (t, 100.0, 100.0, 98.0, 98.5, 1e5) }
+                if t > break_at { x = (t, 98.5, 99.0, 98.0, 98.4, 1e5) }
+                x
+            }).collect()
+        };
+        f.set_candles("BKG", "1h", &mk(bar));
+        f.set_mid("BKG", 98.5);
+        f.set_volume("BKG", 5e6);
+        for (k, c) in others.iter().enumerate() {
+            f.set_candles(c, "1h", &mk(bar - (5 + 10 * k) as f64 * H));
+            f.set_volume(c, 5e6);
+        }
+        trades::register("BKG", "rsidip", 5.0, 1.0);
+        assert!(!trades::can_open("BKG", "breakout", -1.0, 1.0), "the live account: a short against the long, never");
+        b.step(bar).await;
+        let ev = crate::store::drain(&mut rx);
+        let opened: Vec<&Value> = ev.iter().filter(|e| e["what"] == "open").collect();
+        assert_eq!(opened.len(), 1, "{ev:?}");
+        assert_eq!((opened[0]["coin"].as_str(), opened[0]["kind"].as_str(), opened[0]["cnt"].as_u64()), (Some("BKG"), Some("breakout_short"), Some(3)));
+        assert!(f.position("BKG") < 0.0 && b.states["breakout_short"].open.len() == 1);
+        let bodies = f.with(|x| x.bodies.clone());
+        let send = bodies.iter().position(|x| x["action"]["type"] == "sendAsset" && x["action"]["fromSubAccount"] == "").expect("funded");
+        let order = bodies.iter().position(|x| x["action"]["type"] == "order").unwrap();
+        assert!(send < order, "the money first");
+        assert!(bodies.iter().filter(|x| x["action"]["type"] == "order").all(|x| x["vaultAddress"] == crate::sub::SHORT_ACCOUNT));
+        // sent: the margin at 10x and twice the 3% loss, 5% over
+        let tr = &b.states["breakout_short"].open[0].tr;
+        let n = (tr.size * tr.entry_px).abs();
+        let sent: f64 = bodies[send]["action"]["amount"].as_str().unwrap().parse().unwrap();
+        assert!(sent >= n / 10.0 + 0.06 * n - 1.0 && sent <= 1.06 * (n / 10.0 + 0.06 * n) + 6.0, "{sent} for {n}");
+        // the sub-account keeps twice this short's risk
+        assert!((crate::sub::held() - 2.0 * tr.risk()).abs() < 1e-6);
+        trades::unregister("BKG", "rsidip");
+        trades::unregister("BKG", "breakout_short");
+    }
 }
 
 #[cfg(test)]
@@ -623,7 +732,7 @@ mod candles {
         let (store, _) = Store::for_test();
         let p = Params { gap_s: 0.0, ..Params::from_env() };
         let keepers = p.sides.iter().map(|s| (s.kind, Keeper::new(f.venue(), false, cfg(), store.clone(), s.kind, message, HeldIn::Hours))).collect();
-        let mut b = Breakout { venue: f.venue(), keepers, p, states: HashMap::new(), bars: HashMap::new(), stepped: 0.0 };
+        let mut b = Breakout { venue: f.venue(), keepers, p, states: HashMap::new(), bars: HashMap::new(), stepped: 0.0, subs: HashMap::new() };
         let h = (now() / H).floor() * H;
         f.set_candles("BCA", "1h", &[(h - 2.0 * H, 1.0, 2.0, 0.5, 1.5, 4.0), (h - H, 1.5, 2.5, 1.0, 2.0, 3.0), (h, 2.0, 3.0, 1.5, 2.5, 1.0)]);
         assert_eq!(b.fetch("BCA", h - 10.0 * H).await.unwrap(), vec![(h - 2.0 * H, 1.0, 2.0, 0.5, 1.5, 6.0), (h - H, 1.5, 2.5, 1.0, 2.0, 6.0)]);

@@ -1,5 +1,5 @@
 //! The shorts' sub-account (2026-11-21, the user's call: "шорты будем только на саб аккаунте открывать"): the squeeze
-//! short trades on the sub-account `SHORT_ACCOUNT` ("short", the live account's), so a short no longer meets the long
+//! short (and from 2026-11-22 the breakout short) trades on the sub-account `SHORT_ACCOUNT` ("short", the live account's), so a short no longer meets the long
 //! another strategy holds on the coin (Hyperliquid nets one position a coin an account: 2026-11 CASHCAT +34%, ZEC +18%
 //! skipped behind the RSI dip's / dip's longs; V427: the other side free +1..2% on Binance, +7% on HL 2025-26 at 2%).
 //!
@@ -25,8 +25,8 @@ use crate::venue::Venue;
 /// The sub-account "short" of the live account 0xfe19..2719 (made 2026-11-21 by the user; checked that day: the API
 /// wallet's order and cancel for it went through, `sendAsset` by the account's key both ways).
 pub(crate) const SHORT_ACCOUNT: &str = "0x123644e79020f028a0cd11886598fd6a403be4f4";
-/// The strategies trading on it.
-const KINDS: &[&str] = &["squeeze_short"];
+/// The strategies trading on it (the breakout short from 2026-11-22, the user's call: every short there).
+const KINDS: &[&str] = &["squeeze_short", "breakout_short"];
 /// USDC as `sendAsset` names it (the spot token 0).
 const USDC: &str = "USDC:0x6d1e7cde53ba9467b783cb7c530ce054";
 /// A move under this is not worth a transfer.
@@ -37,6 +37,13 @@ const PAD: f64 = 1.05;
 /// Whether `kind` trades on the sub-account.
 pub(crate) fn on_sub(kind: &str) -> bool {
     KINDS.contains(&kind)
+}
+
+/// What the sub-account keeps free for the trades open there: each one's loss to its stop taken twice (a stop filled
+/// at market past it, a gap), over every strategy trading there (the family's registry): one strategy's sweep leaves
+/// the other's.
+pub(crate) fn held() -> f64 {
+    2.0 * crate::trades::open_risk_of(on_sub)
 }
 
 #[cfg(not(test))]
@@ -157,7 +164,19 @@ mod tests {
     #[test]
     fn the_amounts_in_cents_and_the_kinds() {
         assert_eq!((amount(12.5), amount(3.0), amount(7.019), amount(0.1 + 0.2)), ("12.5".into(), "3".into(), "7.01".into(), "0.3".into()));
-        assert!(on_sub("squeeze_short") && !on_sub("squeeze") && !on_sub("rsidip"));
+        assert!(on_sub("squeeze_short") && on_sub("breakout_short") && !on_sub("squeeze") && !on_sub("breakout") && !on_sub("rsidip"));
+    }
+
+    #[test]
+    fn it_keeps_twice_the_risk_of_every_short_there() {
+        crate::trades::register("SBH", "squeeze_short", 10.0, -1.0);
+        crate::trades::register("SBI", "breakout_short", 4.0, -1.0);
+        crate::trades::register("SBJ", "rsidip", 50.0, 1.0);
+        assert_eq!(held(), 28.0, "the two shorts', not the live account's long");
+        for (c, k) in [("SBH", "squeeze_short"), ("SBI", "breakout_short"), ("SBJ", "rsidip")] {
+            crate::trades::unregister(c, k);
+        }
+        assert_eq!(held(), 0.0);
     }
 
     #[tokio::test]

@@ -101,8 +101,10 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         },
         Err(e) => log!("walls: not recording: {e:#}"),
     }
-    squeeze::start(&cfg, store.clone()).await?;
+    // the breakout before the squeeze: its open shorts on the sub-account registered before the squeeze's first sweep
+    // there (`sub::held`: the sub-account keeps every short's loss to its stop)
     breakout::start(&cfg, store.clone()).await?;
+    squeeze::start(&cfg, store.clone()).await?;
     // the stops by the price: a stop the exchange's mark trails, out at market by the mid
     if let Err(e) = pxstop::start(store.clone()).await {
         log!("pxstop: not watching: {e:#}");

@@ -85,7 +85,11 @@
 //! the US stocks 117 fills +432 bp (t 9.8), 82% up, the halves +351 / +511, w/o the 5 best +391 (6%: 157 +329); the 4% -> 7% fall takes
 //! < 1 s in 2/3 of them (the bid must rest); the HL portfolio over the bot (x41.7, 2%) with the top 10 x48.5 at the same drawdown (h2's
 //! drawdown 17.3% -> 15.7%).
-//! The asks (V248 .. V258), the wick's mirror: a resting SELL `WICK_ASK_PCT` (5) over the anchor (the close, or the oracle when higher) on the
+//! The crypto asks are OFF (`WICK_ASK_PCT` 0; 2026-11-23, the user's call): HL 1m 2025-05 .. 2026-10 (night/askbrk.py) 378 crypto asks
+//! +0.3% / -0.3% / -0.5% a trade by half-year; split by Binance's high in the fill minute: under +2% (an HL book's hole) n 60 +1.6%,
+//! +4% and more (a real move, 74% of the fills) -0.7% (t -2.0); closing at once when the HL oracle rose with it (the CEX move seen
+//! live) lifts the sum -62% -> +31% but the last 8 months stay negative (-75% -> -21%); live 2026-11-23 a news spike: LIT / PUMP / ZEC -98.
+//! The asks (V248 .. V258), the wick's mirror: a resting SELL `WICK_ASK_PCT` (5 then) over the anchor (the close, or the oracle when higher) on the
 //! `WICK_ASK_MAX_COINS` (5) most restless picked coins, short, take `WICK_ASK_TAKE_PCT` (3) under, stop `WICK_ASK_STOP_PCT` (10) over,
 //! `WICK_ASK_HOLD_MIN` (240), `WICK_ASK_MAX_OPEN` (2) slots, the registry's `wicka`, the same BTC / hot checks; moved up as soon as its
 //! level rises `WICK_REPRICE_DOWN_PCT` (0.5%; a stale ask under the level fills on a slow climb). The tape (HL 2025-05 .. 2026-10, a fill only on a print over it):
@@ -298,7 +302,7 @@ impl Params {
             cry_deep_coins: v("WICK_DEEP_MAX_COINS", 10.0) as usize, cry_deep_max_open: v("WICK_DEEP_MAX_OPEN", 3.0) as usize,
             cry_deep3_pct: v("WICK_DEEP3_PCT", 12.0) / 100.0, cry_deep3_take: v("WICK_DEEP3_TAKE_PCT", 6.0) / 100.0,
             cry_deep3_max_open: v("WICK_DEEP3_MAX_OPEN", 3.0) as usize, h3_session_deep_pct: v("WICK_H3_SESSION_DEEP_PCT", 7.0) / 100.0,
-            ask_pct: v("WICK_ASK_PCT", 5.0) / 100.0, ask_coins: v("WICK_ASK_MAX_COINS", 5.0) as usize, ask_take: v("WICK_ASK_TAKE_PCT", 3.0) / 100.0,
+            ask_pct: v("WICK_ASK_PCT", 0.0) / 100.0, ask_coins: v("WICK_ASK_MAX_COINS", 5.0) as usize, ask_take: v("WICK_ASK_TAKE_PCT", 3.0) / 100.0,
             ask_stop: v("WICK_ASK_STOP_PCT", 10.0) / 100.0, ask_hold_s: v("WICK_ASK_HOLD_MIN", 240.0) * 60.0, ask_max_open: v("WICK_ASK_MAX_OPEN", 2.0) as usize,
             h3_ask_shut_pct: v("WICK_H3_ASK_SHUT_PCT", 4.0) / 100.0, h3_ask_open_pct: v("WICK_H3_ASK_OPEN_PCT", 7.0) / 100.0, asia_ask_pct: v("WICK_H3_ASIA_ASK_PCT", 3.0) / 100.0,
             h3_ask_max_open: v("WICK_H3_ASK_MAX_OPEN", 3.0) as usize, h3_ask_crash: v("WICK_H3_ASK_CRASH_PCT", 15.0) / 100.0, noneq_shut_pct: v("WICK_H3_NONEQ_SHUT_PCT", 3.0) / 100.0,
@@ -1937,9 +1941,9 @@ mod tests {
         assert_eq!(p.rung_exits("xyz:NVDA", ASK, false, p.h3_ask_open_pct), (0.07, 0.20, 3_600.0));
         assert_eq!(p.rung_exits("xyz:GOLD", 0, true, p.noneq_shut_pct), (0.03, 0.20, 14_400.0));
         assert!(crate::wkd::non_equity("xyz:GOLD") && crate::wkd::asian_stock("xyz:SMSN") && !crate::wkd::non_equity("xyz:NVDA"));
-        // the asks: 5% over on the 5 most restless, take 3%, stop 10%, 240 min, 2 slots; the HIP-3 session ladder 7%, take = its level
-        assert!((p.ask_pct - 0.05).abs() < 1e-12 && p.ask_coins == 5 && p.ask_max_open == 2);
-        assert_eq!(p.rung_exits("SOL", ASK, false, p.ask_pct), (0.03, 0.10, 14_400.0));
+        // the crypto asks off (2026-11-23); their exits kept: take 3%, stop 10%, 240 min, 2 slots; the HIP-3 session ladder 7%, take = its level
+        assert!(p.ask_pct == 0.0 && p.ask_coins == 5 && p.ask_max_open == 2);
+        assert_eq!(p.rung_exits("SOL", ASK, false, 0.05), (0.03, 0.10, 14_400.0));
         assert!((p.h3_session_deep_pct - 0.07).abs() < 1e-12);
         let (take, stop, hold) = p.rung_exits("xyz:NVDA", 1, false, p.h3_session_deep_pct);
         assert!((take - 0.07).abs() < 1e-12 && (stop - 0.20).abs() < 1e-12 && (hold - 3600.0).abs() < 1e-9);

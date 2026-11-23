@@ -1510,6 +1510,9 @@ impl Wick {
                     "out_px": out_px, "closed": done, "pnl_usd": -done * (out_px - px)})),
                 Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("over the {why}, not closed: {e:#}")})),
             }
+            if rung == ASK {
+                self.note_oracle(coin, px, pct).await;
+            }
             self.save();
             return;
         }
@@ -1525,7 +1528,28 @@ impl Wick {
                 self.event(json!({"what": "error", "coin": coin, "error": format!("the stop not placed, closed again: {e:#}")}));
             }
         }
+        if rung == ASK {
+            self.note_oracle(coin, px, pct).await;
+        }
         self.save();
+    }
+
+    /// An ask's fill, after its stop is placed: the coin's oracle (the CEX price / the stock feed) and mid read at once, with
+    /// the minute before's close (the anchor), traced (`wick_order` "ask_oracle"). 2026-11-23: on the crypto asks the
+    /// oracle told a book's hole (it stays: +1.1..+3.0% a fill) from a real move (it rose 4%+ with the price: -1.6%); the
+    /// HIP-3 oracles have no history, so they are kept from now on to test the same rule on the HIP-3 asks.
+    async fn note_oracle(&self, coin: &str, px: f64, pct: f64) {
+        let t = now();
+        let anchor = self.closes.at(coin, (t / 60.0).floor() as i64 - 1);
+        let ctx = match crate::market::contexts(&self.api, dex_of(coin)).await {
+            Ok(v) => v.into_iter().find(|x| x.name == coin),
+            Err(e) => {
+                log!("wick: {coin} oracle not read at the ask's fill: {e:#}");
+                None
+            }
+        };
+        self.trace(json!({"what": "ask_oracle", "coin": coin, "px": px, "pct": pct, "anchor": anchor, "oracle": ctx.as_ref().map(|x| x.oracle),
+            "mid": ctx.as_ref().map(|x| x.mid), "oracle_cached": self.oracle.get(coin), "ctx_age_s": t - self.ctx_at, "read_s": now() - t}));
     }
 
     /// The bids' fills (from the open orders) and the trades' ends; the account's positions.
@@ -2104,6 +2128,10 @@ mod crash_tests {
         fill_ask(&f, &mut w, "WAA", 1.0).await;
         let ev = crate::store::drain(&mut rx);
         assert!(whats(&ev).contains(&"ask_off".to_string()), "{ev:?}");
+        // each ask's fill traced with its oracle read (the fake's: none) and its anchor
+        let o: Vec<&Value> = ev.iter().filter(|e| e["kind"] == "wick_order" && e["what"] == "ask_oracle").collect();
+        assert_eq!(o.len(), 2, "{ev:?}");
+        assert!(o.iter().any(|e| e["coin"] == "WAA" && e["px"] == 100.0 && e.get("oracle").is_some()));
         assert!(!whats(&ev).contains(&"crash_off".to_string()), "the asks don't trip the bids' breaker");
         assert!(w.state.ask_off_until > now() + 3500.0 && w.state.ask_off_until < now() + 3700.0);
         assert_eq!(w.state.crash_off_until, 0.0);

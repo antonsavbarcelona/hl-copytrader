@@ -1,6 +1,9 @@
 //! The daily trend long (`TREND_ENABLED`: unset or "1" live, "0" off; with `LIVE_KEY` / `LIVE_ACCOUNT` / `LIVE_NET` as for the dip): after each
 //! UTC day's close, a main-dex perp whose close broke the high of the `TREND_DAYS` (20) days before it, with
-//! `TREND_MIN_VOL_USD` (10M) or more traded that day, is bought at market while BTC's close is over its
+//! `TREND_MIN_VOL_USD` ($2M; 10M before 2026-11-23: the research's floor was Binance's $10M, and HL's day volume is ~0.21 of
+//! Binance's on the same coin-days (median), so $10M on HL was ~$47M there; night/floors.py, the HL portfolio with the live
+//! floors on the real HL volume, at DD 40%: $10M +830%, $5M +879%, $2M +956%, $1M +1003%; the halves at DD 25% / 30%:
+//! $10M +136 / +160%, $2M +137 / +179%) or more traded that day, is bought at market while BTC's close is over its
 //! `TREND_BTC_MA_DAYS` (50) day mean. Out at market when a day closes `TREND_ATR_K` (3) x ATR20 (the day before's)
 //! under the best close since the entry (a chandelier on the closes: no intraday wick-out), or `TREND_MAX_DAYS`
 //! (90) on. The size: `TREND_RISK_USD` ($20; `FAMILY_RISK_PCT` of the equity when set) lost at the chandelier's
@@ -56,7 +59,7 @@ impl Params {
     fn from_env() -> Self {
         let v = trades::env_f;
         Params { days: v("TREND_DAYS", 20.0) as usize, atr_k: v("TREND_ATR_K", 3.0), max_days: v("TREND_MAX_DAYS", 90.0),
-            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 10e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
+            btc_ma: v("TREND_BTC_MA_DAYS", 50.0) as usize, min_vol: v("TREND_MIN_VOL_USD", 2e6), risk_usd: v("TREND_RISK_USD", 20.0), share: v("TREND_RISK_SHARE", 1.0),
             max_open: v("TREND_MAX_OPEN", 3.0) as usize, trial: trades::switch("TREND_ENABLED").flatten() }
     }
 }

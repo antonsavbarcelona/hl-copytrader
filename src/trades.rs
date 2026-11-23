@@ -448,7 +448,7 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
     // the rest closed at market at once, the take's rest and the stop cancelled (the user's call).
     if held * t.size > 0.0 {
         if let Some(o) = t.take_oid {
-            if let Ok((f, open)) = v.filled(o).await {
+            if let (Ok((_, open)), Ok(f)) = (v.filled(o).await, v.oid_filled(o, (t.at * 1000.0) as i64).await) {
                 if f > 0.0 && f < t.size.abs() * (1.0 - 1e-9) {
                     if open {
                         v.cancel(&t.coin, o).await;
@@ -481,6 +481,13 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
             return None;
         }
     }
+    // closed by the price here (`pxstop`): the stop at its exit's price, the take cancelled
+    if let Some(px) = t.stop_oid.and_then(crate::pxstop::closed) {
+        if let Some(o) = t.take_oid {
+            v.cancel(&t.coin, o).await;
+        }
+        return Some(("stop", px));
+    }
     // The exchange's order status and fills lag the position by a few seconds (2026-11-04, xyz:SNXX: the take filled at
     // 6.4181, the position gone, the take's status and the fills not yet there -> told "closed outside the bot" at the
     // mid 6.4274): neither the take nor the stop seen done and no closing fill -> asked again, up to 3 times 2 s apart.
@@ -488,7 +495,7 @@ pub(crate) async fn gone(v: &Venue, t: &Trade, held: f64, kind: &str) -> Option<
     let mut stopped = false;
     for attempt in 0..4 {
         took = match t.take_oid {
-            Some(o) => v.filled(o).await.map(|x| x.0 > 0.0).unwrap_or(false),
+            Some(o) => v.oid_filled(o, (t.at * 1000.0) as i64).await.map(|x| x > 0.0).unwrap_or(false),
             None => false,
         };
         // the stop filled or triggered; else the position went another way: closed by hand on the exchange, or liquidated

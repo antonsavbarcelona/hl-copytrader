@@ -217,6 +217,36 @@ mod tests {
         assert!(!k.sweep(&mut Vec::<Trade>::new(), |t| t, true, true).await);
     }
 
+    /// 2026-11-20 xyz:SNDK: the coin shared (the HIP-3 dip and a wick rung long), the dip's part closed by `pxstop` at
+    /// the price, its take's status showing size gone with no fill: told the stop at pxstop's price, not the take; the
+    /// other strategy's part left alone.
+    #[tokio::test]
+    async fn a_shared_coin_s_part_closed_by_the_price_is_its_stop_not_its_take() {
+        let f = FakeHl::start(&[("KPC", 2, 10, 100.0)]).await;
+        let (store, mut rx) = Store::for_test();
+        let k = Keeper::new(f.venue(), false, cfg(), store, "kp", msg, HeldIn::No);
+        let tr = trades::open_market(&k.venue, "KPC", 1.0, 0.1, Some(0.05), 3600.0).await.unwrap();
+        trades::register("KPC", "kp", tr.risk(), 1.0);
+        let other = trades::open_market(&k.venue, "KPC", 1.0, 0.2, None, 3600.0).await.unwrap();
+        trades::register("KPC", "kp_other", other.risk(), 1.0);
+        // pxstop: the mark trailing (the resting stop not triggered), out at market by the price, the stop cancelled,
+        // its oid kept
+        f.with(|s| s.marks.insert("KPC".into(), 100.0));
+        f.set_mid("KPC", 89.0);
+        k.venue.market("KPC", -1.0, true).await.unwrap();
+        k.venue.cancel("KPC", tr.stop_oid.unwrap()).await;
+        crate::pxstop::mark_closed(tr.stop_oid.unwrap(), 89.0);
+        // the take's status: some of its size gone, no fill of it
+        f.with(|s| s.orders.get_mut(&tr.take_oid.unwrap()).unwrap().left = 0.4);
+        let mut open = vec![tr.clone()];
+        assert!(k.sweep(&mut open, |t| t, false, true).await);
+        let e = crate::store::drain(&mut rx).pop().unwrap();
+        assert_eq!((e["why"].as_str(), e["px"].as_f64()), (Some("stop"), Some(89.0)), "{e}");
+        assert!(e["pnl_usd"].as_f64().unwrap() < -10.0);
+        assert!((f.position("KPC") - 1.0).abs() < 1e-9, "the other strategy's part held: {} {:?}", f.position("KPC"), f.with(|s| s.fills.clone()));
+        trades::unregister("KPC", "kp_other");
+    }
+
     #[tokio::test]
     async fn a_failed_close_is_told_and_the_trade_kept() {
         let f = FakeHl::start(&[("KPB", 2, 10, 100.0)]).await;

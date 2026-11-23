@@ -370,6 +370,14 @@ impl Venue {
         last_close(&r, coin)
     }
 
+    /// The size the order `oid` filled on `coin` since `since_ms`, by the account's own fills (not the order's status: its
+    /// origSz less its sz is no fill on a coin two strategies share - 2026-11-20 xyz:SNDK, the HIP-3 dip's part closed
+    /// by `pxstop` at 88.06 was told "the take 103.95, +$43", -$95 in fact).
+    pub(crate) async fn oid_filled(&self, oid: u64, since_ms: i64) -> Result<f64> {
+        let r = self.ex.info(json!({"type": "userFillsByTime", "user": self.account, "startTime": since_ms})).await?;
+        Ok(r.as_array().map_or(0.0, |a| a.iter().filter(|x| x["oid"].as_u64() == Some(oid)).map(|x| num(&x["sz"])).sum()))
+    }
+
     /// An order's status ("open", "filled", "triggered", "canceled", ...) and the size filled.
     pub(crate) async fn order_state(&self, oid: u64) -> Result<(String, f64)> {
         let r = self.ex.info(json!({"type": "orderStatus", "user": self.account, "oid": oid})).await?;

@@ -9,6 +9,7 @@
 //! first: only the dexes holding one read for their orders), and at once after an exit.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(test))]
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -24,16 +25,27 @@ const READ_S: f64 = 30.0;
 /// The mid through the trigger this long (two polls) before the exit: a single print of a thin book is not acted on.
 const CONFIRM_S: f64 = 4.0;
 
-/// The stops closed here: oid -> the exit's price.
+/// The stops closed here: oid -> the exit's price (a test's own: the fakes' oids repeat from test to test).
+#[cfg(not(test))]
 static CLOSED: Mutex<Option<HashMap<u64, f64>>> = Mutex::new(None);
+#[cfg(test)]
+thread_local! {
+    static CLOSED_T: std::cell::RefCell<HashMap<u64, f64>> = std::cell::RefCell::new(HashMap::new());
+}
 
 /// The stop `oid` closed here by the price (its exit's price).
 pub(crate) fn closed(oid: u64) -> Option<f64> {
-    CLOSED.lock().unwrap().as_ref().and_then(|m| m.get(&oid).copied())
+    #[cfg(not(test))]
+    return CLOSED.lock().unwrap().as_ref().and_then(|m| m.get(&oid).copied());
+    #[cfg(test)]
+    return CLOSED_T.with(|m| m.borrow().get(&oid).copied());
 }
 
-fn mark_closed(oid: u64, px: f64) {
+pub(crate) fn mark_closed(oid: u64, px: f64) {
+    #[cfg(not(test))]
     CLOSED.lock().unwrap().get_or_insert_with(HashMap::new).insert(oid, px);
+    #[cfg(test)]
+    CLOSED_T.with(|m| m.borrow_mut().insert(oid, px));
 }
 
 /// A resting stop: a reduce-only trigger order.

@@ -187,6 +187,13 @@ const AGAIN_AFTER_S: f64 = 3600.0;
 const CRASH_FILLS: usize = 2;
 const CRASH_WINDOW_S: f64 = 60.0;
 const CRASH_OFF_S: f64 = 7200.0;
+/// The asks' breaker (2026-11-23, the user's call: a news spike, NVDA +14% and the Nasdaq +2.7% in 3 minutes, filled 7 asks
+/// in 2.5 min, KORU and SOXL 11 s apart, ~-$150; night/askbrk.py, HL 1m 2025-05 .. 2026-10, 437 asks: it trips 4 times, the
+/// portfolio +315% -> +324% at the same drawdown, neither half worse; an insurance, not a proven edge): `ASK_BRK_FILLS` asks
+/// (crypto or HIP-3) filled within `ASK_BRK_WINDOW_S` -> every ask off for `ASK_BRK_OFF_S` (the bids stay).
+const ASK_BRK_FILLS: usize = 2;
+const ASK_BRK_WINDOW_S: f64 = 60.0;
+const ASK_BRK_OFF_S: f64 = 3600.0;
 /// A resting order whose wanted size moved this much (the equity's change: a deposit, a drawdown) is placed again at it.
 const RESIZE_X: f64 = 0.10;
 const BTC_MAX_MINUTE: f64 = 0.01;
@@ -404,6 +411,9 @@ struct State {
     /// The crash breaker's end (s): no crypto order before it (kept over a restart).
     #[serde(default)]
     crash_off_until: f64,
+    /// The asks' breaker's end (s): no ask before it (kept over a restart).
+    #[serde(default)]
+    ask_off_until: f64,
     /// The fills on each side (the trial's counts).
     #[serde(default)]
     opened: u32,
@@ -459,6 +469,11 @@ fn resized(old: f64, new: f64) -> bool {
 /// The breaker trips: `CRASH_FILLS` or more of the crypto fills `fills` (s) within `CRASH_WINDOW_S` up to `t`.
 fn crash_trip(fills: &[f64], t: f64) -> bool {
     fills.iter().filter(|x| t - **x <= CRASH_WINDOW_S).count() >= CRASH_FILLS
+}
+
+/// The asks' breaker trips: `ASK_BRK_FILLS` or more of the asks' fills `fills` (s) within `ASK_BRK_WINDOW_S` up to `t`.
+fn ask_trip(fills: &[f64], t: f64) -> bool {
+    fills.iter().filter(|x| t - **x <= ASK_BRK_WINDOW_S).count() >= ASK_BRK_FILLS
 }
 
 /// Why a fill is closed at the market at once: over its rung's slots (the trades open before it) or the family's
@@ -554,6 +569,8 @@ fn message(ev: &Value) -> Option<String> {
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "crash_off" => format!("🛑 ОБВАЛ: {:.0} крипто-лимитки исполнились за {:.0} с — все крипто-лимитки сняты на {:.0} мин (HIP-3 остаются; открытые сделки со своими стопами)",
             f("fills"), f("window_s"), f("off_min")),
+        "ask_off" => format!("🛑 ВЫНОСЫ: {:.0} шорт-лимитки исполнились за {:.0} с (рост по всему рынку?) — все шорт-лимитки сняты на {:.0} мин (открытые сделки со своими стопами)",
+            f("fills"), f("window_s"), f("off_min")),
         "over" => format!("✂️ лишняя лимитка {coin} закрыта по рынку ({}): вход {}, выход {}, {}",
             if ev["why"] == "slots" { "слоты заняты" } else { "лимит риска семьи" }, px(f("px")), px(f("out_px")), usd(f("pnl_usd"))),
         _ => return None,
@@ -597,6 +614,8 @@ struct Wick {
     trade_close: HashMap<(String, i64), f64>,
     /// The crypto bids' fills seen in the last `CRASH_WINDOW_S` (the breaker's count).
     crash_fills: Vec<f64>,
+    /// The asks' fills seen in the last `ASK_BRK_WINDOW_S` (the asks' breaker's count).
+    ask_fills: Vec<f64>,
     /// The loop's timers: the volumes (and the coins picked again), the oracles, the orders' check, the candles' backfill,
     /// every HIP-3 dex's mids, the orphans; the minute the levels were last placed for.
     vol_every: Every,
@@ -837,6 +856,9 @@ impl Wick {
     fn wanted_asks(&self, minute: i64) -> HashMap<String, (f64, f64, bool)> {
         let mut out = HashMap::new();
         let (risk, t) = (trades::risk_usd(self.p.risk_usd), now());
+        if t < self.state.ask_off_until {
+            return out;
+        }
         let free = |c: &str| {
             !self.state.asks_open.iter().any(|x| x.coin == c)
                 && (self.held.get(c).is_none_or(|x| *x == 0.0) || trades::family_holds(c))
@@ -1417,6 +1439,16 @@ impl Wick {
                 self.event(json!({"what": "crash_off", "coin": coin, "fills": self.crash_fills.len(), "window_s": CRASH_WINDOW_S, "off_min": CRASH_OFF_S / 60.0}));
             }
         }
+        // the asks' breaker: an ask's fill (crypto or HIP-3) counted; tripped, every ask comes off (the main loop's next tick)
+        if rung == ASK {
+            let t = now();
+            self.ask_fills.retain(|x| t - *x <= ASK_BRK_WINDOW_S);
+            self.ask_fills.push(t);
+            if ask_trip(&self.ask_fills, t) && t >= self.state.ask_off_until {
+                self.state.ask_off_until = t + ASK_BRK_OFF_S;
+                self.event(json!({"what": "ask_off", "coin": coin, "fills": self.ask_fills.len(), "window_s": ASK_BRK_WINDOW_S, "off_min": ASK_BRK_OFF_S / 60.0}));
+            }
+        }
         if rung == LOW2 {
             self.state.low2_fill.insert(coin.to_string(), now());
         } else if rung == LOW {
@@ -1729,7 +1761,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(),
+        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(),
         vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S), last_minute: (now() / 60.0).floor() as i64 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     crate::runner::spawn("wick", w);
@@ -1776,7 +1808,8 @@ impl Wick {
         }
         // The levels move with the minutes' closes: once a minute (and at once when BTC jumps).
         if minute > self.last_minute || !self.state.bids.is_empty() && self.wanted(minute).len() < self.state.bids.len()
-            || now() < self.state.crash_off_until && self.has_crypto_orders() {
+            || now() < self.state.crash_off_until && self.has_crypto_orders()
+            || now() < self.state.ask_off_until && !self.state.asks.is_empty() {
             self.place(minute).await;
             self.last_minute = minute;
         }
@@ -2008,7 +2041,7 @@ mod crash_tests {
         let w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         (f, w, rx)
     }
@@ -2047,6 +2080,40 @@ mod crash_tests {
         // over a restart the breaker holds (the state's)
         let s: State = serde_json::from_value(serde_json::to_value(&w.state).unwrap()).unwrap();
         assert_eq!(s.crash_off_until, w.state.crash_off_until);
+    }
+
+    /// An ask on `coin` filled for `size` at the mid: the account short.
+    async fn fill_ask(f: &FakeHl, w: &mut Wick, coin: &str, size: f64) {
+        w.book(ASK).insert(coin.to_string(), Bid { oid: 1, px: 100.0, size, pct: 0.07, shut: false });
+        f.hand_trade(coin, -size);
+        w.filled(coin, size, 100.0, ASK).await;
+    }
+
+    #[tokio::test]
+    async fn two_asks_filled_within_a_minute_take_every_ask_off_for_an_hour_the_bids_stay() {
+        trades::family_fits(true);
+        let (f, mut w, mut rx) = setup(&[("WAA", 2, 10, 100.0), ("xyz:WAH", 2, 10, 100.0), ("xyz:WAI", 2, 10, 100.0)]).await;
+        assert!(ask_trip(&[50.0, 100.0], 100.0) && !ask_trip(&[30.0, 100.0], 100.0) && !ask_trip(&[100.0], 100.0));
+        fill_ask(&f, &mut w, "xyz:WAH", 1.0).await;
+        assert_eq!(w.state.ask_off_until, 0.0, "one ask's fill: not tripped");
+        // 2026-11-23: a HIP-3 ask and then a crypto one, 11 s apart
+        fill_ask(&f, &mut w, "WAA", 1.0).await;
+        let ev = crate::store::drain(&mut rx);
+        assert!(whats(&ev).contains(&"ask_off".to_string()), "{ev:?}");
+        assert!(!whats(&ev).contains(&"crash_off".to_string()), "the asks don't trip the bids' breaker");
+        assert!(w.state.ask_off_until > now() + 3500.0 && w.state.ask_off_until < now() + 3700.0);
+        assert_eq!(w.state.crash_off_until, 0.0);
+        let m = message(ev.iter().find(|e| e["what"] == "ask_off").unwrap()).unwrap();
+        assert!(m.contains("ВЫНОСЫ") && m.contains("60 мин"), "{m}");
+        // no ask wanted while it holds, a resting one comes off at the loop's next tick; the trades kept with their stops
+        w.picked = vec!["WAA".into()];
+        w.h3_picked = vec!["xyz:WAI".into()];
+        assert!(w.wanted_asks((now() / 60.0) as i64).is_empty());
+        assert_eq!(w.state.asks_open.len(), 2);
+        assert!(f.position("WAA") < 0.0 && f.position("xyz:WAH") < 0.0);
+        // over a restart the breaker holds (the state's)
+        let s: State = serde_json::from_value(serde_json::to_value(&w.state).unwrap()).unwrap();
+        assert_eq!(s.ask_off_until, w.state.ask_off_until);
     }
 
     #[tokio::test]
@@ -2123,7 +2190,7 @@ mod tick_tests {
         let mut w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         w.tick().await;
         (f, w, rx, clock)

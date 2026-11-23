@@ -204,6 +204,14 @@ const ASK_BRK_OFF_S: f64 = 3600.0;
 /// (the crypto ones and the HIP-3 asks stay). It trips 4 times in 11 months (2 trades dropped), the portfolio at DD 40% +272% ->
 /// +278%, neither half worse. Not on the HIP-3 dips / weekend dips (hip3.rs): their mass entries were bought back (the biggest
 /// clusters +2.2% / +2.9% a trade), a breaker over every HIP-3 long cuts the portfolio (+272% -> +219..+270%, noisy).
+/// A HIP-3 ask filled while the index rose with it: closed at once (2026-11-23, the user's call: the asks' edge is an HL book's
+/// hole, a market-wide news move is not one - 13:55 UTC NVDA +14%, `INDEX` +0.9% in the minute, +2.7% in 3, KORU / SOXL asks
+/// filled and stopped -63 / -66). The index's last price over its lowest of the last ~3 minutes (the fill is seen seconds late,
+/// the jump may be in the minute before), `INDEX_OUT_PCT` or more up -> the ask's trade out at market. HL 1m 2025-10 .. 2026-10,
+/// 58 HIP-3 asks: the index rose at most 0.29% (p95 0.23%) so measured at a fill (the rule costs nothing there); 3-minute rises
+/// of 0.5%+ are 0.06% of the minutes: the news day's guard.
+const INDEX: &str = "xyz:XYZ100";
+const INDEX_OUT_PCT: f64 = 0.005;
 const H3_BRK_FILLS: usize = 2;
 const H3_BRK_WINDOW_S: f64 = 60.0;
 const H3_BRK_OFF_S: f64 = 3600.0;
@@ -586,7 +594,7 @@ fn message(ev: &Value) -> Option<String> {
         "open" => format!("🎣 ПРОКОЛ {coin}: лимитка {:.0}% ниже{} исполнилась по {}, на ${:.0}, тейк {} / стоп {}, выход через {:.0} мин",
             f("pct") * 100.0, if ev["major"] == true { " (крупная монета)" } else if ev["deep"] == true { " (лесенка)" } else { "" }, px(f("px")), f("notional"), px(f("take_px")), px(f("stop_px")), f("hold_min")),
         "close" => format!("{} прокол {} {coin}: {} -> {} ({:+.2}%, {})", if f("ret_pct") >= 0.0 { "✅" } else { "🔻" },
-            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", _ => "ЗАКРЫЛ по времени" }, px(f("entry_px")), px(f("px")), f("ret_pct"), usd(f("pnl_usd"))),
+            match ev["why"].as_str().unwrap_or("") { "stop" => "СТОП", "take" => "ТЕЙК", "manual" => "ЗАКРЫТО ВНЕ БОТА (руками или ликвидация)", "index" => "ЗАКРЫЛ СРАЗУ: Nasdaq-100 растёт вместе с ним (новость, не прокол)", _ => "ЗАКРЫЛ по времени" }, px(f("entry_px")), px(f("px")), f("ret_pct"), usd(f("pnl_usd"))),
         "error" => format!("⚠️ прокол {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "crash_off" => format!("🛑 ОБВАЛ: {:.0} крипто-лимитки исполнились за {:.0} с — все крипто-лимитки сняты на {:.0} мин (HIP-3 остаются; открытые сделки со своими стопами)",
             f("fills"), f("window_s"), f("off_min")),
@@ -1570,10 +1578,46 @@ impl Wick {
                 self.event(json!({"what": "error", "coin": coin, "error": format!("the stop not placed, closed again: {e:#}")}));
             }
         }
+        if rung == ASK && coin.contains(':') {
+            self.index_out(coin).await;
+        }
         if rung == ASK {
             self.note_oracle(coin, px, pct).await;
         }
         self.save();
+    }
+
+    /// A HIP-3 ask's trade just opened: out at market when the index rose `INDEX_OUT_PCT` or more since the close of the minute
+    /// before (a market-wide move, not a hole; see `INDEX_OUT_PCT`). The index unread: kept (its stop guards it).
+    async fn index_out(&mut self, coin: &str) {
+        let t = now();
+        let from = ((t / 60.0).floor() - 3.0) * 60.0;
+        let c = match crate::market::candles(&self.api, INDEX, "1m", from).await {
+            Ok(c) => c,
+            Err(e) => {
+                log!("wick: {INDEX} not read at the ask's fill on {coin}: {e:#}");
+                return;
+            }
+        };
+        // the lowest of the window (the first candle's open and every low) against the last price
+        let low = c.iter().filter(|x| x.t >= from - 1.0).flat_map(|x| [x.o, x.l]).filter(|x| *x > 0.0).fold(f64::MAX, f64::min);
+        let (before, Some(last)) = (if low < f64::MAX { low } else { 0.0 }, c.last().map(|x| x.c)) else { return };
+        let up = if before > 0.0 { last / before - 1.0 } else { 0.0 };
+        if up < INDEX_OUT_PCT {
+            return;
+        }
+        let Some(i) = self.state.asks_open.iter().position(|x| x.coin == coin) else { return };
+        let tr = self.state.asks_open[i].clone();
+        match trades::close(&self.venue, &tr).await {
+            Ok(px) => {
+                self.state.asks_open.remove(i);
+                let ret = tr.ret(px);
+                self.event(json!({"what": "close", "coin": coin, "why": "index", "deep": true, "rung": ASK, "entry_px": tr.entry_px, "px": px, "ret_pct": ret * 100.0,
+                    "pnl_usd": ret * tr.size.abs() * tr.entry_px, "held_min": (now() - tr.at) / 60.0, "index_up_pct": up * 100.0}));
+                trades::unregister(coin, KINDS[ASK]);
+            }
+            Err(e) => self.event(json!({"what": "error", "coin": coin, "error": format!("the index rose {:.2}%: not closed: {e:#}", up * 100.0)})),
+        }
     }
 
     /// An ask's fill, after its stop is placed: the coin's oracle (the CEX price / the stock feed) and mid read at once, with
@@ -2189,6 +2233,29 @@ mod crash_tests {
         // over a restart the breaker holds (the state's)
         let s: State = serde_json::from_value(serde_json::to_value(&w.state).unwrap()).unwrap();
         assert_eq!(s.ask_off_until, w.state.ask_off_until);
+    }
+
+    /// 2026-11-23: a HIP-3 ask filled while the index rose 0.9% in the minute: out at once; the index flat: kept.
+    #[tokio::test]
+    async fn a_hip3_ask_filled_while_the_index_rises_is_closed_at_once() {
+        trades::family_fits(true);
+        let (f, mut w, mut rx) = setup(&[("xyz:WIA", 2, 10, 100.0), ("xyz:WIB", 2, 10, 100.0), (INDEX, 2, 10, 100.0)]).await;
+        let m = (now() / 60.0).floor() * 60.0;
+        f.set_candles(INDEX, "1m", &[(m - 120.0, 100.0, 100.0, 100.0, 100.0, 1.0), (m - 60.0, 100.0, 100.0, 100.0, 100.0, 1.0), (m, 100.0, 100.4, 100.0, 100.4, 1.0)]);
+        fill_ask(&f, &mut w, "xyz:WIA", 1.0).await;
+        assert!(w.state.asks_open.iter().any(|x| x.coin == "xyz:WIA") && f.position("xyz:WIA") < 0.0, "the index +0.4%: kept");
+        w.ask_fills.clear();
+        // the jump in the minute before (the fill seen late): the window still holds the low
+        f.set_candles(INDEX, "1m", &[(m - 120.0, 100.0, 100.0, 100.0, 100.0, 1.0), (m - 60.0, 100.0, 100.8, 100.0, 100.7, 1.0), (m, 100.7, 101.0, 100.7, 100.9, 1.0)]);
+        fill_ask(&f, &mut w, "xyz:WIB", 1.0).await;
+        let ev = crate::store::drain(&mut rx);
+        let c = ev.iter().find(|e| e["what"] == "close" && e["coin"] == "xyz:WIB").unwrap_or_else(|| panic!("{ev:?}"));
+        assert_eq!(c["why"], "index");
+        assert!((c["index_up_pct"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        assert!(message(c).unwrap().contains("Nasdaq-100"));
+        assert_eq!(f.position("xyz:WIB"), 0.0);
+        assert!(!w.state.asks_open.iter().any(|x| x.coin == "xyz:WIB") && !trades::registered("xyz:WIB"));
+        assert!(f.open_orders("xyz:WIB").is_empty(), "its stop and take cancelled");
     }
 
     #[tokio::test]

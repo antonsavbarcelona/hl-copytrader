@@ -14,8 +14,16 @@
 //! trend long at the same drawdown 18%: x33 -> x55 (3 slots; 5 slots worse). HL 2025-10 .. 2026-10: +0.27 R a trade.
 //! Win 40%: the profit is in the few runs.
 //!
+//! No entry on a candle closing on the UTC weekend (Saturday / Sunday), either side (2026-11-23, the audit; night/sqs3.py,
+//! the live slots, 3 open): the short's weekend entries -0.17 R a trade on Binance 2020-26 (n 174) and -0.33 R on HL (n 163),
+//! the weekdays +0.40 / +0.05 R; without them the short's sum Binance 2025-26 +38 -> +44 R, HL +22 -> +29 R, Binance 2020-26
+//! the same (+131 / +127); the long's sum Binance 2020-26 +62 -> +74 R (2023-24 +21 -> +45), HL -22 -> +10 R. The HL portfolio
+//! (2%, the live floors on the real HL volume, night/floors.py) at DD 40%: +830% -> +853% (the long) / +864% (the short), both halves.
+//!
 //! The SHORT side (`SQZS_ENABLED`, as the long's): the mirror, a 4h close under the lower
-//! band after a squeeze (the lowest `SQZS_QUANTILE` (0.1) width), any BTC; out on a 4h close `SQZS_ATR_K` (2) ATR over the
+//! band after a squeeze (the lowest `SQZS_QUANTILE` (0.1) width), any BTC, `SQZS_MIN_VOL_USD` ($5M; 2026-11-23: HL's day volume is
+//! ~0.21 of Binance's on the same coin-days (median), so the research's Binance $30M is ~$5-6M on HL; the live slots on HL
+//! 2025-05 .. 2026-10: $10M 31 trades +0.14 R, $5M 45 +0.27 R, $2M 68 +0.32 R, under $1M negative); out on a 4h close `SQZS_ATR_K` (2) ATR over the
 //! entry or `SQZS_HOLD_DAYS` (5) on; `SQZS_RISK_SHARE` (1: the full family risk; the hedge of the longs, robust/bn_full2.py) of the family's risk; at most `SQZS_MAX_OPEN` (3). V144 / V145
 //! (Binance 2020-26): +0.32 R a trade vs -0.04 on random bars, 6 of 7 years (2022 +128 R), +0.36 R on the untouched
 //! 2023-26; a candle late +0.27, costs x2 +0.29, w/o the 10 best coins +0.24; the daily P&L corr with the live +0.03, the
@@ -74,6 +82,8 @@ struct Params {
     kind: &'static str,
     /// Only while BTC is over its mean (the long).
     btc_filter: bool,
+    /// No entry on a candle closing on the UTC weekend (both sides; see the module's doc).
+    no_weekend: bool,
     /// `SQZ_OWN_DAYS` (30 for the long; 0 = off, the short): new entries only while the strategy's own paper trades (all
     /// its signals on the liquid coins, traded by its rules from the 4h candles, see `paper`) closed in the last that many
     /// days sum under 0 R. The research (2026-11-05, night/stage1-5, Binance 5m 2021-26, the HL coins): the best of ~600
@@ -90,14 +100,14 @@ impl Params {
         let v = trades::env_f;
         Params { q: v("SQZ_QUANTILE", 0.2), atr_k: v("SQZ_ATR_K", 3.0), hold_s: v("SQZ_HOLD_DAYS", 10.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
             min_vol: v("SQZ_MIN_VOL_USD", 10e6), risk_usd: v("SQZ_RISK_USD", 20.0), share: v("SQZ_RISK_SHARE", 1.0), max_open: v("SQZ_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true, own_days: v("SQZ_OWN_DAYS", 30.0) }
+            trial: trades::switch("SQZ_ENABLED").flatten(), side: 1.0, kind: "squeeze", btc_filter: true, no_weekend: true, own_days: v("SQZ_OWN_DAYS", 30.0) }
     }
 
     fn short_from_env() -> Self {
         let v = trades::env_f;
         Params { q: v("SQZS_QUANTILE", 0.1), atr_k: v("SQZS_ATR_K", 2.0), hold_s: v("SQZS_HOLD_DAYS", 5.0) * DAY, btc_ma: (v("SQZ_BTC_MA_DAYS", 50.0) * 6.0) as usize,
-            min_vol: v("SQZS_MIN_VOL_USD", 10e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
-            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false, own_days: 0.0 }
+            min_vol: v("SQZS_MIN_VOL_USD", 5e6), risk_usd: v("SQZS_RISK_USD", 20.0), share: v("SQZS_RISK_SHARE", 1.0), max_open: v("SQZS_MAX_OPEN", 3.0) as usize,
+            trial: trades::switch("SQZS_ENABLED").flatten(), side: -1.0, kind: "squeeze_short", btc_filter: false, no_weekend: true, own_days: 0.0 }
     }
 }
 
@@ -216,6 +226,11 @@ fn paper(b: &[Bar], q: f64, side: f64, atr_k: f64, hold: usize, look: usize, btc
 }
 
 /// Whether BTC's last close is over the mean of its last `n` closes.
+/// The 4h candle opened at `bar` (s) closes on the UTC weekend (its close is the entry).
+fn weekend_close(bar: f64) -> bool {
+    crate::wkd::weekend(((bar + BAR) / 60.0).floor() as i64)
+}
+
 fn btc_up(b: &[Bar], n: usize) -> bool {
     b.len() >= n && b[b.len() - 1].3 > mean(&b[b.len() - n..].iter().map(|x| x.3).collect::<Vec<_>>())
 }
@@ -234,6 +249,8 @@ fn message(ev: &Value) -> Option<String> {
         "error" => format!("⚠️ {nm} {coin}: {}", ev["error"].as_str().unwrap_or("ошибка")),
         "signal" if !crate::notify::PAPER_TO_CHAT => return None,
         "signal" => format!("🗜 сигнал: {nm} {coin} по {} (проба окончена, без сделки)", f("px")),
+        "weekend" if !crate::notify::PAPER_TO_CHAT => return None,
+        "weekend" => format!("🗜 {nm} {coin} по {}: пропущен — свеча закрылась в выходные (в выходные не входим)", f("px")),
         "own_off" => format!("🗜 {nm} {coin} по {}: пропущен — свои бумажные сделки за {:.0} дн. {:+.1}R ({:.0} шт.), вход только после своего минуса",
             f("px"), f("days"), f("own_r"), f("papers")),
         _ => return None,
@@ -323,6 +340,12 @@ impl Squeeze {
                 cands.push((coin, b));
             }
             let own_ok = look == 0 || own < 0.0;
+            if self.p.no_weekend && weekend_close(bar) && !cands.is_empty() {
+                log!("{}: {} breakout(s) on a candle closing on the weekend: no entries", self.p.kind, cands.len());
+                for (coin, b) in std::mem::take(&mut cands) {
+                    self.k.event(json!({"what": "weekend", "coin": coin, "px": b[b.len() - 1].3}));
+                }
+            }
             if look > 0 {
                 log!("{}: its paper trades closed in the last {:.0} days: {papers}, {own:+.1} R: new entries {}", self.p.kind, self.p.own_days, if own_ok { "on (under 0)" } else { "off" });
             }
@@ -566,7 +589,8 @@ mod lifecycle {
         f.set_volume("SQE", 50e6);
         f.with(|x| x.account_value = Some(0.0));
         let (store, mut rx) = Store::for_test();
-        let p = Params::short_from_env();
+        let mut p = Params::short_from_env();
+        p.no_weekend = false; // the bar is today's; the weekend rule's own test below
         let v = crate::sub::venue(&f.venue()).unwrap();
         let mut s = Squeeze { k: Keeper::new(v, false, cfg(), store, p.kind, message, HeldIn::Days), p, state: State::default(),
             sub: Some(Some(crate::sub::Mover::for_test(&f.base, crate::testkit::ACCOUNT))) };
@@ -620,6 +644,32 @@ mod lifecycle {
 mod candles {
     use super::*;
     use crate::testkit::{FakeHl, cfg};
+
+    #[tokio::test]
+    async fn the_weekend_rule_and_the_floors() {
+        // 2026-11-21 was a Saturday: the candle 16:00-20:00 Friday 11-20 closes on Friday, 20:00-24:00 on Saturday 00:00
+        let fri = 1_795_132_800.0; // 2026-11-20 00:00 UTC, a Friday
+        assert!(!weekend_close(fri + 16.0 * 3600.0) && weekend_close(fri + 20.0 * 3600.0));
+        assert!(weekend_close(fri + 2.0 * 86_400.0 + 16.0 * 3600.0) && !weekend_close(fri + 2.0 * 86_400.0 + 20.0 * 3600.0), "Sunday's last candle closes on Monday");
+        let (l, s) = (Params::from_env(), Params::short_from_env());
+        assert!(l.no_weekend && s.no_weekend);
+        assert_eq!((l.min_vol, s.min_vol), (10e6, 5e6));
+        // a breakdown on a candle closing on the weekend: told, not traded
+        let f = FakeHl::start(&[("SQW", 2, 10, 97.0)]).await;
+        f.set_volume("SQW", 50e6);
+        let (store, mut rx) = Store::for_test();
+        let mut s = Squeeze { k: Keeper::new(f.venue(), false, cfg(), store, s.kind, message, HeldIn::Days), p: s, state: State::default(), sub: None };
+        let bar = fri + 20.0 * 3600.0;
+        let mut c: Vec<f64> = (0..545).map(|i| if i % 2 == 0 { 90.0 } else { 110.0 }).collect();
+        c.extend((0..300).map(|i| 100.0 + if i % 2 == 0 { 0.1 } else { -0.1 }));
+        c.push(97.0);
+        let t0 = bar - (c.len() - 1) as f64 * BAR;
+        f.set_candles("SQW", "4h", &c.iter().enumerate().map(|(i, x)| (t0 + i as f64 * BAR, *x, x * 1.001, x * 0.999, *x, 1.0)).collect::<Vec<_>>());
+        s.step(bar).await;
+        let ev = crate::store::drain(&mut rx);
+        assert!(ev.iter().any(|e| e["what"] == "weekend" && e["coin"] == "SQW"), "{ev:?}");
+        assert!(!ev.iter().any(|e| e["what"] == "open") && s.state.open.is_empty() && f.position("SQW") == 0.0);
+    }
 
     #[tokio::test]
     async fn the_closed_4h_candles_only() {

@@ -393,12 +393,17 @@ impl crate::runner::Strategy for Dip {
     }
 }
 
+/// The start's health check sent once all is seen, or this long after the start (what is missing then told).
+const HEALTH_WAIT_S: f64 = 300.0;
+
 impl Dip {
     /// A tick (every 250 ms): the start's health check once, the volumes and the account as due, the day's note, the
     /// books' mids into the minute's closes, the regime's sample; the minute that closed: its signals; the exits due.
     async fn tick(&mut self) {
         let t = now();
-        if !self.checked && (self.health_ready() || t - self.started > 120.0) {
+        // the books' stream comes up 2.5-3 min after a start (2026-11-18 .. 23: micro's start 1:45-3:07 after the bot's): the
+        // check waits up to 5 min, or it told "0 coins in the books, no BTC price" on every deploy
+        if !self.checked && (self.health_ready() || t - self.started > HEALTH_WAIT_S) {
             self.checked = true;
             let h = self.health();
             log!("dip: {}", h.replace('\n', " | "));

@@ -271,6 +271,13 @@ pub(crate) fn non_equity(coin: &str) -> bool {
     coin.split_once(':').is_some_and(|(d, n)| DEXES.contains(&d) && (EXCLUDED.contains(&n) || off_category(coin)))
 }
 
+/// The earnings half hour after the US close: Mon-Fri 16:00 .. 16:30 New York time (the wick's US-stock bids off; see wick.rs).
+pub(crate) fn us_earnings(minute: i64) -> bool {
+    let et = minute - if us_dst(minute.div_euclid(1440)) { 240 } else { 300 };
+    let (wd, m) = ((et.div_euclid(1440) + 3).rem_euclid(7), et.rem_euclid(1440));
+    wd <= 4 && (960..990).contains(&m)
+}
+
 /// The US market shut: the UTC weekend, the US weeknights, Sunday night in New York.
 pub(crate) fn us_shut(minute: i64) -> bool {
     weekend(minute) || us_night(minute) || us_sunday_night(minute)
@@ -524,6 +531,17 @@ mod hours_tests {
         assert!(weekend(at(2026, 11, 7, 0, 0)));      // Sat
         assert!(weekend(at(2026, 11, 8, 23, 59)));    // Sun
         assert!(!weekend(at(2026, 11, 9, 0, 0)));     // Mon
+    }
+
+    #[test]
+    fn the_earnings_half_hour_is_16_00_to_16_30_new_york_on_weekdays() {
+        assert!(us_earnings(at(2026, 11, 17, 21, 7)));     // Tue 16:07 EST (xyz:AAOI's fill)
+        assert!(!us_earnings(at(2026, 11, 17, 20, 59)));   // 15:59
+        assert!(!us_earnings(at(2026, 11, 17, 21, 30)));   // 16:30
+        assert!(us_earnings(at(2026, 8, 12, 20, 5)));      // Wed 16:05 EDT (summer time)
+        assert!(!us_earnings(at(2026, 8, 12, 21, 5)));     // 17:05 EDT
+        assert!(us_earnings(at(2026, 11, 20, 21, 0)));     // Fri
+        assert!(!us_earnings(at(2026, 11, 21, 21, 0)));    // Sat
     }
 
     #[test]

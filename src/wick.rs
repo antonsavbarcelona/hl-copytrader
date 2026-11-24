@@ -222,6 +222,16 @@ const H3_BRK_OFF_S: f64 = 3600.0;
 /// HIP-3 dex: after a 15-minute fall of 10-20% n 16 +1.8%, 20-30% n 4 +4.0%, 30% or more none (the rule costs nothing there).
 const KNIFE_PCT: f64 = 0.30;
 const KNIFE_MIN: i64 = 15;
+
+/// The earnings half hour (2026-11-24, the user's OK): no US-stock bid on any rung Mon-Fri 16:00 .. 16:30 New York time
+/// (`wkd::us_earnings`; the resting ones cancelled, back at 16:30; the open trades keep their stops) - the reports come out at
+/// the close, the fall is the company's, not a book's hole: 2026-11-17 xyz:AAOI's 4% bid filled 16:07 ET, -8.4% in its hour (-$78).
+/// HL 1m 2025-11 .. 2026-10 (night/h3hours2.py), the main bid on the US stocks: 16:00-16:30 n 46 +0.43% a trade, 59% up, the
+/// 2nd half -0.03%, w/o its best 3 stocks -14% (4 of the 12 worst fills: CBRS / WDC / AVGO 16:02-16:15); 16:30-20:00 n 30 +1.22%,
+/// the session +1.34%, the open +2.17%. The cost: ~+20% of the US stocks' ~+900% sum (the window picked on the same data).
+fn earnings_off(coin: &str, minute: i64) -> bool {
+    crate::wkd::us_stock(coin) && crate::wkd::us_earnings(minute)
+}
 /// A resting order whose wanted size moved this much (the equity's change: a deposit, a drawdown) is placed again at it.
 const RESIZE_X: f64 = 0.10;
 const BTC_MAX_MINUTE: f64 = 0.01;
@@ -701,6 +711,7 @@ impl Wick {
             if !self.h3_picked.iter().any(|x| x == c) { return "unpicked"; }
             if !self.h3_ok() { return "h3 breaker"; }
             if self.knifed(c, minute) { return "knife"; }
+            if earnings_off(c, minute) { return "earnings"; }
             if self.p.shut_pct(c, minute).map_or(n_h3 >= self.p.h3_max_open, |_| n_shut >= self.p.shut_max_open) { return "slots"; }
             if !trades::trial_open(self.p.trial, self.state.h3_opened) { return "trial"; }
         } else {
@@ -811,7 +822,7 @@ impl Wick {
         if self.p.h3_max_coins > 0 && self.h3_ok() && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in self.h3_picked.clone() {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
-                if self.knifed(&c, minute) {
+                if self.knifed(&c, minute) || earnings_off(&c, minute) {
                     continue;
                 }
                 // the non-equity names while the US market is shut: their own level, the shut-hours slots
@@ -862,7 +873,7 @@ impl Wick {
         if (self.p.deep_pct > 0.0 || self.p.h3_session_deep_pct > 0.0) && n_h3 < self.p.deep_max_open && self.h3_ok() && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in &self.h3_picked {
                 let Some(close) = self.closes.at(c, minute - 1) else { continue };
-                if !free(c) || !self.h3_full(c) || self.knifed(c, minute) {
+                if !free(c) || !self.h3_full(c) || self.knifed(c, minute) || earnings_off(c, minute) {
                     continue;
                 }
                 if self.p.shut_pct(c, minute).is_some() {
@@ -2310,7 +2321,7 @@ mod crash_tests {
     async fn a_hip3_coin_down_30_pct_in_15_minutes_gets_no_bid_a_25_pct_fall_still_does() {
         trades::family_fits(true);
         let (_f, mut w, _rx) = setup(&[("xyz:WKN", 2, 10, 100.0), ("xyz:WKO", 2, 10, 100.0), ("xyz:WKP", 2, 10, 100.0)]).await;
-        let minute = (now() / 60.0) as i64;
+        let minute = 1_794_409_200 / 60; // a Wednesday 15:00 UTC (10:00 ET: the session, not the earnings half hour)
         w.closes = Closes::default();
         for m in minute - 20..minute {
             // WKN: 100 then 64 (-36%) the minute before; WKO: 100 then 75 (-25%); WKP: -36% but its top 20 minutes ago
@@ -2325,6 +2336,26 @@ mod crash_tests {
         assert!(!want.contains_key("xyz:WKN") && want.contains_key("xyz:WKO") && want.contains_key("xyz:WKP"), "{want:?}");
         assert!(!w.wanted_deep(minute).contains_key("xyz:WKN"));
         assert_eq!(w.why_not("xyz:WKN", minute), "knife");
+    }
+
+    #[tokio::test]
+    async fn no_us_stock_bid_in_the_earnings_half_hour_after_the_close_back_at_16_30() {
+        trades::family_fits(true);
+        let (_f, mut w, _rx) = setup(&[("xyz:WEA", 2, 10, 100.0), ("xyz:WEB", 2, 10, 100.0)]).await;
+        let at = 1_794_949_620 / 60; // Tue 2026-11-17 21:07 UTC = 16:07 EST (xyz:AAOI's fill)
+        let later = at + 23; // 16:30
+        for m in [at - 1, later - 1] {
+            for c in ["xyz:WEA", "xyz:WEB"] {
+                w.closes.update(c, m, 100.0, HIST);
+            }
+        }
+        w.h3_volume = HashMap::from([("xyz:WEA".to_string(), 2e6), ("xyz:WEB".to_string(), 2e6)]);
+        w.h3_picked = vec!["xyz:WEA".into(), "xyz:WEB".into()];
+        assert!(crate::wkd::us_stock("xyz:WEA") && crate::wkd::us_earnings(at) && !crate::wkd::us_earnings(later));
+        let (b, d) = (w.wanted(at), w.wanted_deep(at));
+        assert!(!b.keys().any(|c| c.contains(':')) && !d.keys().any(|c| c.contains(':')), "{b:?} {d:?}");
+        assert_eq!(w.why_not("xyz:WEA", at), "earnings");
+        assert!(w.wanted(later).contains_key("xyz:WEA") && w.wanted(later).contains_key("xyz:WEB"));
     }
 
     #[tokio::test]

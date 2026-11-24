@@ -215,6 +215,13 @@ const INDEX_OUT_PCT: f64 = 0.005;
 const H3_BRK_FILLS: usize = 2;
 const H3_BRK_WINDOW_S: f64 = 60.0;
 const H3_BRK_OFF_S: f64 = 3600.0;
+/// The falling knife (2026-11-24, para:ANSEM): a HIP-3 coin whose minute before's close is `KNIFE_PCT` or more under its highest
+/// close of the last `KNIFE_MIN` minutes gets no bid on any rung (the resting ones cancelled) - the coin's own collapse, not a
+/// book's hole: ANSEM 0.0365 -> 0.0185 in 4 minutes, the 4% bid re-anchored down each minute, filled at -44% from the top,
+/// stopped -21% a minute later (-$91). HL 1m 2025-11 .. 2026-10 (night/h3knife.py), 1045 fills of the main HIP-3 bid on every
+/// HIP-3 dex: after a 15-minute fall of 10-20% n 16 +1.8%, 20-30% n 4 +4.0%, 30% or more none (the rule costs nothing there).
+const KNIFE_PCT: f64 = 0.30;
+const KNIFE_MIN: i64 = 15;
 /// A resting order whose wanted size moved this much (the equity's change: a deposit, a drawdown) is placed again at it.
 const RESIZE_X: f64 = 0.10;
 const BTC_MAX_MINUTE: f64 = 0.01;
@@ -693,6 +700,7 @@ impl Wick {
         if h3 {
             if !self.h3_picked.iter().any(|x| x == c) { return "unpicked"; }
             if !self.h3_ok() { return "h3 breaker"; }
+            if self.knifed(c, minute) { return "knife"; }
             if self.p.shut_pct(c, minute).map_or(n_h3 >= self.p.h3_max_open, |_| n_shut >= self.p.shut_max_open) { return "slots"; }
             if !trades::trial_open(self.p.trial, self.state.h3_opened) { return "trial"; }
         } else {
@@ -803,6 +811,9 @@ impl Wick {
         if self.p.h3_max_coins > 0 && self.h3_ok() && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in self.h3_picked.clone() {
                 let Some(close) = self.closes.at(&c, minute - 1) else { continue };
+                if self.knifed(&c, minute) {
+                    continue;
+                }
                 // the non-equity names while the US market is shut: their own level, the shut-hours slots
                 let noneq = self.p.noneq_shut_pct > 0.0 && crate::wkd::non_equity(&c) && crate::wkd::us_shut(minute);
                 let shut = if !self.h3_full(&c) {
@@ -821,6 +832,13 @@ impl Wick {
             }
         }
         out
+    }
+
+    /// The coin's minute before's close `KNIFE_PCT` or more under its highest close of the `KNIFE_MIN` minutes to it (see the const).
+    fn knifed(&self, c: &str, minute: i64) -> bool {
+        let (Some(q), Some(last)) = (self.closes.0.get(c), self.closes.at(c, minute - 1)) else { return false };
+        let hi = q.iter().filter(|(m, _)| *m >= minute - 1 - KNIFE_MIN && *m <= minute - 1).map(|x| x.1).fold(0.0, f64::max);
+        hi > 0.0 && last / hi - 1.0 <= -KNIFE_PCT
     }
 
     /// A picked HIP-3 coin with `h3_full_vol` or more a day: every HIP-3 rung, not the plain bid only.
@@ -844,7 +862,7 @@ impl Wick {
         if (self.p.deep_pct > 0.0 || self.p.h3_session_deep_pct > 0.0) && n_h3 < self.p.deep_max_open && self.h3_ok() && trades::trial_open(self.p.trial, self.state.h3_opened) {
             for c in &self.h3_picked {
                 let Some(close) = self.closes.at(c, minute - 1) else { continue };
-                if !free(c) || !self.h3_full(c) {
+                if !free(c) || !self.h3_full(c) || self.knifed(c, minute) {
                     continue;
                 }
                 if self.p.shut_pct(c, minute).is_some() {
@@ -2286,6 +2304,27 @@ mod crash_tests {
         // over a restart the breaker holds (the state's)
         let s: State = serde_json::from_value(serde_json::to_value(&w.state).unwrap()).unwrap();
         assert_eq!(s.h3_off_until, w.state.h3_off_until);
+    }
+
+    #[tokio::test]
+    async fn a_hip3_coin_down_30_pct_in_15_minutes_gets_no_bid_a_25_pct_fall_still_does() {
+        trades::family_fits(true);
+        let (_f, mut w, _rx) = setup(&[("xyz:WKN", 2, 10, 100.0), ("xyz:WKO", 2, 10, 100.0), ("xyz:WKP", 2, 10, 100.0)]).await;
+        let minute = (now() / 60.0) as i64;
+        w.closes = Closes::default();
+        for m in minute - 20..minute {
+            // WKN: 100 then 64 (-36%) the minute before; WKO: 100 then 75 (-25%); WKP: -36% but its top 20 minutes ago
+            let k = m >= minute - 3;
+            w.closes.update("xyz:WKN", m, if k { 64.0 } else { 100.0 }, HIST);
+            w.closes.update("xyz:WKO", m, if k { 75.0 } else { 100.0 }, HIST);
+            w.closes.update("xyz:WKP", m, if m >= minute - 17 { 64.0 } else { 100.0 }, HIST);
+        }
+        w.h3_picked = vec!["xyz:WKN".into(), "xyz:WKO".into(), "xyz:WKP".into()];
+        assert!(w.knifed("xyz:WKN", minute) && !w.knifed("xyz:WKO", minute) && !w.knifed("xyz:WKP", minute));
+        let want = w.wanted(minute);
+        assert!(!want.contains_key("xyz:WKN") && want.contains_key("xyz:WKO") && want.contains_key("xyz:WKP"), "{want:?}");
+        assert!(!w.wanted_deep(minute).contains_key("xyz:WKN"));
+        assert_eq!(w.why_not("xyz:WKN", minute), "knife");
     }
 
     #[tokio::test]

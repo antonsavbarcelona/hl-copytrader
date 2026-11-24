@@ -37,6 +37,8 @@ const HIST_S: f64 = 7200.0;
 /// The 2026-11-18 withdrawal taken off by the dollars (the saved hwm, flows): its peak moved in proportion once, the
 /// equity before it $9,049.41 ($4,047.41 after + $5,002 out).
 const FIX_2026_11_18: (f64, f64, f64) = (9607.36008537, -5002.0, 9049.41);
+/// The 2026-11-24 withdrawal taken off by the dollars (the saved hwm, the flows after it, the flow, the equity before it).
+const FIX_2026_11_24: (f64, f64, f64, f64) = (14567.359532, -12006.0, -2002.0, 4197.809941);
 
 /// What the guard keeps over a restart.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -98,8 +100,13 @@ impl Guard {
 
     /// The peak moved by a flow `x` at `t` in proportion to the equity it moved (`hwm` set so the peak is `P x (E + x) / E`
     /// with the flow in); without an equity read `FLOW_PRE_S` before it, by the dollars.
-    fn scale_peak(&mut self, t: f64, x: f64) {
-        let e = self.hist.iter().filter(|(at, _)| *at <= t - FLOW_PRE_S).map(|x| x.1).next_back();
+    fn scale_peak(&mut self, t: f64, x: f64, later: &[(f64, f64)]) {
+        // without a reading before it (2026-11-24: $2,002 out, the bot restarted 2 minutes on, its readings gone): the first
+        // reading after it net of the flows up to that reading (this one's and the batch's later ones)
+        let e = self.hist.iter().filter(|(at, _)| *at <= t - FLOW_PRE_S).map(|x| x.1).next_back().or_else(|| {
+            let &(at, eq) = self.hist.iter().find(|(at, _)| *at >= t)?;
+            Some(eq - x - later.iter().filter(|(s, _)| *s <= at).map(|f| f.1).sum::<f64>())
+        });
         let p = self.peak();
         if let Some(e) = e.filter(|e| *e > 0.0 && e + x > 0.0 && p > 0.0) {
             self.s.hwm = p * (e + x) / e - (self.s.flows + x);
@@ -117,14 +124,27 @@ impl Guard {
         true
     }
 
+    /// The 2026-11-24 withdrawal's peak moved in proportion, once (`FIX_2026_11_24`): $2,002 out at 10:40-10:41 UTC, the bot
+    /// restarted 10:43 without a reading before it, so by the dollars ($4,563 -> $2,561, the equity $2,196 read 14.3% under: the
+    /// risk cut); in proportion to the equity before it ($4,197.81) the peak is $2,387, 8.0% under.
+    fn fix_2026_11_24(&mut self) -> bool {
+        let (hwm, flows, out, e) = FIX_2026_11_24;
+        if (self.s.hwm - hwm).abs() > 0.01 || (self.s.flows - flows).abs() > 0.01 {
+            return false;
+        }
+        let before = hwm + flows - out; // the peak before the flow
+        self.s.hwm = before * (e + out) / e - flows;
+        true
+    }
+
     /// The flows (ms, $) read from the ledger up to `upto_ms`.
     fn flowed(&mut self, flows: &[(f64, f64)], upto_ms: f64) {
-        for &(ms, x) in flows {
-            if ms > self.s.ledger_ms {
-                self.scale_peak(ms / 1000.0, x);
-                self.s.flows += x;
-                self.recent.push((ms / 1000.0, x));
-            }
+        // the flows not seen yet (s, $)
+        let new: Vec<(f64, f64)> = flows.iter().filter(|(ms, _)| *ms > self.s.ledger_ms).map(|&(ms, x)| (ms / 1000.0, x)).collect();
+        for (k, &(t, x)) in new.iter().enumerate() {
+            self.scale_peak(t, x, &new[k + 1..]);
+            self.s.flows += x;
+            self.recent.push((t, x));
         }
         self.s.ledger_ms = self.s.ledger_ms.max(upto_ms);
         let t = upto_ms / 1000.0;
@@ -294,6 +314,9 @@ pub(crate) async fn start(cfg: &Config, store: Store, api: Api) -> anyhow::Resul
         if g.fix_2026_11_18() {
             log!("guard: the 2026-11-18 withdrawal's peak moved in proportion: peak ${:.0}", g.peak());
         }
+        if g.fix_2026_11_24() {
+            log!("guard: the 2026-11-24 withdrawal's peak moved in proportion: peak ${:.0}", g.peak());
+        }
         log!("guard: peak net ${:.0}, flows ${:.0}, risk {}", g.s.hwm, g.s.flows, if g.s.cut { "cut" } else { "full" });
     });
     let cfg = cfg.clone();
@@ -419,6 +442,34 @@ mod tests {
         // old readings leave the history
         y.seen(140.0 + HIST_S + 1.0, 4_500.0);
         assert_eq!(y.hist.len(), 1);
+    }
+
+    #[test]
+    fn without_a_reading_before_a_flow_the_first_one_after_it_net_of_the_flows_moves_the_peak_in_proportion() {
+        // 2026-11-24: a restart after $2 + $2,000 out, its first reading $2,196 after both: the equity before $4,198
+        let mut x = g(4_563.36, 0.0);
+        x.seen(200.0, 2_196.0);
+        x.flowed(&[(100_000.0, -2.0), (110_000.0, -2000.0)], 300_000.0);
+        let p = 4_563.36 * (4_196.0 / 4_198.0) * (2_196.0 / 4_196.0);
+        assert!((x.peak() - p).abs() < 0.01, "{} vs {p}", x.peak());
+        assert!((x.dd() - (1.0 - 2_196.0 / p)).abs() < 1e-9 && x.dd() < CUT_DD, "{}", x.dd());
+        // no reading at all: by the dollars as before
+        let mut y = g(4_563.36, 0.0);
+        y.flowed(&[(100_000.0, -2002.0)], 300_000.0);
+        assert!((y.peak() - 2_561.36).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_2026_11_24_withdrawal_is_moved_once() {
+        let mut x = g(FIX_2026_11_24.0, FIX_2026_11_24.1);
+        assert!((x.peak() - 2_561.36).abs() < 0.01);
+        assert!(x.fix_2026_11_24());
+        assert!((x.peak() - 2_387.0).abs() < 1.0, "{}", x.peak());
+        x.s.cut = true;
+        x.seen(1.0, 2_195.81);
+        assert!((x.dd() - 0.080).abs() < 0.001, "{}", x.dd());
+        assert_eq!((x.decide(), x.decide()), (None, Some(false)));
+        assert!(!x.fix_2026_11_24());
     }
 
     #[test]

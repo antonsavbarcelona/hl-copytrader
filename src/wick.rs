@@ -175,10 +175,11 @@ fn rung_risk_at(coin: &str, rung: usize, shut: bool, base: f64, pct: f64, eq: f6
 const POLL_S: f64 = 5.0;
 const ORDERS_EVERY_S: f64 = 15.0;
 /// The account's positions against the strategies' trades: every minute; one no strategy holds for `ORPHAN_AFTER_S`
-/// (a fresh trade registers within seconds) is told on Telegram, again every `ORPHAN_AGAIN_S` while it stays; not in
+/// (a fresh trade registers within seconds) is closed at market and told on Telegram (2026-11-24: every one of the 12 told
+/// 2026-11-02 .. 24 was the bot's own fill left unregistered, LITE / HIMS / SOXL / ANSEM), again every `ORPHAN_AGAIN_S` while it stays; not in
 /// the first `ORPHAN_BOOT_S` (the modules registering their trades as they start).
 const ORPHANS_EVERY_S: f64 = 60.0;
-const ORPHAN_AFTER_S: f64 = 180.0;
+const ORPHAN_AFTER_S: f64 = 90.0;
 const ORPHAN_AGAIN_S: f64 = 6.0 * 3_600.0;
 const ORPHAN_BOOT_S: f64 = 300.0;
 const VOLUME_EVERY_S: f64 = 300.0;
@@ -1214,9 +1215,21 @@ impl Wick {
             let (first, told) = *self.orphans.entry(c.clone()).or_insert((t, 0.0));
             if t - first >= ORPHAN_AFTER_S && t - told >= ORPHAN_AGAIN_S {
                 let px = self.closes.at(&c, i64::MAX).unwrap_or(0.0);
-                crate::notify::send(format!("🚨 НЕСАНКЦИОНИРОВАННАЯ СДЕЛКА: {c} {} {:.6} (~${:.0}) — ни одна стратегия бота её не ведёт: нет стопа, тейка и выхода по времени. Проверь и закрой руками.",
-                    if size > 0.0 { "лонг" } else { "шорт" }, size.abs(), size.abs() * px));
-                self.trace(json!({"what": "orphan", "coin": c, "size": size, "px": px, "first_seen": first, "t_done": t}));
+                let side = if size > 0.0 { "лонг" } else { "шорт" };
+                // closed at market (2026-11-24, the user's call: "сразу закрывать, вдруг я спать буду"; para:ANSEM's part
+                // filled before its move, the moved order's status behind, held 11 min with no stop); a failed close told
+                match self.venue.market(&c, -size, true).await {
+                    Ok((done, out_px, _)) => {
+                        crate::notify::send(format!("🚨 ЧУЖАЯ ПОЗИЦИЯ ЗАКРЫТА ПО РЫНКУ: {c} {side} {:.6} (~${:.0}) по {} — ни одна стратегия бота её не вела (нет стопа, тейка и выхода по времени).",
+                            done.abs(), done.abs() * out_px, crate::notify::px(out_px)));
+                        self.trace(json!({"what": "orphan", "coin": c, "size": size, "px": px, "first_seen": first, "t_done": now(), "closed": done, "out_px": out_px}));
+                    }
+                    Err(e) => {
+                        crate::notify::send(format!("🚨 НЕСАНКЦИОНИРОВАННАЯ СДЕЛКА: {c} {side} {:.6} (~${:.0}) — ни одна стратегия бота её не ведёт, закрыть по рынку не вышло ({e:#}). Закрой руками.",
+                            size.abs(), size.abs() * px));
+                        self.trace(json!({"what": "orphan", "coin": c, "size": size, "px": px, "first_seen": first, "t_done": now(), "error": format!("{e:#}")}));
+                    }
+                }
                 self.orphans.insert(c, (first, t));
             }
         }
@@ -2315,6 +2328,30 @@ mod crash_tests {
         // over a restart the breaker holds (the state's)
         let s: State = serde_json::from_value(serde_json::to_value(&w.state).unwrap()).unwrap();
         assert_eq!(s.h3_off_until, w.state.h3_off_until);
+    }
+
+    #[tokio::test]
+    async fn a_position_no_strategy_holds_is_closed_at_market_after_90_s_a_registered_one_stays() {
+        trades::family_fits(true);
+        let (f, mut w, mut rx) = setup(&[("xyz:WOA", 2, 10, 100.0), ("xyz:WOB", 2, 10, 100.0)]).await;
+        w.boot = now() - ORPHAN_BOOT_S - 1.0;
+        // WOA: the bot's own fill left unregistered; WOB: a strategy's trade
+        crate::trades::open_market(&f.venue(), "xyz:WOA", 2.0, 0.2, None, 3600.0).await.unwrap();
+        let tr = crate::trades::open_market(&f.venue(), "xyz:WOB", 2.0, 0.2, None, 3600.0).await.unwrap();
+        crate::trades::register("xyz:WOB", "wick", tr.risk(), tr.size);
+        assert!(f.position("xyz:WOA") > 0.0 && f.position("xyz:WOB") > 0.0);
+        // first seen now: not yet
+        w.watch_orphans().await;
+        assert!(f.position("xyz:WOA") > 0.0);
+        // seen 90 s ago: closed at market, told
+        w.orphans.insert("xyz:WOA".into(), (now() - ORPHAN_AFTER_S - 1.0, 0.0));
+        w.watch_orphans().await;
+        assert_eq!(f.position("xyz:WOA"), 0.0);
+        assert!(f.position("xyz:WOB") > 0.0, "a registered trade stays");
+        let ev = crate::store::drain(&mut rx);
+        let o = ev.iter().find(|e| e["what"] == "orphan").expect("traced");
+        assert!(o["closed"].as_f64().unwrap() != 0.0 && o["coin"] == "xyz:WOA", "{o}");
+        assert!(!ev.iter().any(|e| e["what"] == "orphan" && e["coin"] == "xyz:WOB"));
     }
 
     #[tokio::test]

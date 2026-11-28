@@ -63,6 +63,62 @@ fn watched() -> HashMap<String, (f64, f64)> {
     WATCH.lock().unwrap().clone().unwrap_or_default()
 }
 
+/// The coins whose trades are summed a minute only (the wick's crypto coins besides the picks: the low-volume ones, the majors).
+static VOL_WATCH: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// A coin's traded $ a minute from its trades stream: since when it is summed (the subscription, ms), the last minutes.
+#[derive(Default)]
+struct MinuteUsd {
+    since_ms: u64,
+    mins: std::collections::VecDeque<(u64, f64)>,
+}
+static MINUTE_USD: Mutex<Option<HashMap<String, MinuteUsd>>> = Mutex::new(None);
+const MINUTES_KEPT: usize = 5;
+
+/// The coins to sum the trades of besides `set_watch`'s.
+pub(crate) fn set_vol_watch(coins: HashSet<String>) {
+    *VOL_WATCH.lock().unwrap() = Some(coins);
+}
+
+/// The coin's trades summed from `ms` on (a fresh subscription: what came before is not counted).
+pub(crate) fn usd_from(coin: &str, ms: u64) {
+    MINUTE_USD.lock().unwrap().get_or_insert_with(Default::default).insert(coin.to_string(), MinuteUsd { since_ms: ms, mins: Default::default() });
+}
+
+/// A trade of the coin: its $ added to its minute (before the summing's start: left out).
+pub(crate) fn note_trade(coin: &str, ms: u64, usd: f64) {
+    let mut g = MINUTE_USD.lock().unwrap();
+    let Some(st) = g.get_or_insert_with(Default::default).get_mut(coin) else { return };
+    if ms < st.since_ms {
+        return;
+    }
+    let m = ms / 60_000;
+    match st.mins.iter_mut().find(|x| x.0 == m) {
+        Some(x) => x.1 += usd,
+        None => {
+            st.mins.push_back((m, usd));
+            st.mins.make_contiguous().sort_by_key(|x| x.0);
+            while st.mins.len() > MINUTES_KEPT {
+                st.mins.pop_front();
+            }
+        }
+    }
+}
+
+/// The coin's traded $ in `minute` (no trade in it: 0); None when the minute was not summed whole (not subscribed from its start,
+/// or older than the minutes kept).
+pub(crate) fn minute_usd(coin: &str, minute: i64) -> Option<f64> {
+    let g = MINUTE_USD.lock().unwrap();
+    let st = g.as_ref()?.get(coin)?;
+    let m = u64::try_from(minute).ok()?;
+    if m * 60_000 < st.since_ms {
+        return None;
+    }
+    match st.mins.iter().find(|x| x.0 == m) {
+        Some(x) => Some(x.1),
+        None => st.mins.front().is_none_or(|f| m > f.0).then_some(0.0),
+    }
+}
+
 struct Shadow {
     coin: String,
     t_ms: u64,
@@ -130,11 +186,13 @@ pub(crate) fn spawn(store: Store, account: String, stop: f64, hold_s: f64) {
                         });
                         let mut want: HashSet<String> = watched().into_keys().collect();
                         want.extend(shadows.iter().map(|s| s.coin.clone()));
+                        want.extend(VOL_WATCH.lock().unwrap().clone().unwrap_or_default());
                         for c in want.difference(&subs.clone()).cloned().collect::<Vec<_>>() {
                             for t in ["trades", "activeAssetCtx"] {
                                 ok &= sink.send(Message::Text(json!({"method": "subscribe", "subscription": {"type": t, "coin": c}}).to_string())).await.is_ok();
                             }
                             coins.entry(c.clone()).or_default().subscribed_ms = now_ms;
+                            usd_from(&c, now_ms);
                             subs.insert(c);
                         }
                         for c in subs.difference(&want).cloned().collect::<Vec<_>>() {
@@ -143,6 +201,7 @@ pub(crate) fn spawn(store: Store, account: String, stop: f64, hold_s: f64) {
                             }
                             subs.remove(&c);
                             coins.remove(&c);
+                            if let Some(m) = MINUTE_USD.lock().unwrap().as_mut() { m.remove(&c); }
                         }
                     }
                     m = tokio::time::timeout(Duration::from_secs(60), read.next()) => {
@@ -162,6 +221,7 @@ pub(crate) fn spawn(store: Store, account: String, stop: f64, hold_s: f64) {
                                     let (coin, px, ms) = (t["coin"].as_str().unwrap_or(""), num(&t["px"]), t["time"].as_u64().unwrap_or(0));
                                     let Some(st) = coins.get_mut(coin) else { continue };
                                     if px <= 0.0 { continue; }
+                                    note_trade(coin, ms, px * num(&t["sz"]));
                                     let minute = ms / 60_000;
                                     if minute > st.minute {
                                         if st.minute > 0 { st.prev = st.last; }

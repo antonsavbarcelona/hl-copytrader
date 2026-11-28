@@ -224,6 +224,42 @@ const H3_BRK_OFF_S: f64 = 3600.0;
 const KNIFE_PCT: f64 = 0.30;
 const KNIFE_MIN: i64 = 15;
 
+/// The volume spike (2026-11-28, the user's call, an insurance like the earnings half hour): a crypto coin whose minute before
+/// traded `SPIKE_X` times its median minute of the 24 h to it or more gets no bid on any rung (the resting ones cancelled; told
+/// "volume" in why_not) - a coin's own news / dump, not a book's hole: 2026-11-28 WLFI 04:30 UTC $335k in the minute against
+/// ~$1-3k, the 7% low-volume bid filled 04:32, -30% in the 04:36 minute, the stop slipped to -23% (-$50), its day $50M against
+/// ~$1-2M. HL 1m 2025-05 .. 2026-10 (volspike/vs2.py, port_vs.py; the HL tape's $ a minute, the bot's pick, the crash breaker):
+/// 366 crypto bids +2.41% a trade; at x100+ n 92 -0.01%, x300+ n 49 -1.16% (CASHCAT alone -107%), x1000+ n 17 -1.05%;
+/// the family portfolio (2%) +342% DD 46.8% worst day -15.2% -> x300 +356% DD 45.1% -13.0%, h1 +28 -> +30%, h2 +245 -> +248%,
+/// at DD 40% +272 -> +294% (x200 +254%, x500 +286%: noisy, not a proven edge). The minute's $ from the trades stream
+/// (`wickwatch::minute_usd`), the median from the coin's 24 h of 1m candles read hourly (`VOLMED_*`); either unknown: no check.
+const SPIKE_X: f64 = 300.0;
+/// One coin's median minute read this often, each again after `VOLMED_FRESH_S`, used up to `VOLMED_MAX_AGE_S`.
+const VOLMED_EVERY_S: f64 = 20.0;
+const VOLMED_FRESH_S: f64 = 3600.0;
+const VOLMED_MAX_AGE_S: f64 = 7200.0;
+/// The fewest minutes of candles the median is taken from.
+const VOLMED_MIN_MINUTES: i64 = 600;
+
+/// The median $ a minute of the 1440 minutes to `minute - 2` (the minute before left out; a minute with no candle: $0), the
+/// candles' $ = volume x close; None with under `VOLMED_MIN_MINUTES` minutes since the first candle.
+pub(crate) fn median_minute_usd(candles: &[crate::market::Candle], minute: i64) -> Option<f64> {
+    let (lo, hi) = (minute - 1441, minute - 2);
+    let first = candles.iter().map(|x| (x.t / 60.0).floor() as i64).filter(|m| *m <= hi).min()?;
+    if hi - first.max(lo) + 1 < VOLMED_MIN_MINUTES {
+        return None;
+    }
+    let mut v = vec![0.0; (hi - lo + 1) as usize];
+    for x in candles {
+        let m = (x.t / 60.0).floor() as i64;
+        if (lo..=hi).contains(&m) {
+            v[(m - lo) as usize] = x.v * x.c;
+        }
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() / 2])
+}
+
 /// The earnings half hour (2026-11-24, the user's OK): no US-stock bid on any rung Mon-Fri 16:00 .. 16:30 New York time
 /// (`wkd::us_earnings`; the resting ones cancelled, back at 16:30; the open trades keep their stops) - the reports come out at
 /// the close, the fall is the company's, not a book's hole: 2026-11-17 xyz:AAOI's 4% bid filled 16:07 ET, -8.4% in its hour (-$78).
@@ -667,6 +703,9 @@ struct Wick {
     ask_fills: Vec<f64>,
     /// The HIP-3 bids' fills seen in the last `H3_BRK_WINDOW_S` (the HIP-3 bids' breaker's count).
     h3_fills: Vec<f64>,
+    /// A crypto coin's median $ a minute of the last 24 h (the volume spike's): (read at, $).
+    vol_med: HashMap<String, (f64, f64)>,
+    volmed_every: Every,
     /// The loop's timers: the volumes (and the coins picked again), the oracles, the orders' check, the candles' backfill,
     /// every HIP-3 dex's mids, the orphans; the minute the levels were last placed for.
     vol_every: Every,
@@ -726,6 +765,7 @@ impl Wick {
         if self.held.get(c).is_some_and(|x| *x != 0.0) && !trades::family_holds(c) { return "held"; }
         if self.state.last_fill.get(c).is_some_and(|x| now() - x < AGAIN_AFTER_S) { return "after its fill"; }
         if !trades::can_open(c, "wick", 1.0, trades::risk_usd(self.p.risk_usd)) { return "family cap"; }
+        if !h3 && self.spiked(c, minute) { return "volume"; }
         if !h3 && self.hot(c, minute) { return "hot"; }
         "other"
     }
@@ -765,9 +805,37 @@ impl Wick {
 
     /// The coins to bid now and their levels.
     /// A crash on the coin already: the last hour's 1-minute deviation over `hot_x` times the day's (both to the
-    /// minute before; the day's from 600 minutes); unknown: not hot.
+    /// minute before; the day's from 600 minutes); unknown: not hot. A volume spike in the minute before (`spiked`): hot too
+    /// (every crypto rung checks this).
     fn hot(&self, coin: &str, minute: i64) -> bool {
-        is_hot(self.closes.spread(coin, minute - 1, 60, 30), self.closes.spread(coin, minute - 1, 1440, 600), self.p.hot_x)
+        self.spiked(coin, minute)
+            || is_hot(self.closes.spread(coin, minute - 1, 60, 30), self.closes.spread(coin, minute - 1, 1440, 600), self.p.hot_x)
+    }
+
+    /// The coin's minute before traded `SPIKE_X` times its median minute or more (see the const); either unknown: false.
+    fn spiked(&self, coin: &str, minute: i64) -> bool {
+        let Some(&(at, med)) = self.vol_med.get(coin) else { return false };
+        if now() - at > VOLMED_MAX_AGE_S {
+            return false;
+        }
+        crate::wickwatch::minute_usd(coin, minute - 1).is_some_and(|v| v >= SPIKE_X * med.max(1.0))
+    }
+
+    /// One crypto coin's median minute read (the picks, the low-volume ones, the majors; the one without, or the oldest past
+    /// `VOLMED_FRESH_S`).
+    async fn read_vol_med(&mut self, minute: i64) {
+        let t = now();
+        let mut coins: Vec<String> = self.picked.iter().chain(self.low_picked.iter()).cloned().collect();
+        coins.extend(MAJORS.iter().filter(|c| self.venue.coins.contains_key(**c)).map(|c| c.to_string()));
+        let Some(c) = coins.into_iter().filter(|c| self.vol_med.get(c).is_none_or(|x| t - x.0 >= VOLMED_FRESH_S))
+            .min_by(|a, b| self.vol_med.get(a).map_or(0.0, |x| x.0).total_cmp(&self.vol_med.get(b).map_or(0.0, |x| x.0))) else { return };
+        match crate::market::candles(&self.api, &c, "1m", t - 1445.0 * 60.0).await {
+            Ok(v) => match median_minute_usd(&v, minute) {
+                Some(m) => { self.vol_med.insert(c, (t, m)); }
+                None => { self.vol_med.remove(&c); }
+            },
+            Err(e) => log!("wick: {c} minute volumes not read: {e:#}"),
+        }
     }
 
     /// The crypto orders on: BTC calm and the crash breaker not tripped.
@@ -1076,6 +1144,10 @@ impl Wick {
         let mut watch: HashMap<String, (f64, f64)> = self.picked.iter().map(|c| (c.clone(), (self.p.pct, self.p.take))).collect();
         watch.extend(self.h3_picked.iter().map(|c| (c.clone(), (self.p.h3_pct, self.p.h3_take))));
         crate::wickwatch::set_watch(watch);
+        // The volume spike's other coins: their trades summed a minute only.
+        let mut vol: HashSet<String> = self.low_picked.iter().cloned().collect();
+        vol.extend(MAJORS.iter().filter(|c| self.venue.coins.contains_key(**c)).map(|c| c.to_string()));
+        crate::wickwatch::set_vol_watch(vol);
     }
 
     /// One coin's 24 h of 1-minute closes (the liquid ones without 6 h of them, the biggest first).
@@ -1917,7 +1989,7 @@ pub async fn start(cfg: &Config, store: Store, api: Api) -> Result<()> {
     }
     let w = Wick { venue, unified, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api, cfg: cfg.clone(), store, p, state, closes: Closes::default(), oracle: HashMap::new(),
         volume: HashMap::new(), h3_volume: HashMap::new(), held: HashMap::new(),
-        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(),
+        picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0, moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(), vol_med: HashMap::new(), volmed_every: Every::new(VOLMED_EVERY_S),
         vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S), last_minute: (now() / 60.0).floor() as i64 };
     crate::wickwatch::spawn(w.store.clone(), w.venue.account.clone(), w.p.stop, w.p.hold_s);
     crate::runner::spawn("wick", w);
@@ -1955,6 +2027,9 @@ impl Wick {
         }
         if self.p.by_spread && self.backfill_every.due(t) {
             self.backfill().await;
+        }
+        if self.volmed_every.due(t) {
+            self.read_vol_med(minute).await;
         }
         if self.orders_every.due(t) {
             self.check().await;
@@ -2198,7 +2273,7 @@ mod crash_tests {
         let w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(), vol_med: HashMap::new(), volmed_every: Every::new(VOLMED_EVERY_S), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         (f, w, rx)
     }
@@ -2375,6 +2450,52 @@ mod crash_tests {
         assert_eq!(w.why_not("xyz:WKN", minute), "knife");
     }
 
+    /// 2026-11-28 WLFI: a crypto coin whose minute before traded x300 its median minute gets no bid; under that, or the median
+    /// unknown / stale, or the minute not summed whole: bid as before.
+    #[tokio::test]
+    async fn a_crypto_coin_trading_300x_its_median_minute_gets_no_bid() {
+        trades::family_fits(true);
+        let (_f, mut w, _rx) = setup(&[("WVS", 2, 10, 100.0), ("WVN", 2, 10, 100.0), ("WVU", 2, 10, 100.0), ("WVO", 2, 10, 100.0)]).await;
+        let minute = (now() / 60.0).floor() as i64;
+        w.closes = Closes::default();
+        for c in ["BTC", "WVS", "WVN", "WVU", "WVO"] {
+            w.closes.update(c, minute - 1, 100.0, HIST);
+        }
+        let since = ((minute - 3) * 60_000) as u64;
+        for (c, usd) in [("WVS", 301_000.0), ("WVN", 250_000.0), ("WVU", 900_000.0), ("WVO", 900_000.0)] {
+            crate::wickwatch::usd_from(c, since);
+            crate::wickwatch::note_trade(c, ((minute - 1) * 60_000 + 5_000) as u64, usd);
+        }
+        w.vol_med.insert("WVS".into(), (now(), 1_000.0));
+        w.vol_med.insert("WVN".into(), (now(), 1_000.0));
+        w.vol_med.insert("WVO".into(), (now() - VOLMED_MAX_AGE_S - 1.0, 1_000.0)); // stale
+        w.picked = vec!["WVS".into(), "WVN".into(), "WVU".into(), "WVO".into()];
+        assert!(w.spiked("WVS", minute) && !w.spiked("WVN", minute) && !w.spiked("WVU", minute) && !w.spiked("WVO", minute));
+        let want = w.wanted(minute);
+        assert!(!want.contains_key("WVS") && want.contains_key("WVN") && want.contains_key("WVU") && want.contains_key("WVO"), "{want:?}");
+        assert_eq!(w.why_not("WVS", minute), "volume");
+        // the minute after with no trade: $0, no spike
+        assert_eq!(crate::wickwatch::minute_usd("WVS", minute), Some(0.0));
+        // a minute before the summing's start: unknown
+        assert_eq!(crate::wickwatch::minute_usd("WVS", minute - 4), None);
+    }
+
+    #[test]
+    fn the_median_minute_counts_a_minute_with_no_candle_as_0_and_leaves_the_minute_before_out() {
+        let c = |m: i64, usd: f64| crate::market::Candle { t: (m * 60) as f64, o: 1.0, h: 1.0, l: 1.0, c: 2.0, v: usd / 2.0 };
+        let minute = 100_000;
+        // candles on 900 of the 1440 minutes at $10, the minute before $1M: the median $10
+        let mut v: Vec<_> = (minute - 1441..minute - 1441 + 900).map(|m| c(m, 10.0)).collect();
+        v.push(c(minute - 1, 1e6));
+        assert_eq!(median_minute_usd(&v, minute), Some(10.0));
+        // candles on 500 of them: the median $0
+        let v: Vec<_> = (minute - 1441..minute - 1441 + 500).map(|m| c(m, 10.0)).collect();
+        assert_eq!(median_minute_usd(&v, minute), Some(0.0));
+        // a coin listed 300 minutes ago: unknown
+        let v: Vec<_> = (minute - 301..minute - 1).map(|m| c(m, 10.0)).collect();
+        assert_eq!(median_minute_usd(&v, minute), None);
+    }
+
     #[tokio::test]
     async fn no_us_stock_bid_in_the_earnings_half_hour_after_the_close_back_at_16_30() {
         trades::family_fits(true);
@@ -2469,7 +2590,7 @@ mod tick_tests {
         let mut w = Wick { venue: f.venue(), unified: false, cap: None, orphans: HashMap::new(), boot: now(), diag_at: 0.0, api: f.api(), cfg: cfg(), store,
             p: Params::from_env(), state: State::default(), closes: Closes::default(), oracle: HashMap::new(), volume: HashMap::new(), h3_volume: HashMap::new(),
             held: HashMap::new(), picked: Vec::new(), h3_picked: Vec::new(), low_picked: Vec::new(), backfilled: HashSet::new(), mids_at: 0.0, ctx_at: 0.0,
-            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
+            moved: Vec::new(), trade_close: HashMap::new(), crash_fills: Vec::new(), ask_fills: Vec::new(), h3_fills: Vec::new(), vol_med: HashMap::new(), volmed_every: Every::new(VOLMED_EVERY_S), vol_every: Every::new(VOLUME_EVERY_S), oracle_every: Every::new(ORACLE_EVERY_S), orders_every: Every::new(ORDERS_EVERY_S), backfill_every: Every::new(BACKFILL_EVERY_S), h3_every: Every::new(H3_MIDS_EVERY_S), orphans_every: Every::new(ORPHANS_EVERY_S),
             last_minute: (now() / 60.0).floor() as i64 };
         w.tick().await;
         (f, w, rx, clock)
